@@ -1,0 +1,79 @@
+#include "tradebox/broker/alpaca_order_codec.h"
+
+#include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
+
+namespace {
+
+using namespace tradebox;
+
+core::Decimal D(const char* value) {
+    return *core::Decimal::Parse(value);
+}
+
+TEST(AlpacaOrderCodec, SerializesDecimalsAsExactJsonStrings) {
+    core::NativeOrderRequest request{
+        .asset_class = core::AssetClass::Equity,
+        .symbol = "AAPL",
+        .qty = D("0.123456789"),
+        .side = core::OrderSide::Buy,
+        .type = core::OrderType::Limit,
+        .time_in_force = core::TimeInForce::Day,
+        .limit_price = D("201.25"),
+        .client_order_id = "tb-request-1",
+    };
+
+    const auto encoded = broker::alpaca::SerializeOrder(request);
+
+    ASSERT_TRUE(encoded);
+    const auto json = nlohmann::json::parse(*encoded);
+    EXPECT_EQ(json.at("qty"), "0.123456789");
+    EXPECT_EQ(json.at("limit_price"), "201.25");
+    EXPECT_EQ(json.at("client_order_id"), "tb-request-1");
+}
+
+TEST(AlpacaOrderCodec, SerializesMultilegNetCreditWithoutParentSide) {
+    core::NativeOrderRequest request{
+        .asset_class = core::AssetClass::Option,
+        .qty = D("1"),
+        .type = core::OrderType::Limit,
+        .time_in_force = core::TimeInForce::Day,
+        .order_class = core::OrderClass::Mleg,
+        .limit_price = D("-1.25"),
+        .legs =
+            {
+                {"AAPL270115C00200000", D("1"), core::OrderSide::Buy,
+                 core::PositionIntent::BuyToOpen},
+                {"AAPL270115C00205000", D("1"),
+                 core::OrderSide::Sell,
+                 core::PositionIntent::SellToOpen},
+            },
+    };
+
+    const auto encoded = broker::alpaca::SerializeOrder(request);
+
+    ASSERT_TRUE(encoded);
+    const auto json = nlohmann::json::parse(*encoded);
+    EXPECT_FALSE(json.contains("symbol"));
+    EXPECT_FALSE(json.contains("side"));
+    EXPECT_EQ(json.at("limit_price"), "-1.25");
+    EXPECT_EQ(json.at("legs").size(), 2U);
+}
+
+TEST(AlpacaOrderCodec, SerializesReplacementFieldsOnly) {
+    const core::ReplaceOrderRequest request{
+        .qty = D("10"),
+        .limit_price = D("199.50"),
+        .client_order_id = "tb-replace-1",
+    };
+
+    const auto encoded = broker::alpaca::SerializeReplacement(request);
+
+    ASSERT_TRUE(encoded);
+    const auto json = nlohmann::json::parse(*encoded);
+    EXPECT_EQ(json.size(), 3U);
+    EXPECT_EQ(json.at("qty"), "10");
+    EXPECT_EQ(json.at("limit_price"), "199.5");
+}
+
+}  // namespace

@@ -1,0 +1,113 @@
+#pragma once
+
+#include "tradebox/core/decimal.h"
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <variant>
+#include <vector>
+
+namespace tradebox::core {
+
+enum class MarketDataFeed { Unknown, Iex, Sip };
+enum class MarketStreamStatus {
+    Disconnected,
+    Connecting,
+    Authenticated,
+    Subscribed,
+    Stale,
+    Error,
+};
+
+struct MarketQuote {
+    std::string symbol;
+    Decimal bid_price;
+    Decimal bid_size;
+    std::string bid_exchange;
+    Decimal ask_price;
+    Decimal ask_size;
+    std::string ask_exchange;
+    std::vector<std::string> conditions;
+    std::string tape;
+    std::string broker_timestamp;
+    std::int64_t event_time_ns = 0;
+    std::int64_t received_at_ms = 0;
+};
+
+struct MarketTrade {
+    std::string symbol;
+    std::string trade_id;
+    Decimal price;
+    Decimal size;
+    std::string exchange;
+    std::vector<std::string> conditions;
+    std::string tape;
+    std::string broker_timestamp;
+    std::int64_t event_time_ns = 0;
+    std::int64_t received_at_ms = 0;
+    std::uint64_t receive_sequence = 0;
+    bool corrected = false;
+};
+
+struct QuoteReceived {
+    MarketQuote quote;
+};
+
+struct TradeReceived {
+    MarketTrade trade;
+};
+
+struct TradeCanceled {
+    std::string symbol;
+    std::string trade_id;
+    std::string broker_timestamp;
+};
+
+struct TradeCorrected {
+    std::string symbol;
+    std::string original_trade_id;
+    MarketTrade corrected_trade;
+};
+
+struct MarketStreamChanged {
+    MarketStreamStatus status = MarketStreamStatus::Disconnected;
+    MarketDataFeed feed = MarketDataFeed::Unknown;
+    std::vector<std::string> trade_symbols;
+    std::vector<std::string> quote_symbols;
+    std::string message;
+    std::int64_t received_at_ms = 0;
+};
+
+using MarketDataEvent =
+    std::variant<QuoteReceived, TradeReceived, TradeCanceled,
+                 TradeCorrected, MarketStreamChanged>;
+
+struct MarketDataSnapshot {
+    std::string symbol;
+    MarketDataFeed feed = MarketDataFeed::Unknown;
+    MarketStreamStatus stream_status =
+        MarketStreamStatus::Disconnected;
+    bool trades_subscribed = false;
+    bool quotes_subscribed = false;
+    std::optional<MarketQuote> latest_quote;
+    std::vector<MarketTrade> trades;
+    std::uint64_t revision = 0;
+    std::int64_t last_received_at_ms = 0;
+    std::string status_message;
+};
+
+class IMarketDataSink {
+public:
+    virtual ~IMarketDataSink() = default;
+    virtual void Ingest(MarketDataEvent event) = 0;
+};
+
+class IMarketDataView {
+public:
+    virtual ~IMarketDataView() = default;
+    virtual MarketDataSnapshot Snapshot(
+        const std::string& symbol) const = 0;
+};
+
+}  // namespace tradebox::core

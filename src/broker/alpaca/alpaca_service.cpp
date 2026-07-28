@@ -1,0 +1,1368 @@
+#include "tradebox/broker/alpaca_service.h"
+#include "tradebox/broker/alpaca_order_codec.h"
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+
+using json = nlohmann::json;
+
+namespace {
+
+struct HttpResult {
+    DWORD status = 0;
+    std::string body;
+    std::string error;
+};
+
+std::wstring Wide(const std::string& value) {
+    if (value.empty()) return {};
+    const int size = MultiByteToWideChar(CP_UTF8, 0, value.data(),
+                                         static_cast<int>(value.size()), nullptr, 0);
+    std::wstring result(size, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()),
+                        result.data(), size);
+    return result;
+}
+
+std::int64_t ParseTimestampMs(const std::string& value) {
+    if (value.size() < 19) return 0;
+    std::tm time{};
+    std::istringstream stream(value.substr(0, 19));
+    stream >> std::get_time(&time, "%Y-%m-%dT%H:%M:%S");
+    if (stream.fail()) return 0;
+    std::int64_t milliseconds = static_cast<std::int64_t>(_mkgmtime64(&time)) * 1000;
+    const std::size_t dot = value.find('.');
+    if (dot != std::string::npos) {
+        std::string fraction;
+        for (std::size_t i = dot + 1; i < value.size() && fraction.size() < 3;
+             ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(value[i]))) break;
+            fraction.push_back(value[i]);
+        }
+        while (fraction.size() < 3) fraction.push_back('0');
+        if (!fraction.empty()) milliseconds += std::stoi(fraction);
+    }
+    std::size_t offset_at = value.find_first_of("+-", 19);
+    if (offset_at != std::string::npos && offset_at + 5 < value.size()) {
+        try {
+            const int hours = std::stoi(value.substr(offset_at + 1, 2));
+            const int minutes = std::stoi(value.substr(offset_at + 4, 2));
+            const std::int64_t offset_ms =
+                static_cast<std::int64_t>(hours * 60 + minutes) * 60 * 1000;
+            milliseconds += value[offset_at] == '+' ? -offset_ms : offset_ms;
+        } catch (...) {
+        }
+    }
+    return milliseconds;
+}
+
+std::int64_t ParseTimestampNs(const std::string& value) {
+    const std::int64_t milliseconds = ParseTimestampMs(value);
+    if (milliseconds == 0) return 0;
+    std::int64_t sub_millisecond_ns = 0;
+    const std::size_t dot = value.find('.');
+    if (dot != std::string::npos) {
+        std::string fraction;
+        for (std::size_t index = dot + 1;
+             index < value.size() && fraction.size() < 9; ++index) {
+            if (!std::isdigit(
+                    static_cast<unsigned char>(value[index])))
+                break;
+            fraction.push_back(value[index]);
+        }
+        while (fraction.size() < 9) fraction.push_back('0');
+        if (fraction.size() == 9)
+            sub_millisecond_ns =
+                std::stoll(fraction.substr(3, 6));
+    }
+    return milliseconds * 1'000'000 + sub_millisecond_ns;
+}
+
+double Number(const json& object, const char* key) {
+    if (!object.contains(key) || object[key].is_null()) return 0;
+    if (object[key].is_number()) return object[key].get<double>();
+    if (object[key].is_string()) {
+        try {
+            return std::stod(object[key].get<std::string>());
+        } catch (...) {
+        }
+    }
+    return 0;
+}
+
+std::string String(const json& object, const char* key) {
+    if (!object.contains(key) || object[key].is_null() ||
+        !object[key].is_string())
+        return {};
+    return object[key].get<std::string>();
+}
+
+std::string Identifier(const json& object, const char* key) {
+    if (!object.contains(key) || object[key].is_null()) return {};
+    if (object[key].is_string()) return object[key].get<std::string>();
+    if (object[key].is_number_integer())
+        return std::to_string(object[key].get<std::int64_t>());
+    if (object[key].is_number_unsigned())
+        return std::to_string(object[key].get<std::uint64_t>());
+    return {};
+}
+
+std::vector<std::string> StringArray(const json& object,
+                                     const char* key) {
+    std::vector<std::string> result;
+    if (!object.contains(key) || !object[key].is_array()) return result;
+    for (const auto& value : object[key])
+        if (value.is_string()) result.push_back(value.get<std::string>());
+    return result;
+}
+
+std::optional<std::string> DecimalText(const json& object, const char* key) {
+    if (!object.contains(key) || object[key].is_null()) return std::nullopt;
+    if (object[key].is_string()) return object[key].get<std::string>();
+    if (object[key].is_number_integer())
+        return std::to_string(object[key].get<std::int64_t>());
+    if (object[key].is_number_unsigned())
+        return std::to_string(object[key].get<std::uint64_t>());
+    if (object[key].is_number_float()) return object[key].dump();
+    throw std::runtime_error(std::string("Expected decimal field: ") + key);
+}
+
+tradebox::core::Decimal RequiredDecimal(const json& object, const char* key) {
+    const std::optional<std::string> text = DecimalText(object, key);
+    if (!text) return tradebox::core::Decimal::Zero();
+    auto parsed = tradebox::core::Decimal::Parse(*text);
+    if (!parsed)
+        throw std::runtime_error(std::string("Invalid decimal ") + key +
+                                 ": " + parsed.error().message);
+    return std::move(*parsed);
+}
+
+std::optional<tradebox::core::Decimal> OptionalDecimal(
+    const json& object, const char* key) {
+    const std::optional<std::string> text = DecimalText(object, key);
+    if (!text) return std::nullopt;
+    auto parsed = tradebox::core::Decimal::Parse(*text);
+    if (!parsed)
+        throw std::runtime_error(std::string("Invalid decimal ") + key +
+                                 ": " + parsed.error().message);
+    return std::move(*parsed);
+}
+
+std::int64_t WallClockNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+HttpResult Request(const wchar_t* method, const std::wstring& host,
+                   const std::wstring& path,
+                   const AlpacaCredentials& credentials,
+                   std::string_view body = {}) {
+    HttpResult result;
+    HINTERNET session =
+        WinHttpOpen(L"TradeBoxNative/0.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) {
+        result.error = "WinHttpOpen failed";
+        return result;
+    }
+    WinHttpSetTimeouts(session, 5000, 5000, 10000, 10000);
+    HINTERNET connection = WinHttpConnect(session, host.c_str(),
+                                          INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET request =
+        connection ? WinHttpOpenRequest(connection, method, path.c_str(), nullptr,
+                                        WINHTTP_NO_REFERER,
+                                        WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                        WINHTTP_FLAG_SECURE)
+                   : nullptr;
+    const std::wstring headers =
+        L"APCA-API-KEY-ID: " + Wide(credentials.key) +
+        L"\r\nAPCA-API-SECRET-KEY: " + Wide(credentials.secret) +
+        L"\r\nContent-Type: application/json\r\n";
+    void* request_body =
+        body.empty() ? WINHTTP_NO_REQUEST_DATA
+                     : const_cast<char*>(body.data());
+    if (!request ||
+        !WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(-1L),
+                            request_body, static_cast<DWORD>(body.size()),
+                            static_cast<DWORD>(body.size()), 0) ||
+        !WinHttpReceiveResponse(request, nullptr)) {
+        result.error = "HTTPS request failed (" + std::to_string(GetLastError()) + ")";
+    } else {
+        DWORD size = sizeof(result.status);
+        WinHttpQueryHeaders(request,
+                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &result.status, &size,
+                            WINHTTP_NO_HEADER_INDEX);
+        for (;;) {
+            DWORD available = 0;
+            if (!WinHttpQueryDataAvailable(request, &available) || available == 0)
+                break;
+            std::string chunk(available, '\0');
+            DWORD read = 0;
+            if (!WinHttpReadData(request, chunk.data(), available, &read)) break;
+            result.body.append(chunk.data(), read);
+        }
+    }
+    if (request) WinHttpCloseHandle(request);
+    if (connection) WinHttpCloseHandle(connection);
+    WinHttpCloseHandle(session);
+    return result;
+}
+
+HttpResult Get(const std::wstring& host, const std::wstring& path,
+               const AlpacaCredentials& credentials) {
+    return Request(L"GET", host, path, credentials);
+}
+
+std::wstring HistoryPath(const std::string& symbol) {
+    const auto now = std::chrono::system_clock::now();
+    const auto start = now - std::chrono::hours(24 * 365 * 6);
+    const std::time_t start_time = std::chrono::system_clock::to_time_t(start);
+    std::tm utc{};
+    gmtime_s(&utc, &start_time);
+    std::ostringstream date;
+    date << std::put_time(&utc, "%Y-%m-%d");
+    return Wide("/v2/stocks/" + symbol +
+                "/bars?timeframe=1Day&start=" + date.str() +
+                "&limit=1000&adjustment=all&feed=iex&sort=asc");
+}
+
+std::string UrlEncode(const std::string& value) {
+    std::ostringstream result;
+    result << std::uppercase << std::hex;
+    for (const unsigned char character : value) {
+        if (std::isalnum(character) || character == '-' || character == '_' ||
+            character == '.' || character == '~') {
+            result << character;
+        } else {
+            result << '%' << std::setw(2) << std::setfill('0')
+                   << static_cast<int>(character);
+        }
+    }
+    return result.str();
+}
+
+tradebox::core::OrderState ParseCoreOrder(const json& value) {
+    tradebox::core::OrderState order;
+    order.id = String(value, "id");
+    order.client_order_id = String(value, "client_order_id");
+    order.asset_id = String(value, "asset_id");
+    order.symbol = String(value, "symbol");
+    order.asset_class = String(value, "asset_class");
+    order.side = String(value, "side");
+    order.type = String(value, "type");
+    if (order.type.empty()) order.type = String(value, "order_type");
+    order.time_in_force = String(value, "time_in_force");
+    order.order_class = String(value, "order_class");
+    order.status = String(value, "status");
+    order.submitted_at = String(value, "submitted_at");
+    order.updated_at = String(value, "updated_at");
+    order.filled_at = String(value, "filled_at");
+    order.canceled_at = String(value, "canceled_at");
+    order.expired_at = String(value, "expired_at");
+    order.failed_at = String(value, "failed_at");
+    order.replaced_at = String(value, "replaced_at");
+    order.replaced_by = String(value, "replaced_by");
+    order.replaces = String(value, "replaces");
+    order.qty = OptionalDecimal(value, "qty");
+    order.notional = OptionalDecimal(value, "notional");
+    order.filled_qty = RequiredDecimal(value, "filled_qty");
+    order.filled_avg_price = OptionalDecimal(value, "filled_avg_price");
+    order.limit_price = OptionalDecimal(value, "limit_price");
+    order.stop_price = OptionalDecimal(value, "stop_price");
+    order.extended_hours = value.value("extended_hours", false);
+    order.submitted_at_ms = ParseTimestampMs(order.submitted_at);
+    order.updated_at_ms = ParseTimestampMs(order.updated_at);
+    return order;
+}
+
+bool SendText(HINTERNET socket, const std::string& message) {
+    return WinHttpWebSocketSend(
+               socket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+               const_cast<char*>(message.data()),
+               static_cast<DWORD>(message.size())) == NO_ERROR;
+}
+
+std::string Subscription(const char* action,
+                         const std::vector<std::string>& symbols) {
+    json value = {
+        {"action", action},
+        {"trades", symbols},
+        {"quotes", symbols},
+        {"dailyBars", symbols},
+        {"updatedBars", symbols},
+    };
+    return value.dump();
+}
+
+tradebox::broker::BrokerCommandResult CommandResult(
+    const HttpResult& response) {
+    tradebox::broker::BrokerCommandResult result{
+        .http_status = response.status,
+        .raw_response = response.body,
+    };
+    if (!response.error.empty() || response.status == 0 ||
+        response.status == 408 || response.status == 429 ||
+        response.status >= 500) {
+        result.disposition =
+            tradebox::broker::BrokerCommandDisposition::Indeterminate;
+        result.message = response.error.empty()
+                             ? "Broker outcome is indeterminate"
+                             : response.error;
+        return result;
+    }
+    if (response.status >= 200 && response.status < 300) {
+        result.disposition =
+            tradebox::broker::BrokerCommandDisposition::Accepted;
+        result.message = "Broker accepted HTTP command";
+        if (!response.body.empty()) {
+            try {
+                const json value = json::parse(response.body);
+                result.broker_order_id = value.value("id", "");
+            } catch (const std::exception&) {
+                result.disposition =
+                    tradebox::broker::BrokerCommandDisposition::Indeterminate;
+                result.message =
+                    "Broker returned success with an unreadable response";
+            }
+        }
+        return result;
+    }
+    result.disposition =
+        tradebox::broker::BrokerCommandDisposition::Rejected;
+    result.message = response.body.empty() ? "Broker rejected HTTP command"
+                                           : response.body;
+    return result;
+}
+
+}  // namespace
+
+AlpacaService::AlpacaService(UiEventQueue& events, Database& database,
+                             tradebox::core::ITradingCore& core,
+                             tradebox::core::IMarketDataSink& market_data)
+    : events_(events),
+      database_(database),
+      core_(core),
+      market_data_(market_data) {}
+
+AlpacaService::~AlpacaService() {
+    Disconnect();
+}
+
+AlpacaCredentials AlpacaService::CredentialsSnapshot() const {
+    std::scoped_lock lock(credentials_mutex_);
+    return credentials_;
+}
+
+void AlpacaService::Connect(AlpacaCredentials credentials,
+                            const std::vector<std::string>& symbols,
+                            tradebox::core::MarketDataFeed feed) {
+    std::scoped_lock lifecycle_lock(lifecycle_mutex_);
+    Disconnect();
+    const std::uint64_t generation = generation_counter_.fetch_add(1) + 1;
+    active_generation_ = generation;
+    PublishCoreEvent(tradebox::core::BrokerEvent{
+        .kind = tradebox::core::BrokerEventKind::ConnectionAttemptStarted,
+        .generation = tradebox::core::ConnectionGeneration{generation},
+        .source_event_id =
+            "connection:" + std::to_string(generation),
+        .raw_payload = "{}",
+    });
+    {
+        std::scoped_lock lock(credentials_mutex_);
+        credentials_ = std::move(credentials);
+    }
+    market_data_feed_ = feed;
+    {
+        std::scoped_lock lock(subscription_mutex_);
+        desired_symbols_ = symbols;
+        subscribed_symbols_.clear();
+    }
+    running_ = true;
+    {
+        std::scoped_lock lock(workers_mutex_);
+        orders_dirty_ = true;
+        positions_dirty_ = true;
+        workers_.emplace_back(&AlpacaService::AccountRefreshLoop, this);
+        workers_.emplace_back(&AlpacaService::MarketClockLoop, this);
+        for (const std::string& symbol : symbols)
+            workers_.emplace_back(&AlpacaService::FetchHistory, this, symbol);
+    }
+    stream_thread_ = std::thread(&AlpacaService::StreamLoop, this, symbols);
+    account_stream_thread_ =
+        std::thread(&AlpacaService::AccountStreamLoop, this);
+}
+
+void AlpacaService::RefreshSymbols(const std::vector<std::string>& symbols) {
+    if (!running_) return;
+    std::vector<std::string> previous;
+    {
+        std::scoped_lock lock(subscription_mutex_);
+        desired_symbols_ = symbols;
+        previous = subscribed_symbols_;
+        subscribed_symbols_ = symbols;
+    }
+    HINTERNET socket = websocket_.load();
+    if (!socket || !connected_) return;
+    std::scoped_lock send_lock(websocket_send_mutex_);
+    if (!previous.empty())
+        SendText(socket, Subscription("unsubscribe", previous));
+    if (!symbols.empty())
+        SendText(socket, Subscription("subscribe", symbols));
+}
+
+void AlpacaService::RequestHistory(const std::string& symbol) {
+    if (!running_) return;
+    std::scoped_lock lock(workers_mutex_);
+    workers_.emplace_back(&AlpacaService::FetchHistory, this, symbol);
+}
+
+void AlpacaService::Disconnect() {
+    std::scoped_lock lifecycle_lock(lifecycle_mutex_);
+    running_ = false;
+    connected_ = false;
+    account_connected_ = false;
+    HINTERNET socket = websocket_.exchange(nullptr);
+    if (socket) WinHttpCloseHandle(socket);
+    HINTERNET account_socket = account_websocket_.exchange(nullptr);
+    if (account_socket) WinHttpCloseHandle(account_socket);
+    if (stream_thread_.joinable()) stream_thread_.join();
+    if (account_stream_thread_.joinable()) account_stream_thread_.join();
+    JoinWorkers();
+    {
+        std::scoped_lock lock(credentials_mutex_);
+        if (!credentials_.key.empty())
+            SecureZeroMemory(credentials_.key.data(),
+                             credentials_.key.size());
+        if (!credentials_.secret.empty())
+            SecureZeroMemory(credentials_.secret.data(),
+                             credentials_.secret.size());
+        credentials_ = {};
+    }
+}
+
+void AlpacaService::JoinWorkers() {
+    std::vector<std::thread> workers;
+    {
+        std::scoped_lock lock(workers_mutex_);
+        workers.swap(workers_);
+    }
+    for (std::thread& worker : workers)
+        if (worker.joinable()) worker.join();
+}
+
+void AlpacaService::PublishCoreEvent(tradebox::core::BrokerEvent event) {
+    if (event.generation.value == 0)
+        event.generation =
+            tradebox::core::ConnectionGeneration{active_generation_.load()};
+    if (auto result = core_.Ingest(std::move(event)); !result) {
+        events_.Push(
+            {UiEventType::Status, {},
+             "Trading core rejected broker event: " +
+                 result.error().message});
+    }
+}
+
+tradebox::broker::BrokerCommandResult AlpacaService::PlaceOrder(
+    const tradebox::core::NativeOrderRequest& request) {
+    std::scoped_lock lifecycle_lock(lifecycle_mutex_);
+    const auto body = tradebox::broker::alpaca::SerializeOrder(request);
+    if (!body)
+        return {
+            .disposition =
+                tradebox::broker::BrokerCommandDisposition::Rejected,
+            .message = body.error(),
+        };
+    const AlpacaCredentials credentials = CredentialsSnapshot();
+    if (credentials.key.empty())
+        return {
+            .disposition =
+                tradebox::broker::BrokerCommandDisposition::Indeterminate,
+            .message = "Broker credentials are unavailable",
+        };
+    const std::wstring host =
+        credentials.paper ? L"paper-api.alpaca.markets"
+                          : L"api.alpaca.markets";
+    auto result = CommandResult(
+        Request(L"POST", host, L"/v2/orders", credentials, *body));
+    if (result.disposition ==
+        tradebox::broker::BrokerCommandDisposition::Accepted)
+        orders_dirty_ = true;
+    return result;
+}
+
+tradebox::broker::BrokerCommandResult AlpacaService::CancelOrder(
+    const std::string& order_id) {
+    std::scoped_lock lifecycle_lock(lifecycle_mutex_);
+    if (order_id.empty())
+        return {
+            .disposition =
+                tradebox::broker::BrokerCommandDisposition::Rejected,
+            .message = "order_id is required",
+        };
+    const AlpacaCredentials credentials = CredentialsSnapshot();
+    if (credentials.key.empty())
+        return {
+            .disposition =
+                tradebox::broker::BrokerCommandDisposition::Indeterminate,
+            .message = "Broker credentials are unavailable",
+        };
+    const std::wstring host =
+        credentials.paper ? L"paper-api.alpaca.markets"
+                          : L"api.alpaca.markets";
+    auto result = CommandResult(Request(
+        L"DELETE", host, Wide("/v2/orders/" + UrlEncode(order_id)),
+        credentials));
+    if (result.disposition ==
+        tradebox::broker::BrokerCommandDisposition::Accepted)
+        orders_dirty_ = true;
+    return result;
+}
+
+tradebox::broker::BrokerCommandResult AlpacaService::ReplaceOrder(
+    const std::string& order_id,
+    const tradebox::core::ReplaceOrderRequest& request) {
+    std::scoped_lock lifecycle_lock(lifecycle_mutex_);
+    const auto body =
+        tradebox::broker::alpaca::SerializeReplacement(request);
+    if (!body)
+        return {
+            .disposition =
+                tradebox::broker::BrokerCommandDisposition::Rejected,
+            .message = body.error(),
+        };
+    const AlpacaCredentials credentials = CredentialsSnapshot();
+    if (credentials.key.empty())
+        return {
+            .disposition =
+                tradebox::broker::BrokerCommandDisposition::Indeterminate,
+            .message = "Broker credentials are unavailable",
+        };
+    const std::wstring host =
+        credentials.paper ? L"paper-api.alpaca.markets"
+                          : L"api.alpaca.markets";
+    auto result = CommandResult(Request(
+        L"PATCH", host, Wide("/v2/orders/" + UrlEncode(order_id)),
+        credentials, *body));
+    if (result.disposition ==
+        tradebox::broker::BrokerCommandDisposition::Accepted)
+        orders_dirty_ = true;
+    return result;
+}
+
+void AlpacaService::FetchAccount() {
+    const AlpacaCredentials credentials = CredentialsSnapshot();
+    const std::wstring host = credentials.paper ? L"paper-api.alpaca.markets"
+                                                 : L"api.alpaca.markets";
+    const HttpResult result = Get(host, L"/v2/account", credentials);
+    if (result.status != 200) {
+        events_.Push({UiEventType::Status, {}, "Account login failed: " +
+                                                   (!result.error.empty()
+                                                        ? result.error
+                                                        : result.body)});
+        return;
+    }
+    try {
+        const json value = json::parse(result.body);
+        tradebox::core::AccountState core_account;
+        core_account.id = value.value("id", "");
+        core_account.account_number = value.value("account_number", "");
+        core_account.status = value.value("status", "");
+        core_account.crypto_status = value.value("crypto_status", "");
+        core_account.currency = value.value("currency", "");
+        core_account.multiplier = value.value("multiplier", "");
+        core_account.equity = RequiredDecimal(value, "equity");
+        core_account.last_equity = RequiredDecimal(value, "last_equity");
+        core_account.portfolio_value =
+            RequiredDecimal(value, "portfolio_value");
+        core_account.cash = RequiredDecimal(value, "cash");
+        core_account.buying_power = RequiredDecimal(value, "buying_power");
+        core_account.non_marginable_buying_power =
+            RequiredDecimal(value, "non_marginable_buying_power");
+        core_account.regt_buying_power =
+            RequiredDecimal(value, "regt_buying_power");
+        core_account.long_market_value =
+            RequiredDecimal(value, "long_market_value");
+        core_account.short_market_value =
+            RequiredDecimal(value, "short_market_value");
+        core_account.initial_margin =
+            RequiredDecimal(value, "initial_margin");
+        core_account.maintenance_margin =
+            RequiredDecimal(value, "maintenance_margin");
+        core_account.last_maintenance_margin =
+            RequiredDecimal(value, "last_maintenance_margin");
+        core_account.sma = RequiredDecimal(value, "sma");
+        core_account.accrued_fees =
+            RequiredDecimal(value, "accrued_fees");
+        core_account.pending_transfer_in =
+            RequiredDecimal(value, "pending_transfer_in");
+        core_account.pending_transfer_out =
+            RequiredDecimal(value, "pending_transfer_out");
+        core_account.account_blocked =
+            value.value("account_blocked", false);
+        core_account.trade_suspended_by_user =
+            value.value("trade_suspended_by_user", false);
+        core_account.trading_blocked =
+            value.value("trading_blocked", false);
+        core_account.transfers_blocked =
+            value.value("transfers_blocked", false);
+        core_account.shorting_enabled =
+            value.value("shorting_enabled", false);
+        core_account.received_at_ms = WallClockNowMs();
+        const std::int64_t account_received_at =
+            core_account.received_at_ms;
+        PublishCoreEvent(tradebox::core::BrokerEvent{
+            .kind = tradebox::core::BrokerEventKind::AccountSnapshot,
+            .source_event_id =
+                "account:" + std::to_string(active_generation_.load()) +
+                ":" + std::to_string(account_received_at),
+            .raw_payload = result.body,
+            .payload = tradebox::core::AccountSnapshotPayload{
+                .account = std::move(core_account),
+            },
+        });
+    } catch (const std::exception& error) {
+        events_.Push(
+            {UiEventType::Status, {}, "Account JSON error: " + std::string(error.what())});
+    }
+}
+
+void AlpacaService::FetchPositions() {
+    const AlpacaCredentials credentials = CredentialsSnapshot();
+    const std::wstring host = credentials.paper ? L"paper-api.alpaca.markets"
+                                                 : L"api.alpaca.markets";
+    const HttpResult result = Get(host, L"/v2/positions", credentials);
+    if (result.status != 200) {
+        events_.Push({UiEventType::Status, {}, "Positions refresh failed: " +
+                                                   (!result.error.empty()
+                                                        ? result.error
+                                                        : result.body)});
+        return;
+    }
+    try {
+        const json value = json::parse(result.body);
+        std::vector<tradebox::core::PositionState> positions;
+        positions.reserve(value.size());
+        for (const auto& item : value) {
+            tradebox::core::PositionState position;
+            position.asset_id = item.value("asset_id", "");
+            position.symbol = item.value("symbol", "");
+            position.exchange = item.value("exchange", "");
+            position.asset_class = item.value("asset_class", "");
+            position.side = item.value("side", "");
+            position.qty = RequiredDecimal(item, "qty");
+            position.qty_available =
+                RequiredDecimal(item, "qty_available");
+            position.avg_entry_price =
+                RequiredDecimal(item, "avg_entry_price");
+            position.market_value =
+                RequiredDecimal(item, "market_value");
+            position.cost_basis = RequiredDecimal(item, "cost_basis");
+            position.unrealized_pl =
+                RequiredDecimal(item, "unrealized_pl");
+            position.unrealized_plpc =
+                RequiredDecimal(item, "unrealized_plpc");
+            position.unrealized_intraday_pl =
+                RequiredDecimal(item, "unrealized_intraday_pl");
+            position.unrealized_intraday_plpc =
+                RequiredDecimal(item, "unrealized_intraday_plpc");
+            position.current_price =
+                RequiredDecimal(item, "current_price");
+            position.lastday_price =
+                RequiredDecimal(item, "lastday_price");
+            position.change_today =
+                RequiredDecimal(item, "change_today");
+            positions.push_back(std::move(position));
+        }
+        const std::int64_t received_at = WallClockNowMs();
+        PublishCoreEvent(tradebox::core::BrokerEvent{
+            .kind = tradebox::core::BrokerEventKind::PositionsSnapshot,
+            .source_event_id =
+                "positions:" +
+                std::to_string(active_generation_.load()) + ":" +
+                std::to_string(received_at),
+            .raw_payload = result.body,
+            .payload = tradebox::core::PositionsSnapshotPayload{
+                .positions = std::move(positions),
+                .received_at_ms = received_at,
+            },
+        });
+    } catch (const std::exception& error) {
+        events_.Push({UiEventType::Status, {},
+                      "Positions JSON error: " + std::string(error.what())});
+    }
+}
+
+void AlpacaService::FetchOrders() {
+    const AlpacaCredentials credentials = CredentialsSnapshot();
+    const std::wstring host = credentials.paper ? L"paper-api.alpaca.markets"
+                                                 : L"api.alpaca.markets";
+    std::vector<tradebox::core::OrderState> core_orders;
+    json raw_orders = json::array();
+    std::string until;
+    while (running_) {
+        std::string path =
+            "/v2/orders?status=all&limit=500&direction=desc&nested=true";
+        if (!until.empty()) path += "&until=" + UrlEncode(until);
+        const HttpResult result = Get(host, Wide(path), credentials);
+        if (result.status != 200) {
+            events_.Push({UiEventType::Status, {}, "Orders load failed: " +
+                                                       (!result.error.empty()
+                                                            ? result.error
+                                                            : result.body)});
+            return;
+        }
+        try {
+            const json value = json::parse(result.body);
+            for (const auto& item : value) {
+                core_orders.push_back(ParseCoreOrder(item));
+                raw_orders.push_back(item);
+            }
+            if (value.size() < 500 || value.empty()) break;
+            const std::string next_until =
+                String(value.back(), "submitted_at");
+            if (next_until.empty() || next_until == until) break;
+            until = next_until;
+        } catch (const std::exception& error) {
+            events_.Push({UiEventType::Status, {},
+                          "Orders JSON error: " + std::string(error.what())});
+            return;
+        }
+    }
+    const std::int64_t received_at = WallClockNowMs();
+    PublishCoreEvent(tradebox::core::BrokerEvent{
+        .kind = tradebox::core::BrokerEventKind::OrdersSnapshot,
+        .source_event_id =
+            "orders:" + std::to_string(active_generation_.load()) + ":" +
+            std::to_string(received_at),
+        .raw_payload = raw_orders.dump(),
+        .payload = tradebox::core::OrdersSnapshotPayload{
+            .orders = std::move(core_orders),
+            .received_at_ms = received_at,
+        },
+    });
+}
+
+void AlpacaService::AccountRefreshLoop() {
+    auto next_account_refresh = std::chrono::steady_clock::now();
+    auto next_safety_reconciliation = std::chrono::steady_clock::now();
+    auto next_order_safety_reconciliation = std::chrono::steady_clock::now();
+    while (running_) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_account_refresh) {
+            FetchAccount();
+            next_account_refresh = now + std::chrono::seconds(5);
+        }
+        if (positions_dirty_.exchange(false) ||
+            now >= next_safety_reconciliation) {
+            FetchPositions();
+            next_safety_reconciliation =
+                now + std::chrono::seconds(1);
+        }
+        const bool stream_unavailable = !account_connected_.load();
+        const bool order_safety_due =
+            stream_unavailable && now >= next_order_safety_reconciliation;
+        if ((orders_dirty_.exchange(false) || order_safety_due) && running_) {
+            FetchOrders();
+            next_order_safety_reconciliation =
+                now + std::chrono::seconds(1);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+void AlpacaService::FetchMarketClock() {
+    const AlpacaCredentials credentials = CredentialsSnapshot();
+    const std::wstring host = credentials.paper ? L"paper-api.alpaca.markets"
+                                                 : L"api.alpaca.markets";
+    const HttpResult result = Get(host, L"/v2/clock", credentials);
+    if (result.status != 200) {
+        events_.Push({UiEventType::Status, {}, "Market clock failed: " +
+                                                   (!result.error.empty()
+                                                        ? result.error
+                                                        : result.body)});
+        return;
+    }
+    try {
+        const json value = json::parse(result.body);
+        MarketClockSnapshot clock;
+        clock.is_open = value.value("is_open", false);
+        clock.timestamp_ms = ParseTimestampMs(value.value("timestamp", ""));
+        clock.next_open_ms = ParseTimestampMs(value.value("next_open", ""));
+        clock.next_close_ms = ParseTimestampMs(value.value("next_close", ""));
+        clock.received_at_ms = WallClockNowMs();
+        database_.QueueTimelineEvent(
+            "alpaca.trading", std::to_string(clock.timestamp_ms),
+            "market_clock", "", clock.timestamp_ms, result.body);
+        UiEvent event;
+        event.type = UiEventType::MarketClock;
+        event.market_clock = clock;
+        events_.Push(std::move(event));
+    } catch (const std::exception& error) {
+        events_.Push({UiEventType::Status, {},
+                      "Market clock JSON error: " + std::string(error.what())});
+    }
+}
+
+void AlpacaService::MarketClockLoop() {
+    while (running_) {
+        FetchMarketClock();
+        for (int tenth_seconds = 0;
+             tenth_seconds < 300 && running_; ++tenth_seconds)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+void AlpacaService::FetchHistory(std::string symbol) {
+    const AlpacaCredentials credentials = CredentialsSnapshot();
+    const std::vector<Bar> cached = database_.LoadBars(symbol);
+    if (!cached.empty()) {
+        UiEvent event;
+        event.type = UiEventType::HistoricalBars;
+        event.symbol = symbol;
+        event.bars = cached;
+        events_.Push(std::move(event));
+    }
+    const HttpResult result =
+        Get(L"data.alpaca.markets", HistoryPath(symbol), credentials);
+    if (result.status != 200) {
+        events_.Push({UiEventType::Status, symbol,
+                      "History failed for " + symbol + ": " +
+                          (!result.error.empty() ? result.error : result.body)});
+        return;
+    }
+    try {
+        const json value = json::parse(result.body);
+        std::vector<Bar> bars;
+        for (const auto& item : value.value("bars", json::array())) {
+            bars.push_back({
+                ParseTimestampMs(item.value("t", "")),
+                Number(item, "o"),
+                Number(item, "h"),
+                Number(item, "l"),
+                Number(item, "c"),
+                Number(item, "v"),
+            });
+        }
+        database_.StoreBars(symbol, bars);
+        UiEvent event;
+        event.type = UiEventType::HistoricalBars;
+        event.symbol = std::move(symbol);
+        event.bars = std::move(bars);
+        events_.Push(std::move(event));
+    } catch (const std::exception& error) {
+        events_.Push({UiEventType::Status, symbol,
+                      "History JSON error: " + std::string(error.what())});
+    }
+}
+
+void AlpacaService::StreamLoop(std::vector<std::string> symbols) {
+    const AlpacaCredentials credentials = CredentialsSnapshot();
+    const tradebox::core::MarketDataFeed feed = market_data_feed_;
+    const bool sip = feed == tradebox::core::MarketDataFeed::Sip;
+    const char* feed_name = sip ? "SIP" : "IEX";
+    market_data_.Ingest(tradebox::core::MarketStreamChanged{
+        .status = tradebox::core::MarketStreamStatus::Connecting,
+        .feed = feed,
+        .message = std::string("Connecting to ") + feed_name +
+                   " market stream",
+        .received_at_ms = WallClockNowMs(),
+    });
+    HINTERNET session =
+        WinHttpOpen(L"TradeBoxNative/0.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) return;
+    WinHttpSetTimeouts(session, 5000, 5000, 10000, 0);
+    HINTERNET connection =
+        WinHttpConnect(session, L"stream.data.alpaca.markets",
+                       INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET request =
+        connection
+            ? WinHttpOpenRequest(connection, L"GET",
+                                 sip ? L"/v2/sip" : L"/v2/iex", nullptr,
+                                 WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                 WINHTTP_FLAG_SECURE)
+            : nullptr;
+    if (!request ||
+        !WinHttpSetOption(request, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0) ||
+        !WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(request, nullptr)) {
+        events_.Push({UiEventType::Status, {}, "Market stream connection failed"});
+        market_data_.Ingest(tradebox::core::MarketStreamChanged{
+            .status = tradebox::core::MarketStreamStatus::Error,
+            .feed = feed,
+            .message = "Market stream connection failed",
+            .received_at_ms = WallClockNowMs(),
+        });
+        if (request) WinHttpCloseHandle(request);
+        if (connection) WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        return;
+    }
+    HINTERNET socket = WinHttpWebSocketCompleteUpgrade(request, 0);
+    WinHttpCloseHandle(request);
+    if (!socket) {
+        events_.Push({UiEventType::Status, {}, "WebSocket upgrade failed"});
+        market_data_.Ingest(tradebox::core::MarketStreamChanged{
+            .status = tradebox::core::MarketStreamStatus::Error,
+            .feed = feed,
+            .message = "Market WebSocket upgrade failed",
+            .received_at_ms = WallClockNowMs(),
+        });
+        WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        return;
+    }
+    websocket_ = socket;
+    const json auth = {
+        {"action", "auth"},
+        {"key", credentials.key},
+        {"secret", credentials.secret},
+    };
+    {
+        std::scoped_lock send_lock(websocket_send_mutex_);
+        SendText(socket, auth.dump());
+    }
+
+    std::string message;
+    std::vector<char> buffer(64 * 1024);
+    while (running_ && websocket_.load() == socket) {
+        DWORD bytes = 0;
+        WINHTTP_WEB_SOCKET_BUFFER_TYPE type{};
+        const DWORD rc = WinHttpWebSocketReceive(
+            socket, buffer.data(), static_cast<DWORD>(buffer.size()), &bytes, &type);
+        if (rc != NO_ERROR) break;
+        message.append(buffer.data(), bytes);
+        if (type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE ||
+            type == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE)
+            continue;
+        if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) break;
+        try {
+            const json packet = json::parse(message);
+            const json items = packet.is_array() ? packet : json::array({packet});
+            for (const auto& item : items) {
+                const std::string kind = item.value("T", "");
+                if (kind == "success") {
+                    const std::string status = item.value("msg", "");
+                    if (status == "authenticated") {
+                        connected_ = true;
+                        market_data_.Ingest(
+                            tradebox::core::MarketStreamChanged{
+                                .status = tradebox::core::
+                                    MarketStreamStatus::Authenticated,
+                                .feed = feed,
+                                .message =
+                                    std::string(feed_name) +
+                                    " market stream authenticated",
+                                .received_at_ms = WallClockNowMs(),
+                            });
+                        std::vector<std::string> desired;
+                        {
+                            std::scoped_lock subscription_lock(subscription_mutex_);
+                            desired = desired_symbols_;
+                            subscribed_symbols_ = desired;
+                        }
+                        if (!desired.empty()) {
+                            std::scoped_lock send_lock(websocket_send_mutex_);
+                            SendText(socket, Subscription("subscribe", desired));
+                        }
+                        events_.Push(
+                            {UiEventType::Status, {}, "Market stream authenticated"});
+                    }
+                    continue;
+                }
+                if (kind == "error") {
+                    const std::string error_message =
+                        "Stream error: " + item.value("msg", "");
+                    events_.Push({UiEventType::Status, {},
+                                  error_message});
+                    market_data_.Ingest(
+                        tradebox::core::MarketStreamChanged{
+                            .status =
+                                tradebox::core::MarketStreamStatus::Error,
+                            .feed = feed,
+                            .message = error_message,
+                            .received_at_ms = WallClockNowMs(),
+                        });
+                    continue;
+                }
+                if (kind == "subscription") {
+                    const std::vector<std::string> trades =
+                        StringArray(item, "trades");
+                    const std::vector<std::string> quotes =
+                        StringArray(item, "quotes");
+                    const std::size_t subscribed = trades.size();
+                    events_.Push(
+                        {UiEventType::Status, {},
+                         "Market subscription active: " +
+                             std::to_string(subscribed) + " symbols"});
+                    market_data_.Ingest(
+                        tradebox::core::MarketStreamChanged{
+                            .status = tradebox::core::
+                                MarketStreamStatus::Subscribed,
+                            .feed = feed,
+                            .trade_symbols = trades,
+                            .quote_symbols = quotes,
+                            .message = std::string(feed_name) +
+                                       " trades and quotes subscribed",
+                            .received_at_ms = WallClockNowMs(),
+                        });
+                    continue;
+                }
+                if (kind != "t" && kind != "q" && kind != "x" &&
+                    kind != "c" && kind != "d" && kind != "u")
+                    continue;
+                const std::string symbol = item.value("S", "");
+                const std::string broker_timestamp =
+                    item.value("t", "");
+                const std::int64_t timestamp =
+                    ParseTimestampMs(broker_timestamp);
+                const std::int64_t received_at = WallClockNowMs();
+                std::string source_event_id;
+                if (kind == "t" && item.contains("i")) {
+                    source_event_id = symbol + ":" +
+                                      Identifier(item, "i");
+                }
+                database_.QueueTimelineEvent(
+                    sip ? "alpaca.market.sip" : "alpaca.market.iex",
+                    std::move(source_event_id), kind,
+                    symbol, timestamp, item.dump());
+                if (kind == "q") {
+                    market_data_.Ingest(tradebox::core::QuoteReceived{
+                        .quote =
+                            {
+                                .symbol = symbol,
+                                .bid_price =
+                                    RequiredDecimal(item, "bp"),
+                                .bid_size =
+                                    RequiredDecimal(item, "bs"),
+                                .bid_exchange =
+                                    item.value("bx", ""),
+                                .ask_price =
+                                    RequiredDecimal(item, "ap"),
+                                .ask_size =
+                                    RequiredDecimal(item, "as"),
+                                .ask_exchange =
+                                    item.value("ax", ""),
+                                .conditions =
+                                    StringArray(item, "c"),
+                                .tape = item.value("z", ""),
+                                .broker_timestamp =
+                                    broker_timestamp,
+                                .event_time_ns =
+                                    ParseTimestampNs(
+                                        broker_timestamp),
+                                .received_at_ms = received_at,
+                            },
+                    });
+                    continue;
+                }
+                if (kind == "t") {
+                    market_data_.Ingest(tradebox::core::TradeReceived{
+                        .trade =
+                            {
+                                .symbol = symbol,
+                                .trade_id = Identifier(item, "i"),
+                                .price = RequiredDecimal(item, "p"),
+                                .size = RequiredDecimal(item, "s"),
+                                .exchange = item.value("x", ""),
+                                .conditions =
+                                    StringArray(item, "c"),
+                                .tape = item.value("z", ""),
+                                .broker_timestamp =
+                                    broker_timestamp,
+                                .event_time_ns =
+                                    ParseTimestampNs(
+                                        broker_timestamp),
+                                .received_at_ms = received_at,
+                            },
+                    });
+                } else if (kind == "x") {
+                    market_data_.Ingest(tradebox::core::TradeCanceled{
+                        .symbol = symbol,
+                        .trade_id = Identifier(item, "i"),
+                        .broker_timestamp = broker_timestamp,
+                    });
+                    continue;
+                } else if (kind == "c") {
+                    market_data_.Ingest(tradebox::core::TradeCorrected{
+                        .symbol = symbol,
+                        .original_trade_id = Identifier(item, "oi"),
+                        .corrected_trade =
+                            {
+                                .symbol = symbol,
+                                .trade_id = Identifier(item, "ci"),
+                                .price = RequiredDecimal(item, "cp"),
+                                .size = RequiredDecimal(item, "cs"),
+                                .exchange = item.value("x", ""),
+                                .conditions =
+                                    StringArray(item, "cc"),
+                                .tape = item.value("z", ""),
+                                .broker_timestamp =
+                                    broker_timestamp,
+                                .event_time_ns =
+                                    ParseTimestampNs(
+                                        broker_timestamp),
+                                .received_at_ms = received_at,
+                            },
+                    });
+                    continue;
+                }
+                UiEvent event;
+                event.type = kind == "t" ? UiEventType::Trade : UiEventType::DailyBar;
+                event.symbol = symbol;
+                if (kind == "t") {
+                    event.bar.timestamp_ms = timestamp;
+                    event.bar.close = Number(item, "p");
+                    event.bar.volume = Number(item, "s");
+                    event.received_at_ms = received_at;
+                } else {
+                    event.bar = {timestamp, Number(item, "o"), Number(item, "h"),
+                                 Number(item, "l"), Number(item, "c"),
+                                 Number(item, "v")};
+                }
+                events_.Push(std::move(event));
+            }
+        } catch (const std::exception& error) {
+            events_.Push({UiEventType::Status, {},
+                          "Stream JSON error: " + std::string(error.what())});
+        }
+        message.clear();
+    }
+    connected_ = false;
+    if (websocket_.exchange(nullptr) == socket) WinHttpCloseHandle(socket);
+    WinHttpCloseHandle(connection);
+    WinHttpCloseHandle(session);
+    if (running_)
+        events_.Push({UiEventType::Status, {}, "Market stream disconnected"});
+    market_data_.Ingest(tradebox::core::MarketStreamChanged{
+        .status = running_ ? tradebox::core::MarketStreamStatus::Stale
+                           : tradebox::core::MarketStreamStatus::Disconnected,
+        .feed = feed,
+        .message =
+            running_
+                ? std::string(feed_name) +
+                      " market stream disconnected unexpectedly"
+                : std::string(feed_name) + " market stream stopped",
+        .received_at_ms = WallClockNowMs(),
+    });
+}
+
+void AlpacaService::AccountStreamLoop() {
+    const AlpacaCredentials credentials = CredentialsSnapshot();
+    HINTERNET session =
+        WinHttpOpen(L"TradeBoxNative/0.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    const std::wstring host = credentials.paper ? L"paper-api.alpaca.markets"
+                                                 : L"api.alpaca.markets";
+    HINTERNET connection =
+        session ? WinHttpConnect(session, host.c_str(),
+                                 INTERNET_DEFAULT_HTTPS_PORT, 0)
+                : nullptr;
+    HINTERNET request =
+        connection
+            ? WinHttpOpenRequest(connection, L"GET", L"/stream", nullptr,
+                                 WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                 WINHTTP_FLAG_SECURE)
+            : nullptr;
+    if (!session || !request ||
+        !WinHttpSetOption(request, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr,
+                          0) ||
+        !WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(request, nullptr)) {
+        events_.Push(
+            {UiEventType::Status, {}, "Account stream connection failed"});
+        PublishCoreEvent(tradebox::core::BrokerEvent{
+            .kind = tradebox::core::BrokerEventKind::Failure,
+            .raw_payload = "{}",
+            .message = "Account stream connection failed",
+        });
+        if (request) WinHttpCloseHandle(request);
+        if (connection) WinHttpCloseHandle(connection);
+        if (session) WinHttpCloseHandle(session);
+        return;
+    }
+
+    HINTERNET socket = WinHttpWebSocketCompleteUpgrade(request, 0);
+    WinHttpCloseHandle(request);
+    if (!socket) {
+        events_.Push(
+            {UiEventType::Status, {}, "Account WebSocket upgrade failed"});
+        PublishCoreEvent(tradebox::core::BrokerEvent{
+            .kind = tradebox::core::BrokerEventKind::Failure,
+            .raw_payload = "{}",
+            .message = "Account WebSocket upgrade failed",
+        });
+        WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        return;
+    }
+    account_websocket_ = socket;
+    const json auth = {
+        {"action", "auth"},
+        {"key", credentials.key},
+        {"secret", credentials.secret},
+    };
+    const auto auth_started = std::chrono::steady_clock::now();
+    SendText(socket, auth.dump());
+
+    std::string message;
+    std::vector<char> buffer(64 * 1024);
+    while (running_ && account_websocket_.load() == socket) {
+        DWORD bytes = 0;
+        WINHTTP_WEB_SOCKET_BUFFER_TYPE type{};
+        const DWORD rc = WinHttpWebSocketReceive(
+            socket, buffer.data(), static_cast<DWORD>(buffer.size()), &bytes,
+            &type);
+        if (rc != NO_ERROR) break;
+        message.append(buffer.data(), bytes);
+        if (type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE ||
+            type == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE)
+            continue;
+        if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) break;
+        try {
+            const json packet = json::parse(message);
+            const json items = packet.is_array() ? packet : json::array({packet});
+            for (const auto& item : items) {
+                const std::string stream = item.value("stream", "");
+                const json data = item.value("data", json::object());
+                if (stream == "authorization") {
+                    const std::string status = data.value("status", "");
+                    if (status == "authorized") {
+                        PublishCoreEvent(tradebox::core::BrokerEvent{
+                            .kind =
+                                tradebox::core::BrokerEventKind::Authorized,
+                            .source_event_id =
+                                "authorized:" +
+                                std::to_string(active_generation_.load()),
+                            .raw_payload = item.dump(),
+                        });
+                        const json listen = {
+                            {"action", "listen"},
+                            {"data", {{"streams", {"trade_updates"}}}},
+                        };
+                        SendText(socket, listen.dump());
+                    } else {
+                        events_.Push({UiEventType::Status, {},
+                                      "Account stream authorization failed"});
+                        PublishCoreEvent(tradebox::core::BrokerEvent{
+                            .kind = tradebox::core::BrokerEventKind::Failure,
+                            .raw_payload = item.dump(),
+                            .message =
+                                "Account stream authorization failed",
+                        });
+                    }
+                } else if (stream == "listening") {
+                    bool trade_updates_active = false;
+                    for (const auto& subscribed :
+                         data.value("streams", json::array())) {
+                        if (subscribed.is_string() &&
+                            subscribed.get<std::string>() == "trade_updates") {
+                            trade_updates_active = true;
+                            break;
+                        }
+                    }
+                    if (trade_updates_active && !account_connected_.exchange(true)) {
+                        PublishCoreEvent(tradebox::core::BrokerEvent{
+                            .kind = tradebox::core::BrokerEventKind::
+                                TradeUpdatesAcknowledged,
+                            .source_event_id =
+                                "listening:" +
+                                std::to_string(active_generation_.load()),
+                            .raw_payload = item.dump(),
+                        });
+                        UiEvent event;
+                        event.type = UiEventType::AccountStreamConnected;
+                        event.latency_ms =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - auth_started)
+                                .count();
+                        event.received_at_ms = WallClockNowMs();
+                        events_.Push(std::move(event));
+                    } else if (!trade_updates_active) {
+                        events_.Push({UiEventType::Status, {},
+                                      "Account trade_updates subscription missing"});
+                    }
+                } else if (stream == "trade_updates") {
+                    orders_dirty_ = true;
+                    positions_dirty_ = true;
+                    const std::int64_t received_at = WallClockNowMs();
+                    const std::int64_t timestamp =
+                        ParseTimestampMs(data.value("timestamp", ""));
+                    database_.QueueTimelineEvent(
+                        "alpaca.trading", "", "trade_update",
+                        data.contains("order")
+                            ? data["order"].value("symbol", "")
+                            : "",
+                        timestamp > 0 ? timestamp : received_at, item.dump());
+                    if (!data.contains("order") ||
+                        !data["order"].is_object()) {
+                        throw std::runtime_error(
+                            "trade_updates payload has no order object");
+                    }
+                    tradebox::core::TradeUpdatePayload update;
+                    update.event = data.value("event", "");
+                    update.execution_id =
+                        data.value("execution_id", "");
+                    update.order = ParseCoreOrder(data["order"]);
+                    update.fill_qty = OptionalDecimal(data, "qty");
+                    update.fill_price = OptionalDecimal(data, "price");
+                    update.position_qty =
+                        OptionalDecimal(data, "position_qty");
+                    update.event_at_ms =
+                        timestamp > 0 ? timestamp : received_at;
+                    std::string source_event_id = update.execution_id;
+                    if (source_event_id.empty()) {
+                        source_event_id =
+                            update.order.id + ":" + update.event + ":" +
+                            std::to_string(update.event_at_ms);
+                    }
+                    PublishCoreEvent(tradebox::core::BrokerEvent{
+                        .kind =
+                            tradebox::core::BrokerEventKind::TradeUpdate,
+                        .source_event_id = std::move(source_event_id),
+                        .raw_payload = item.dump(),
+                        .payload = std::move(update),
+                    });
+                    UiEvent event;
+                    event.type = UiEventType::AccountStreamEvent;
+                    event.received_at_ms = received_at;
+                    event.latency_ms =
+                        timestamp > 0 ? received_at - timestamp : -1;
+                    events_.Push(std::move(event));
+                }
+            }
+        } catch (const std::exception& error) {
+            events_.Push({UiEventType::Status, {},
+                          "Account stream JSON error: " +
+                              std::string(error.what())});
+        }
+        message.clear();
+    }
+
+    account_connected_ = false;
+    if (account_websocket_.exchange(nullptr) == socket)
+        WinHttpCloseHandle(socket);
+    WinHttpCloseHandle(connection);
+    WinHttpCloseHandle(session);
+    if (running_)
+    {
+        events_.Push(
+            {UiEventType::Status, {}, "Account stream disconnected"});
+        PublishCoreEvent(tradebox::core::BrokerEvent{
+            .kind = tradebox::core::BrokerEventKind::Disconnected,
+            .raw_payload = "{}",
+            .message = "Account stream disconnected",
+        });
+    }
+}

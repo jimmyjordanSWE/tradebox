@@ -1,0 +1,35 @@
+# Build and IDE output
+/build/
+/build-*/
+/.vs/
+/.vscode/
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Runtime and local persistence data
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.pid
+/.tradebox/
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+*credentials*.json
+*secrets*.json
+
+# Generated screenshots and local artifacts
+/artifacts/
+
+# Platform/editor noise
+*.user
+*.suo
+*.userprefs
+Thumbs.db
+desktop.ini
+
