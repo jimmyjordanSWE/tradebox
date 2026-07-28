@@ -3,6 +3,7 @@
 #include "tradebox/application/order_execution_service.h"
 #include "tradebox/broker/alpaca_service.h"
 #include "tradebox/core/system_clock.h"
+#include "tradebox/core/bar_store.h"
 #include "tradebox/core/market_data_store.h"
 #include "tradebox/core/trading_core.h"
 #include "tradebox/persistence/database_event_journal.h"
@@ -16,26 +17,32 @@ namespace tradebox::application {
 class TradingApplication::Impl final {
 public:
     explicit Impl(Database& database)
-        : owned_events(std::make_unique<UiEventQueue>()),
+        : database(database),
+          owned_events(std::make_unique<UiEventQueue>()),
           journal(database),
           order_journal(database),
           core(journal, clock),
-          broker(*owned_events, database, core, market_data, market_data),
+          broker(*owned_events, database, core, market_data,
+                 market_data, bars),
           order_execution(core, broker, order_journal, clock) {}
 
     Impl(UiEventQueue& events, Database& database)
-        : journal(database),
+        : database(database),
+          journal(database),
           order_journal(database),
           core(journal, clock),
-          broker(events, database, core, market_data, market_data),
+          broker(events, database, core, market_data,
+                 market_data, bars),
           order_execution(core, broker, order_journal, clock) {}
 
+    Database& database;
     std::unique_ptr<UiEventQueue> owned_events;
     persistence::DatabaseEventJournal journal;
     persistence::DatabaseOrderCommandJournal order_journal;
     core::SystemClock clock;
     core::TradingCore core;
     core::MarketDataStore market_data;
+    core::BarStore bars;
     AlpacaService broker;
     OrderExecutionService order_execution;
 };
@@ -53,6 +60,11 @@ core::CoreSnapshot TradingApplication::Snapshot() const {
     return impl_->core.Snapshot();
 }
 
+std::optional<core::CoreSnapshot> TradingApplication::SnapshotAfter(
+    std::uint64_t revision) const {
+    return impl_->core.SnapshotAfter(revision);
+}
+
 core::MarketDataSnapshot TradingApplication::MarketData(
     const std::string& symbol) const {
     return impl_->market_data.Snapshot(symbol);
@@ -63,6 +75,48 @@ core::MarketDataDelta TradingApplication::MarketDataChanges(
     std::size_t maximum_events) const {
     return impl_->market_data.Delta(
         symbol, after_sequence, maximum_events);
+}
+
+core::ChangedInstruments TradingApplication::ChangedMarketInstruments(
+    std::uint64_t after_sequence,
+    std::size_t maximum_instruments) const {
+    return impl_->market_data.Changes(
+        after_sequence, maximum_instruments);
+}
+
+core::BarSeriesSnapshot TradingApplication::Bars(
+    const core::BarSeriesKey& key,
+    core::BarRange range) const {
+    core::BarSeriesSnapshot snapshot =
+        impl_->bars.Bars(key, range);
+    if (snapshot.missing_ranges.empty()) return snapshot;
+
+    StoredBarSeries stored =
+        impl_->database.LoadProviderBars(key, range);
+    std::optional<core::BarRange> first_coverage;
+    if (!stored.coverage.empty()) {
+        first_coverage = stored.coverage.front();
+        stored.coverage.erase(stored.coverage.begin());
+    }
+    impl_->bars.Upsert({
+        .key = key,
+        .symbol = std::move(stored.symbol),
+        .bars = std::move(stored.bars),
+        .covered_range = first_coverage,
+    });
+    for (const core::BarRange coverage : stored.coverage)
+        impl_->bars.Upsert({
+            .key = key,
+            .covered_range = coverage,
+        });
+    return impl_->bars.Bars(key, range);
+}
+
+core::ChangedBarSeriesBatch TradingApplication::ChangedBarSeries(
+    std::uint64_t after_sequence,
+    std::size_t maximum_series) const {
+    return impl_->bars.BarChanges(
+        after_sequence, maximum_series);
 }
 
 std::expected<core::CommandReceipt, core::CoreError>

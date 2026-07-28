@@ -27,6 +27,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -68,10 +69,6 @@ struct Chart {
     int visible_bars = 120;
     double last_trade_price = 0;
     std::int64_t last_trade_timestamp_ms = 0;
-    std::vector<tradebox::core::MarketTrade> ticks;
-    std::optional<std::future<tradebox::core::TickSeries>> tick_request;
-    std::int64_t tick_range_ns = 60LL * 60 * 1'000'000'000;
-    std::string tick_status;
     bool window_open = false;
 };
 
@@ -91,6 +88,7 @@ struct App {
         std::uint64_t cursor = 0;
     };
     std::unordered_map<std::string, MarketProjection> market_views;
+    std::uint64_t market_change_cursor = 0;
     // Read-only projections copied from the headless core for rendering.
     tradebox::core::CoreSnapshot core_view;
     tradebox::core::AccountState account;
@@ -110,6 +108,7 @@ struct App {
     bool show_event_log = true;
     bool show_orders = true;
     bool show_positions = true;
+    bool show_time_sales = true;
     ConnectionState connection_state = ConnectionState::Disconnected;
     std::int64_t market_latency_ms = -1;
     std::int64_t last_market_received_at_ms = 0;
@@ -126,9 +125,13 @@ struct App {
     struct OrderTicket {
         OrderEntryDraft draft;
         std::array<char, 96> name{'U','n','t','i','t','l','e','d',' ','o','r','d','e','r'};
+        std::array<char, 24> symbol{'A','M','D'};
         std::array<char, 64> amount{'1'};
         std::array<char, 64> limit{};
         std::array<char, 64> stop{};
+        std::string symbol_query;
+        std::vector<tradebox::core::TradableAsset> symbol_matches;
+        int symbol_cursor = 0;
         bool window_open = true;
         bool was_visible = false;
     };
@@ -137,7 +140,13 @@ struct App {
     std::array<char, 96> asset_query{};
     int asset_cursor = 0;
     std::vector<tradebox::core::TradableAsset> asset_matches;
+    std::string watchlist_asset_query;
     std::string selected_symbol = "AMD";
+    std::array<char, 24> time_sales_symbol{'A','M','D'};
+    std::string time_sales_query;
+    std::vector<tradebox::core::TradableAsset> time_sales_matches;
+    int time_sales_cursor = 0;
+    std::size_t linked_order_ticket = 0;
     bool show_order_entry = true;
     bool command_in_flight = false;
     std::string command_request_id;
@@ -148,14 +157,17 @@ struct App {
     std::filesystem::path capture_path;
     bool exit_after_capture = false;
     int frames_before_capture = 0;
+    bool vsync_requested = false;
     bool vsync_enabled = false;
     int swap_interval = 0;
     float display_refresh_hz = 0;
+    int maximum_frame_rate = 0;
     bool software_frame_pacing = false;
-    Uint64 display_sync_changed_at = 0;
     Uint64 next_frame_deadline_ns = 0;
     MarketDataStorageUsage market_storage;
     Uint64 market_storage_sampled_at = 0;
+    DatabaseWriterTelemetry writer_telemetry;
+    Uint64 writer_telemetry_sampled_at = 0;
 };
 
 void RequestChartData(App& app, Chart& chart);
@@ -166,13 +178,17 @@ void AddMessage(App& app, std::string message) {
         app.messages.erase(app.messages.begin(), app.messages.begin() + 20);
 }
 
-void RefreshDisplaySync(App& app, SDL_Window* window, bool announce) {
-    app.software_frame_pacing = false;
+void ApplyPresentationSettings(App& app, SDL_Window* window, bool announce) {
+    app.software_frame_pacing = app.maximum_frame_rate > 0;
     app.next_frame_deadline_ns = 0;
-    app.display_sync_changed_at = SDL_GetTicks();
-    app.vsync_enabled = SDL_GL_SetSwapInterval(-1);
-    if (!app.vsync_enabled)
-        app.vsync_enabled = SDL_GL_SetSwapInterval(1);
+    app.vsync_enabled = false;
+    if (app.vsync_requested) {
+        app.vsync_enabled = SDL_GL_SetSwapInterval(-1);
+        if (!app.vsync_enabled)
+            app.vsync_enabled = SDL_GL_SetSwapInterval(1);
+    } else {
+        SDL_GL_SetSwapInterval(0);
+    }
     int accepted_interval = 0;
     if (app.vsync_enabled &&
         SDL_GL_GetSwapInterval(&accepted_interval))
@@ -184,8 +200,19 @@ void RefreshDisplaySync(App& app, SDL_Window* window, bool announce) {
     app.display_refresh_hz = mode ? mode->refresh_rate : 0;
     if (announce) {
         std::ostringstream message;
-        message << "VSync active";
-        message << (app.swap_interval == -1 ? " (adaptive)" : " (standard)");
+        if (app.vsync_enabled) {
+            message << (app.swap_interval == -1
+                            ? "VSync active (adaptive)"
+                            : "VSync active (standard)");
+        } else if (app.vsync_requested) {
+            message << "VSync requested but unavailable";
+        } else {
+            message << "VSync off";
+        }
+        if (app.maximum_frame_rate > 0)
+            message << "; capped at " << app.maximum_frame_rate << " FPS";
+        else
+            message << "; frame rate uncapped";
         if (app.display_refresh_hz > 0)
             message << " on " << std::fixed << std::setprecision(0)
                     << app.display_refresh_hz << " Hz display";
@@ -193,31 +220,10 @@ void RefreshDisplaySync(App& app, SDL_Window* window, bool announce) {
     }
 }
 
-void EvaluatePresentationPacing(App& app) {
-    if (app.software_frame_pacing || !app.vsync_enabled ||
-        app.display_refresh_hz <= 0 ||
-        SDL_GetTicks() - app.display_sync_changed_at < 4000)
-        return;
-    const float delivered_fps = ImGui::GetIO().Framerate;
-    if (delivered_fps >= app.display_refresh_hz * 0.75f) return;
-    if (!SDL_GL_SetSwapInterval(0)) return;
-    app.software_frame_pacing = true;
-    app.vsync_enabled = false;
-    app.swap_interval = 0;
-    app.next_frame_deadline_ns = 0;
-    AddMessage(app, "OpenGL VSync delivered " +
-                        std::to_string(static_cast<int>(
-                            std::lround(delivered_fps))) +
-                        " FPS on " +
-                        std::to_string(static_cast<int>(
-                            std::lround(app.display_refresh_hz))) +
-                        " Hz display; using refresh-rate frame pacing");
-}
-
 void PaceSoftwareFrame(App& app) {
-    if (!app.software_frame_pacing || app.display_refresh_hz <= 0) return;
+    if (!app.software_frame_pacing || app.maximum_frame_rate <= 0) return;
     const Uint64 period_ns = static_cast<Uint64>(
-        1000000000.0 / static_cast<double>(app.display_refresh_hz));
+        1000000000.0 / static_cast<double>(app.maximum_frame_rate));
     const Uint64 now = SDL_GetTicksNS();
     if (app.next_frame_deadline_ns == 0 ||
         now > app.next_frame_deadline_ns + period_ns * 4)
@@ -388,13 +394,13 @@ double PreviousSessionClose(const Chart& chart) {
 }
 
 void RefreshCoreProjection(App& app) {
-    tradebox::core::CoreSnapshot snapshot =
-        app.application.Snapshot();
-    if (snapshot.revision == app.core_view.revision) return;
+    auto snapshot =
+        app.application.SnapshotAfter(app.core_view.revision);
+    if (!snapshot) return;
 
     const bool first_account =
-        !app.has_account && snapshot.account.has_value();
-    app.core_view = std::move(snapshot);
+        !app.has_account && snapshot->account.has_value();
+    app.core_view = std::move(*snapshot);
     app.has_account = app.core_view.account.has_value();
     app.account = app.core_view.account.value_or(
         tradebox::core::AccountState{});
@@ -427,7 +433,7 @@ void RefreshCoreProjection(App& app) {
 }
 
 void InsertProjectedTrade(
-    std::vector<tradebox::core::MarketTrade>& trades,
+    std::deque<tradebox::core::MarketTrade>& trades,
     tradebox::core::MarketTrade trade) {
     if (!trade.trade_id.empty()) {
         const auto duplicate = std::ranges::find_if(
@@ -440,8 +446,12 @@ void InsertProjectedTrade(
                         existing.event_time_ns / day_ns ==
                             trade.event_time_ns / day_ns);
             });
-        if (duplicate != trades.end()) *duplicate = std::move(trade);
-        else {
+        if (duplicate != trades.end()) {
+            *duplicate = std::move(trade);
+        } else if (trades.empty() ||
+                   trades.front().event_time_ns <= trade.event_time_ns) {
+            trades.push_front(std::move(trade));
+        } else {
             const auto position = std::ranges::find_if(
                 trades, [&trade](const auto& existing) {
                     return existing.event_time_ns < trade.event_time_ns;
@@ -449,13 +459,18 @@ void InsertProjectedTrade(
             trades.insert(position, std::move(trade));
         }
     } else {
-        const auto position = std::ranges::find_if(
-            trades, [&trade](const auto& existing) {
-                return existing.event_time_ns < trade.event_time_ns;
-            });
-        trades.insert(position, std::move(trade));
+        if (trades.empty() ||
+            trades.front().event_time_ns <= trade.event_time_ns) {
+            trades.push_front(std::move(trade));
+        } else {
+            const auto position = std::ranges::find_if(
+                trades, [&trade](const auto& existing) {
+                    return existing.event_time_ns < trade.event_time_ns;
+                });
+            trades.insert(position, std::move(trade));
+        }
     }
-    if (trades.size() > 2'000) trades.resize(2'000);
+    if (trades.size() > 2'000) trades.pop_back();
 }
 
 void RefreshMarketProjection(App& app, const std::string& symbol) {
@@ -475,12 +490,24 @@ void RefreshMarketProjection(App& app, const std::string& symbol) {
     snapshot.quotes_subscribed = delta.quotes_subscribed;
     snapshot.status_message = std::move(delta.status_message);
     snapshot.last_received_at_ms = delta.last_received_at_ms;
-    snapshot.latest_quote = std::move(delta.latest_quote);
     for (auto& sequenced : delta.events) {
         std::visit(
             [&](auto& event) {
                 using Event = std::decay_t<decltype(event)>;
                 if constexpr (std::is_same_v<
+                                  Event,
+                                  tradebox::core::QuoteReceived>) {
+                    if (event.quote.received_at_ms > 0 &&
+                        event.quote.event_time_ns > 0) {
+                        app.market_latency_ms =
+                            event.quote.received_at_ms -
+                            event.quote.event_time_ns / 1'000'000;
+                        app.last_market_received_at_ms =
+                            event.quote.received_at_ms;
+                    }
+                    snapshot.latest_quote =
+                        std::move(event.quote);
+                } else if constexpr (std::is_same_v<
                                   Event,
                                   tradebox::core::TradeReceived>) {
                     if (event.trade.received_at_ms > 0 &&
@@ -499,13 +526,6 @@ void RefreshMarketProjection(App& app, const std::string& symbol) {
                              0, 0, 0,
                              event.trade.price.ToDisplayDouble(),
                              event.trade.size.ToDisplayDouble()});
-                        if (chart->second.timeframe == "Ticks") {
-                            chart->second.ticks.push_back(event.trade);
-                            if (chart->second.ticks.size() > 100'000)
-                                chart->second.ticks.erase(
-                                    chart->second.ticks.begin(),
-                                    chart->second.ticks.begin() + 10'000);
-                        }
                     }
                     InsertProjectedTrade(snapshot.trades,
                                          std::move(event.trade));
@@ -522,19 +542,6 @@ void RefreshMarketProjection(App& app, const std::string& symbol) {
                                     trade.event_time_ns / day_ns ==
                                         event.event_time_ns / day_ns);
                         });
-                    if (auto chart = app.charts.find(symbol);
-                        chart != app.charts.end())
-                        std::erase_if(
-                            chart->second.ticks,
-                            [&](const auto& trade) {
-                                constexpr std::int64_t day_ns =
-                                    24LL * 60 * 60 * 1'000'000'000;
-                                return trade.trade_id == event.trade_id &&
-                                       (event.event_time_ns <= 0 ||
-                                        trade.event_time_ns / day_ns ==
-                                            event.event_time_ns /
-                                                day_ns);
-                            });
                 } else if constexpr (std::is_same_v<
                                          Event,
                                          tradebox::core::TradeCorrected>) {
@@ -544,36 +551,40 @@ void RefreshMarketProjection(App& app, const std::string& symbol) {
                             return trade.trade_id ==
                                    event.original_trade_id;
                         });
-                    if (auto chart = app.charts.find(symbol);
-                        chart != app.charts.end()) {
-                        std::erase_if(
-                            chart->second.ticks,
-                            [&](const auto& trade) {
-                                return trade.trade_id ==
-                                       event.original_trade_id;
-                            });
-                        chart->second.ticks.push_back(
-                            event.corrected_trade);
-                    }
                     InsertProjectedTrade(
                         snapshot.trades,
                         std::move(event.corrected_trade));
                 }
             },
-            sequenced.event);
+            *sequenced.event);
     }
     projection.cursor = delta.next_sequence;
     snapshot.revision = projection.cursor;
 }
 
 void RefreshVisibleMarketData(App& app) {
-    for (const std::string& symbol : app.watchlist)
-        RefreshMarketProjection(app, symbol);
-    for (const auto& ticket : app.order_tickets)
-        if (!ticket.draft.symbol.empty() &&
-            std::ranges::find(app.watchlist, ticket.draft.symbol) ==
-                app.watchlist.end())
-            RefreshMarketProjection(app, ticket.draft.symbol);
+    auto changes = app.application.ChangedMarketInstruments(
+        app.market_change_cursor);
+    if (changes.instruments.empty() &&
+        !changes.gap_detected) {
+        app.market_change_cursor = changes.next_sequence;
+        return;
+    }
+    if (changes.gap_detected) {
+        for (const auto& symbol : app.requested_market_symbols)
+            RefreshMarketProjection(app, symbol);
+    } else {
+        std::unordered_set<std::string> refreshed;
+        refreshed.reserve(changes.instruments.size());
+        for (const auto& change : changes.instruments) {
+            if (std::ranges::binary_search(
+                    app.requested_market_symbols,
+                    change.symbol) &&
+                refreshed.insert(change.symbol).second)
+                RefreshMarketProjection(app, change.symbol);
+        }
+    }
+    app.market_change_cursor = changes.next_sequence;
 }
 
 void RefreshRequiredMarketSymbols(App& app) {
@@ -581,6 +592,8 @@ void RefreshRequiredMarketSymbols(App& app) {
         app.connection_state == ConnectionState::Error)
         return;
     std::vector<std::string> required = app.watchlist;
+    if (!app.selected_symbol.empty())
+        required.push_back(app.selected_symbol);
     for (const auto& ticket : app.order_tickets)
         if (!ticket.draft.symbol.empty())
             required.push_back(ticket.draft.symbol);
@@ -743,6 +756,85 @@ void SubmitUiCommand(App& app, tradebox::core::NativeOrderCommand command,
     });
 }
 
+std::optional<std::string> DrawSymbolSelector(
+    App& app, const char* label, std::array<char, 24>& input,
+    std::string& previous_query,
+    std::vector<tradebox::core::TradableAsset>& matches,
+    int& cursor) {
+    const bool submitted = ImGui::InputText(
+        label, input.data(), input.size(),
+        ImGuiInputTextFlags_CharsUppercase |
+            ImGuiInputTextFlags_EnterReturnsTrue);
+    const std::string query = NormalizeSymbol(input.data());
+    if (query != previous_query) {
+        previous_query = query;
+        cursor = 0;
+        matches =
+            query.empty()
+                ? std::vector<tradebox::core::TradableAsset>{}
+                : tradebox::core::SearchTradableAssets(
+                      app.asset_catalog, query, 5);
+    }
+    if (ImGui::IsItemActive() && !matches.empty()) {
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
+            cursor = (cursor + 1) %
+                     static_cast<int>(matches.size());
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))
+            cursor =
+                (cursor + static_cast<int>(matches.size()) - 1) %
+                static_cast<int>(matches.size());
+    }
+    if ((ImGui::IsItemHovered() || ImGui::IsItemActive()) &&
+        !matches.empty()) {
+        ImGui::BeginTooltip();
+        for (std::size_t index = 0; index < matches.size(); ++index) {
+            const auto& asset = matches[index];
+            if (static_cast<int>(index) == cursor)
+                ImGui::TextColored(
+                    ImVec4(.3f, .85f, 1, 1), "> %s",
+                    asset.symbol.c_str());
+            else
+                ImGui::Text("  %s", asset.symbol.c_str());
+            ImGui::SameLine(100);
+            ImGui::TextDisabled(
+                "%s | %s", asset.name.c_str(),
+                asset.exchange.c_str());
+        }
+        ImGui::EndTooltip();
+    }
+    if (!submitted) return std::nullopt;
+    const std::string selected =
+        !matches.empty()
+            ? matches[static_cast<std::size_t>(cursor)].symbol
+            : query;
+    if (selected.empty()) return std::nullopt;
+    std::snprintf(input.data(), input.size(), "%s", selected.c_str());
+    previous_query = selected;
+    matches.clear();
+    return selected;
+}
+
+void SelectTimeSalesSymbol(App& app, const std::string& symbol,
+                           bool update_linked_ticket) {
+    if (symbol.empty()) return;
+    app.selected_symbol = symbol;
+    std::snprintf(
+        app.time_sales_symbol.data(), app.time_sales_symbol.size(),
+        "%s", symbol.c_str());
+    app.time_sales_query = symbol;
+    app.time_sales_matches.clear();
+    if (!update_linked_ticket ||
+        app.linked_order_ticket >= app.order_tickets.size())
+        return;
+    auto& ticket = app.order_tickets[app.linked_order_ticket];
+    ticket.draft.symbol = symbol;
+    std::snprintf(
+        ticket.symbol.data(), ticket.symbol.size(), "%s",
+        symbol.c_str());
+    ticket.symbol_query = symbol;
+    ticket.symbol_matches.clear();
+}
+
 void DrawOrderEntry(App& app) {
     if (app.order_tickets.empty()) app.order_tickets.emplace_back();
     for (std::size_t ticket_index = 0; ticket_index < app.order_tickets.size(); ++ticket_index) {
@@ -760,14 +852,17 @@ void DrawOrderEntry(App& app) {
         ImGui::SetNextWindowSize(ImVec2(360, 460), ImGuiCond_FirstUseEver);
         if (!ImGui::Begin(title.c_str(), &ticket.window_open)) { ImGui::End(); ImGui::PopID(); continue; }
         ticket.was_visible = true;
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows))
+            app.linked_order_ticket = ticket_index;
         if (ImGui::InputText("Ticket name", ticket.name.data(), ticket.name.size()))
             ticket.draft.name = ticket.name.data();
-    const char* symbols[] = {"AMD", "MSFT", "AAPL", "QQQ"};
-    int symbol_index = 0;
-    for (int i = 0; i < 4; ++i) if (ticket.draft.symbol == symbols[i]) symbol_index = i;
-    if (ImGui::Combo("Symbol", &symbol_index, symbols, 4)) {
-        ticket.draft.symbol = symbols[symbol_index];
-        app.selected_symbol = ticket.draft.symbol;
+    ImGui::SetNextItemWidth(180);
+    if (const auto selected = DrawSymbolSelector(
+            app, "Symbol", ticket.symbol, ticket.symbol_query,
+            ticket.symbol_matches, ticket.symbol_cursor)) {
+        ticket.draft.symbol = *selected;
+        app.linked_order_ticket = ticket_index;
+        SelectTimeSalesSymbol(app, *selected, false);
     }
     const char* sides[] = {"Buy", "Sell"};
     int side_index = ticket.draft.side == "Sell" ? 1 : 0;
@@ -818,17 +913,45 @@ void DrawOrderEntry(App& app) {
     }
 }
 
-void DrawMarketPanel(App& app) {
+std::string TradeTime(const std::string& timestamp) {
+    const std::size_t separator = timestamp.find('T');
+    if (separator == std::string::npos ||
+        separator + 9 > timestamp.size())
+        return timestamp;
+    const std::size_t available =
+        std::min<std::size_t>(12, timestamp.size() - separator - 1);
+    return timestamp.substr(separator + 1, available);
+}
+
+void DrawTimeSales(App& app) {
+    if (!app.show_time_sales) return;
+    ImGui::SetNextWindowSize(ImVec2(560, 420), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("TIME & SALES", &app.show_time_sales)) {
+        ImGui::End();
+        return;
+    }
+    ImGui::SetNextItemWidth(170);
+    if (const auto selected = DrawSymbolSelector(
+            app, "Symbol", app.time_sales_symbol,
+            app.time_sales_query, app.time_sales_matches,
+            app.time_sales_cursor))
+        SelectTimeSalesSymbol(app, *selected, true);
+
     const auto& market = MarketView(app, app.selected_symbol);
-    ImGui::SetNextWindowSize(ImVec2(600, 360), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("MARKET DATA")) { ImGui::End(); return; }
     const bool stale = market.last_received_at_ms > 0 &&
         SystemNowMs() - market.last_received_at_ms > 5000;
     const char* stream = market.stream_status == tradebox::core::MarketStreamStatus::Subscribed
         ? "CONNECTED" : market.stream_status == tradebox::core::MarketStreamStatus::Stale
         ? "STALE" : "DISCONNECTED";
+    const char* feed =
+        market.feed == tradebox::core::MarketDataFeed::Sip
+            ? "SIP"
+            : market.feed == tradebox::core::MarketDataFeed::Iex
+                  ? "IEX"
+                  : "UNKNOWN FEED";
+    ImGui::SameLine();
     ImGui::TextColored(stale ? ImVec4(1, .65f, .2f, 1) : ImVec4(.3f, .9f, .5f, 1),
-                       "%s  |  %s  |  %s", app.selected_symbol.c_str(), stream,
+                       "%s | %s | %s", feed, stream,
                        market.trades_subscribed && market.quotes_subscribed ? "SUBSCRIBED" : "NOT SUBSCRIBED");
     if (market.latest_quote) {
         const auto& quote = *market.latest_quote;
@@ -836,38 +959,62 @@ void DrawMarketPanel(App& app) {
                     quote.bid_price.ToString().c_str(), quote.bid_size.ToString().c_str(), quote.bid_exchange.c_str(),
                     quote.ask_price.ToString().c_str(), quote.ask_size.ToString().c_str(), quote.ask_exchange.c_str());
     }
-    if (!market.trades.empty()) {
-        ImGui::Text("Latest trade  %s x %s  %s", market.trades.front().price.ToString().c_str(),
-                    market.trades.front().size.ToString().c_str(), market.trades.front().broker_timestamp.c_str());
-        const ImVec2 size(ImGui::GetContentRegionAvail().x, 85);
-        ImGui::InvisibleButton("##tick-chart", size);
-        const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
-        ImDrawList* draw = ImGui::GetWindowDrawList();
-        draw->AddRectFilled(a, b, IM_COL32(18, 24, 34, 255));
-        double low = market.trades.front().price.ToDisplayDouble();
-        double high = low;
-        for (const auto& trade : market.trades) { const double p = trade.price.ToDisplayDouble(); low = std::min(low, p); high = std::max(high, p); }
-        const double span = std::max(high - low, 0.000001);
-        for (std::size_t i = 1; i < market.trades.size(); ++i) {
-            const auto px = [&](std::size_t n) { return a.x + size.x * static_cast<float>(n - 1) / static_cast<float>(std::max<std::size_t>(market.trades.size() - 1, 1)); };
-            const auto py = [&](std::size_t n) { return b.y - 5.0f - (static_cast<float>((market.trades[n].price.ToDisplayDouble() - low) / span) * (size.y - 10.0f)); };
-            draw->AddLine(ImVec2(px(i), py(i)), ImVec2(a.x + size.x * static_cast<float>(i) / static_cast<float>(std::max<std::size_t>(market.trades.size() - 1, 1)), py(i)), IM_COL32(78, 177, 255, 255), 1.5f);
-        }
-    } else ImGui::TextDisabled("No trades received");
-    ImGui::SeparatorText("Trade tape (newest first)");
+    ImGui::TextDisabled(
+        "%zu prints | newest first", market.trades.size());
     if (ImGui::BeginTable("trade-tape", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
-                          ImVec2(0, ImGui::GetContentRegionAvail().y))) {
+                           ImVec2(0, ImGui::GetContentRegionAvail().y))) {
         ImGui::TableSetupColumn("Time"); ImGui::TableSetupColumn("Price"); ImGui::TableSetupColumn("Size");
         ImGui::TableSetupColumn("Exchange"); ImGui::TableSetupColumn("Conditions"); ImGui::TableHeadersRow();
-        for (const auto& trade : market.trades) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(trade.broker_timestamp.c_str());
-            ImGui::TableNextColumn(); ImGui::TextColored(trade.corrected ? ImVec4(1, .7f, .25f, 1) : ImVec4(.75f, .85f, 1, 1), "%s", trade.price.ToString().c_str());
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(trade.size.ToString().c_str());
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(trade.exchange.c_str());
-            ImGui::TableNextColumn();
-            std::string conditions; for (const auto& c : trade.conditions) { if (!conditions.empty()) conditions += ","; conditions += c; }
-            ImGui::TextUnformatted(conditions.c_str());
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(market.trades.size()));
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart;
+                 row < clipper.DisplayEnd; ++row) {
+                const std::size_t index =
+                    static_cast<std::size_t>(row);
+                const auto& trade = market.trades[index];
+                int direction = 0;
+                if (index + 1 < market.trades.size()) {
+                    const auto& older = market.trades[index + 1];
+                    direction =
+                        trade.price > older.price
+                            ? 1
+                            : trade.price < older.price ? -1 : 0;
+                }
+                const ImVec4 color =
+                    trade.corrected
+                        ? ImVec4(1, .7f, .25f, 1)
+                        : direction > 0
+                              ? ImVec4(.25f, .9f, .58f, 1)
+                              : direction < 0
+                                    ? ImVec4(.96f, .38f, .43f, 1)
+                                    : ImVec4(.75f, .85f, 1, 1);
+                const std::string time =
+                    TradeTime(trade.broker_timestamp);
+                const std::string price =
+                    trade.price.ToString();
+                const std::string size =
+                    trade.size.ToString();
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(time.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextColored(
+                    color, "%s %s",
+                    direction > 0 ? "^" : direction < 0 ? "v" : " ",
+                    price.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(size.c_str());
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(trade.exchange.c_str());
+                ImGui::TableNextColumn();
+                std::string conditions;
+                for (const auto& condition : trade.conditions) {
+                    if (!conditions.empty()) conditions += ",";
+                    conditions += condition;
+                }
+                ImGui::TextUnformatted(conditions.c_str());
+            }
         }
         ImGui::EndTable();
     }
@@ -1265,11 +1412,11 @@ void DrawPerformanceOverlay(const App& app) {
 
     char performance_label[160];
     const char* sync_label =
-        app.software_frame_pacing
-            ? "FRAME PACED"
-            : (!app.vsync_enabled
-            ? "VSYNC FAILED"
-            : (app.swap_interval == -1 ? "VSYNC ADAPTIVE" : "VSYNC ON"));
+        app.vsync_enabled
+            ? (app.swap_interval == -1 ? "VSYNC ADAPTIVE" : "VSYNC ON")
+            : (app.maximum_frame_rate > 0
+                   ? "FPS CAPPED"
+                   : (app.vsync_requested ? "VSYNC FAILED" : "UNCAPPED"));
     std::snprintf(performance_label, sizeof(performance_label),
                   "%s %.0f Hz  |  %.0f FPS  %.2f ms  |  CPU %.1f%% "
                   "(%.2f core)  |  RAM %.0f MB",
@@ -1297,8 +1444,18 @@ void DrawPerformanceOverlay(const App& app) {
         ")  |  TICKS " + storage_size(app.market_storage.tick_bytes) + " (" +
         std::to_string(app.market_storage.tick_rows) + ")  |  DISK " +
         storage_size(app.market_storage.database_bytes);
-    const std::array<std::string_view, 4> lines = {
-        clock_label, session_label, performance_label, storage_label};
+    const std::string writer_label =
+        "WRITE-BEHIND  |  QUEUED " +
+        std::to_string(app.writer_telemetry.pending_events) +
+        "  |  PEAK " +
+        std::to_string(app.writer_telemetry.high_water_events) +
+        "  |  DROPPED " +
+        std::to_string(
+            app.writer_telemetry.dropped_market_events +
+            app.writer_telemetry.dropped_timeline_events);
+    const std::array<std::string_view, 5> lines = {
+        clock_label, session_label, performance_label, storage_label,
+        writer_label};
     float text_width = 0;
     for (const std::string_view line : lines)
         text_width =
@@ -1537,6 +1694,8 @@ bool DrawTitleBar(App& app, SDL_Window* window) {
                 }
             }
             if (ImGui::MenuItem("Order")) app.order_tickets.emplace_back();
+            if (ImGui::MenuItem("Time & Sales"))
+                app.show_time_sales = true;
             if (ImGui::MenuItem("Watchlist")) app.show_watchlist = true;
             if (ImGui::MenuItem("Account")) app.show_account = true;
             if (ImGui::MenuItem("Orders")) app.show_orders = true;
@@ -1664,7 +1823,7 @@ void ForgetSavedCredentials(App& app, bool paper) {
                         " credentials from Windows Credential Manager");
 }
 
-void DrawCredentials(App& app) {
+void DrawCredentials(App& app, SDL_Window* window) {
     if (!app.credentials_open) return;
     ImGui::OpenPopup("Settings");
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -1675,6 +1834,28 @@ void DrawCredentials(App& app) {
     if (ImGui::BeginPopupModal("Settings", &app.credentials_open,
                                ImGuiWindowFlags_AlwaysAutoResize |
                                    ImGuiWindowFlags_NoMove)) {
+        ImGui::SeparatorText("User interface");
+        bool presentation_changed = false;
+        if (ImGui::Checkbox("Vertical sync", &app.vsync_requested)) {
+            app.database.SaveAppSetting(
+                "ui.vsync", app.vsync_requested ? "1" : "0");
+            presentation_changed = true;
+        }
+        ImGui::SetNextItemWidth(120);
+        if (ImGui::InputInt("Maximum FPS (0 = unlimited)",
+                            &app.maximum_frame_rate, 30, 120)) {
+            app.maximum_frame_rate =
+                std::clamp(app.maximum_frame_rate, 0, 10'000);
+            app.database.SaveAppSetting(
+                "ui.maximum_fps",
+                std::to_string(app.maximum_frame_rate));
+            presentation_changed = true;
+        }
+        if (presentation_changed)
+            ApplyPresentationSettings(app, window, true);
+        ImGui::TextDisabled(
+            "Default: VSync off and no frame-rate limit.");
+
         ImGui::SeparatorText("Alpaca connection");
         ImGui::TextWrapped(
             "Keys are stored in Windows Credential Manager, never in the "
@@ -1783,26 +1964,8 @@ void AddSymbol(App& app, const std::string& symbol) {
 }
 
 void RequestChartData(App& app, Chart& chart) {
-    if (chart.timeframe != "Ticks") {
-        app.application.RequestMarketHistory(
-            chart.symbol, chart.timeframe);
-        return;
-    }
-    const std::int64_t end_ns =
-        SystemNowMs() * 1'000'000;
-    auto feed =
-        app.application.MarketData(chart.symbol).feed;
-    if (feed == tradebox::core::MarketDataFeed::Unknown)
-        feed = tradebox::core::MarketDataFeed::Iex;
-    chart.tick_status = "Loading cached and historical ticks...";
-    chart.tick_request.emplace(app.application.RequestTicks({
-        .symbol = chart.symbol,
-        .start_ns = end_ns - chart.tick_range_ns,
-        .end_ns = end_ns,
-        .feed = feed,
-        .include_trades = true,
-        .include_quotes = false,
-    }));
+    app.application.RequestMarketHistory(
+        chart.symbol, chart.timeframe);
 }
 
 void OpenChart(App& app, Chart& chart) {
@@ -1833,8 +1996,17 @@ void DrawWatchlist(App& app) {
     const bool submitted = ImGui::InputText(
         "##symbol", app.new_symbol.data(), app.new_symbol.size(),
         ImGuiInputTextFlags_CharsUppercase | ImGuiInputTextFlags_EnterReturnsTrue);
-    app.asset_matches = tradebox::core::SearchTradableAssets(
-        app.asset_catalog, app.new_symbol.data(), 5);
+    const std::string asset_query =
+        NormalizeSymbol(app.new_symbol.data());
+    if (asset_query != app.watchlist_asset_query) {
+        app.watchlist_asset_query = asset_query;
+        app.asset_cursor = 0;
+        app.asset_matches =
+            asset_query.empty()
+                ? std::vector<tradebox::core::TradableAsset>{}
+                : tradebox::core::SearchTradableAssets(
+                      app.asset_catalog, asset_query, 5);
+    }
     if (ImGui::IsItemActive() && !app.asset_matches.empty()) {
         if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
             app.asset_cursor = (app.asset_cursor + 1) % static_cast<int>(app.asset_matches.size());
@@ -1895,6 +2067,10 @@ void DrawWatchlist(App& app) {
                 if (ImGui::MenuItem("Open trade order")) {
                     App::OrderTicket ticket;
                     ticket.draft.symbol = app.watchlist[i];
+                    std::snprintf(
+                        ticket.symbol.data(), ticket.symbol.size(),
+                        "%s", app.watchlist[i].c_str());
+                    ticket.symbol_query = app.watchlist[i];
                     ticket.name = {};
                     const std::string label = "Order " + app.watchlist[i];
                     std::copy(label.begin(), label.end(), ticket.name.begin());
@@ -2063,65 +2239,6 @@ void DrawChartCanvas(Chart& chart) {
     }
 }
 
-void DrawTickChartCanvas(const Chart& chart) {
-    ImVec2 size = ImGui::GetContentRegionAvail();
-    size.x = std::max(size.x, 240.0f);
-    size.y = std::max(size.y, 180.0f);
-    ImGui::InvisibleButton("tick-chart-canvas", size);
-    const ImVec2 a = ImGui::GetItemRectMin();
-    const ImVec2 b = ImGui::GetItemRectMax();
-    ImDrawList* draw = ImGui::GetWindowDrawList();
-    draw->AddRectFilled(a, b, IM_COL32(12, 17, 25, 255));
-    if (chart.ticks.empty()) {
-        draw->AddText(
-            ImVec2(a.x + 16, a.y + 16),
-            IM_COL32(145, 155, 170, 255),
-            chart.tick_status.empty() ? "No ticks in range"
-                                      : chart.tick_status.c_str());
-        return;
-    }
-    const std::size_t maximum_points =
-        static_cast<std::size_t>(std::max(1.0f, size.x * 2));
-    const std::size_t stride =
-        std::max<std::size_t>(
-            1, (chart.ticks.size() + maximum_points - 1) /
-                   maximum_points);
-    double low = chart.ticks.front().price.ToDisplayDouble();
-    double high = low;
-    for (std::size_t index = 0; index < chart.ticks.size();
-         index += stride) {
-        const double price =
-            chart.ticks[index].price.ToDisplayDouble();
-        low = std::min(low, price);
-        high = std::max(high, price);
-    }
-    const double span = std::max(high - low, 0.000001);
-    ImVec2 previous{};
-    bool has_previous = false;
-    std::size_t point = 0;
-    const std::size_t points =
-        (chart.ticks.size() + stride - 1) / stride;
-    for (std::size_t index = 0; index < chart.ticks.size();
-         index += stride, ++point) {
-        const float x =
-            a.x + size.x * static_cast<float>(point) /
-                      static_cast<float>(
-                          std::max<std::size_t>(points - 1, 1));
-        const float y =
-            b.y - 8.0f -
-            static_cast<float>(
-                (chart.ticks[index].price.ToDisplayDouble() - low) /
-                span) *
-                (size.y - 16.0f);
-        const ImVec2 current{x, y};
-        if (has_previous)
-            draw->AddLine(previous, current,
-                          IM_COL32(78, 177, 255, 255), 1.2f);
-        previous = current;
-        has_previous = true;
-    }
-}
-
 void DrawCharts(App& app) {
     for (const std::string& symbol : app.watchlist) {
         auto found = app.charts.find(symbol);
@@ -2135,49 +2252,15 @@ void DrawCharts(App& app) {
             continue;
         }
         ConstrainCurrentWindowToWorkspace();
-        const char* timeframes[] = {"1Day", "1Hour", "1Min", "Ticks"};
+        const char* timeframes[] = {"1Day", "1Hour", "1Min"};
         int timeframe_index =
             chart.timeframe == "1Hour"
                 ? 1
                 : chart.timeframe == "1Min"
-                      ? 2
-                      : chart.timeframe == "Ticks" ? 3 : 0;
-        if (ImGui::Combo("Timeframe", &timeframe_index, timeframes, 4)) {
+                      ? 2 : 0;
+        if (ImGui::Combo("Timeframe", &timeframe_index, timeframes, 3)) {
             chart.timeframe = timeframes[timeframe_index];
             RequestChartData(app, chart);
-        }
-        if (chart.timeframe == "Ticks") {
-            ImGui::SameLine();
-            if (ImGui::Button("1 hour")) {
-                chart.tick_range_ns =
-                    60LL * 60 * 1'000'000'000;
-                RequestChartData(app, chart);
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("1 day")) {
-                chart.tick_range_ns =
-                    24LL * 60 * 60 * 1'000'000'000;
-                RequestChartData(app, chart);
-            }
-            if (chart.tick_request &&
-                chart.tick_request->wait_for(
-                    std::chrono::seconds(0)) ==
-                    std::future_status::ready) {
-                auto series = chart.tick_request->get();
-                chart.ticks = std::move(series.trades);
-                chart.tick_status =
-                    series.error.empty()
-                        ? std::to_string(chart.ticks.size()) +
-                              " ticks"
-                        : std::move(series.error);
-                chart.tick_request.reset();
-            }
-            ImGui::TextDisabled(
-                "%zu ticks | %s", chart.ticks.size(),
-                chart.tick_status.c_str());
-            DrawTickChartCanvas(chart);
-            ImGui::End();
-            continue;
         }
         if (!chart.bars.empty()) {
             const Bar& latest = chart.bars.back();
@@ -2497,7 +2580,21 @@ int RunApplication(const LaunchOptions& options) {
 
     App app(database);
     app.order_tickets.emplace_back();
-    RefreshDisplaySync(app, window, false);
+    const auto* gl_renderer = reinterpret_cast<const char*>(
+        glGetString(GL_RENDERER));
+    const auto* gl_version = reinterpret_cast<const char*>(
+        glGetString(GL_VERSION));
+    AddMessage(
+        app, "OpenGL renderer: " +
+                 std::string(gl_renderer ? gl_renderer : "unknown") +
+                 " | " +
+                 std::string(gl_version ? gl_version : "unknown"));
+    if (const auto value = database.LoadAppSetting("ui.vsync"))
+        app.vsync_requested = *value == "1";
+    if (const auto value = database.LoadAppSetting("ui.maximum_fps"))
+        app.maximum_frame_rate =
+            std::clamp(std::atoi(value->c_str()), 0, 10'000);
+    ApplyPresentationSettings(app, window, false);
     const Uint64 launched_at = SDL_GetTicks();
     if (options.capture_and_exit) {
         app.capture_requested = true;
@@ -2559,7 +2656,7 @@ int RunApplication(const LaunchOptions& options) {
                 done = true;
             }
             if (event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED)
-                RefreshDisplaySync(app, window, true);
+                ApplyPresentationSettings(app, window, true);
             if (event.type == SDL_EVENT_WINDOW_MAXIMIZED) {
                 remember_maximized = true;
                 placement_dirty = true;
@@ -2597,9 +2694,17 @@ int RunApplication(const LaunchOptions& options) {
         RefreshVisibleMarketData(app);
         const Uint64 storage_now = SDL_GetTicks();
         if (app.market_storage_sampled_at == 0 ||
-            storage_now - app.market_storage_sampled_at >= 2000) {
+            storage_now - app.market_storage_sampled_at >= 10000) {
             app.market_storage = database.LoadMarketDataStorageUsage();
             app.market_storage_sampled_at = storage_now;
+        }
+        if (app.writer_telemetry_sampled_at == 0 ||
+            storage_now -
+                    app.writer_telemetry_sampled_at >=
+                500) {
+            app.writer_telemetry =
+                database.WriterTelemetry();
+            app.writer_telemetry_sampled_at = storage_now;
         }
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
@@ -2615,9 +2720,9 @@ int RunApplication(const LaunchOptions& options) {
         ImGui::SetNextWindowPos(ImVec2(10, 550), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(400, 250), ImGuiCond_FirstUseEver);
         DrawLog(app);
-        DrawCredentials(app);
+        DrawCredentials(app, window);
         DrawOrderEntry(app);
-        DrawMarketPanel(app);
+        DrawTimeSales(app);
         DrawCharts(app);
         ImGui::SetNextWindowPos(ImVec2(420, 10), ImGuiCond_FirstUseEver);
         DrawPositions(app);
@@ -2626,7 +2731,6 @@ int RunApplication(const LaunchOptions& options) {
         DrawPerformanceOverlay(app);
 
         ImGui::Render();
-        EvaluatePresentationPacing(app);
         int width = 0, height = 0;
         SDL_GetWindowSizeInPixels(window, &width, &height);
         glViewport(0, 0, width, height);

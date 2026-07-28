@@ -84,6 +84,7 @@ endfunction()
 add_library(tradebox_core STATIC
   src/core/decimal.cpp
   src/core/asset_catalog.cpp
+  src/core/bar_store.cpp
   src/core/market_data_store.cpp
   src/core/order_request.cpp
   src/core/system_clock.cpp
@@ -114,6 +115,7 @@ target_link_libraries(tradebox_platform PRIVATE crypt32 advapi32)
 tradebox_enable_windows_api(tradebox_platform)
 
 add_library(tradebox_broker_alpaca STATIC
+  src/broker/alpaca/alpaca_market_stream_decoder.cpp
   src/broker/alpaca/alpaca_order_codec.cpp
   src/broker/alpaca/alpaca_service.cpp
 )
@@ -168,6 +170,7 @@ target_link_libraries(tradebox_gui PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
   set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
   FetchContent_Declare(
     googletest
@@ -178,6 +181,7 @@ if(BUILD_TESTING)
   FetchContent_MakeAvailable(googletest)
 
   add_executable(tradebox_core_tests
+    tests/unit/bar_store_tests.cpp
     tests/unit/decimal_tests.cpp
     tests/unit/market_data_store_tests.cpp
     tests/unit/order_request_tests.cpp
@@ -194,6 +198,7 @@ if(BUILD_TESTING)
   gtest_discover_tests(tradebox_core_tests)
 
   add_executable(tradebox_order_pipeline_tests
+    tests/unit/alpaca_market_stream_decoder_tests.cpp
     tests/unit/alpaca_order_codec_tests.cpp
     tests/unit/database_order_command_journal_tests.cpp
     tests/unit/order_execution_service_tests.cpp
@@ -215,6 +220,66 @@ if(BUILD_TESTING)
   target_link_libraries(tradebox_ui_tests PRIVATE tradebox_core GTest::gtest_main)
   tradebox_enable_strict_warnings(tradebox_ui_tests)
   gtest_discover_tests(tradebox_ui_tests)
+
+  set(TRADEBOX_REPLAY_CORPUS
+    ${CMAKE_CURRENT_BINARY_DIR}/testdata/alpaca_market_stream_10x10000.jsonl
+  )
+  add_custom_command(
+    OUTPUT
+      ${TRADEBOX_REPLAY_CORPUS}
+      ${TRADEBOX_REPLAY_CORPUS}.assets.json
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+      ${CMAKE_CURRENT_BINARY_DIR}/testdata
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_synthetic_market_stream.py
+      --output ${TRADEBOX_REPLAY_CORPUS}
+      --instruments 10
+      --events-per-instrument 10000
+      --frame-size 100
+    DEPENDS
+      ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_synthetic_market_stream.py
+    VERBATIM
+  )
+  add_custom_target(tradebox_replay_corpus
+    DEPENDS
+      ${TRADEBOX_REPLAY_CORPUS}
+      ${TRADEBOX_REPLAY_CORPUS}.assets.json
+  )
+  add_executable(tradebox_market_replay_benchmark
+    tests/performance/market_stream_replay_benchmark.cpp
+  )
+  add_dependencies(
+    tradebox_market_replay_benchmark tradebox_replay_corpus
+  )
+  target_compile_features(
+    tradebox_market_replay_benchmark PRIVATE cxx_std_23
+  )
+  target_compile_definitions(
+    tradebox_market_replay_benchmark PRIVATE
+      TRADEBOX_REPLAY_CORPUS="${TRADEBOX_REPLAY_CORPUS}"
+      TRADEBOX_REPLAY_EVENT_COUNT=100000
+  )
+  target_link_libraries(
+    tradebox_market_replay_benchmark PRIVATE
+      tradebox_broker_alpaca
+      tradebox_persistence
+      tradebox_core
+  )
+  tradebox_enable_strict_warnings(
+    tradebox_market_replay_benchmark
+  )
+  add_test(
+    NAME Performance.MarketStreamReplay
+    COMMAND tradebox_market_replay_benchmark
+      ${TRADEBOX_REPLAY_CORPUS}
+      100000
+      ${CMAKE_CURRENT_BINARY_DIR}/benchmark-results/market_stream_replay_latest.json
+  )
+  set_tests_properties(
+    Performance.MarketStreamReplay PROPERTIES
+      LABELS performance
+      TIMEOUT 60
+  )
 
   add_test(
     NAME Architecture.CoreHasNoAdapterDependencies

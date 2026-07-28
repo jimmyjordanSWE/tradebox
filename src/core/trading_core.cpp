@@ -15,6 +15,13 @@ CoreSnapshot TradingCore::Snapshot() const {
     return state_;
 }
 
+std::optional<CoreSnapshot> TradingCore::SnapshotAfter(
+    std::uint64_t revision) const {
+    std::scoped_lock lock(mutex_);
+    if (state_.revision == revision) return std::nullopt;
+    return state_;
+}
+
 std::expected<CommandReceipt, CoreError> TradingCore::Submit(Command command) {
     std::scoped_lock lock(mutex_);
     CommandReceipt receipt{

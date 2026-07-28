@@ -1,14 +1,17 @@
 #include "tradebox/core/decimal.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <limits>
 #include <utility>
 
 namespace tradebox::core {
 
-Decimal::Decimal(bool negative, std::string digits, std::uint32_t scale)
-    : negative_(negative), digits_(std::move(digits)), scale_(scale) {}
+Decimal::Decimal(bool negative, std::string digits, std::uint32_t scale,
+                 double display_value)
+    : negative_(negative),
+      digits_(std::move(digits)),
+      scale_(scale),
+      display_value_(display_value) {}
 
 std::expected<Decimal, DecimalError> Decimal::Parse(std::string_view text) {
     if (text.empty())
@@ -62,7 +65,14 @@ std::expected<Decimal, DecimalError> Decimal::Parse(std::string_view text) {
         --scale;
     }
 
-    return Decimal(negative, std::move(digits), scale);
+    double display_value = 0;
+    for (const char digit : digits)
+        display_value = display_value * 10.0 +
+                        static_cast<double>(digit - '0');
+    for (std::uint32_t place = 0; place < scale; ++place)
+        display_value /= 10.0;
+    if (negative) display_value = -display_value;
+    return Decimal(negative, std::move(digits), scale, display_value);
 }
 
 Decimal Decimal::Zero() {
@@ -94,8 +104,7 @@ std::string Decimal::ToString() const {
 }
 
 double Decimal::ToDisplayDouble() const {
-    const std::string value = ToString();
-    return std::strtod(value.c_str(), nullptr);
+    return display_value_;
 }
 
 bool Decimal::IsZero() const {

@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <expected>
+#include <optional>
 
 namespace tradebox::core {
 
@@ -25,6 +26,8 @@ public:
     virtual ~ITradingCore() = default;
 
     virtual CoreSnapshot Snapshot() const = 0;
+    virtual std::optional<CoreSnapshot> SnapshotAfter(
+        std::uint64_t revision) const = 0;
     virtual std::expected<CommandReceipt, CoreError> Submit(
         Command command) = 0;
     virtual std::expected<void, CoreError> Ingest(BrokerEvent event) = 0;

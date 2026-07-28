@@ -2,6 +2,7 @@
 
 #include "tradebox/broker/gateway.h"
 #include "tradebox/core/interfaces.h"
+#include "tradebox/core/bar_series.h"
 #include "tradebox/core/market_data.h"
 #include "tradebox/persistence/database.h"
 #include "tradebox/platform/credentials.h"
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <windows.h>
@@ -22,7 +24,8 @@ public:
     AlpacaService(UiEventQueue& events, Database& database,
                   tradebox::core::ITradingCore& core,
                   tradebox::core::IMarketDataSink& market_data,
-                  tradebox::core::IMarketDataView& market_data_view);
+                  tradebox::core::IMarketDataView& market_data_view,
+                  tradebox::core::IBarDataSink& bars);
     ~AlpacaService();
 
     AlpacaService(const AlpacaService&) = delete;
@@ -66,12 +69,14 @@ private:
     void JoinWorkers();
     void PublishCoreEvent(tradebox::core::BrokerEvent event);
     AlpacaCredentials CredentialsSnapshot() const;
+    std::string InstrumentIdForSymbol(const std::string& symbol) const;
 
     UiEventQueue& events_;
     Database& database_;
     tradebox::core::ITradingCore& core_;
     tradebox::core::IMarketDataSink& market_data_;
     tradebox::core::IMarketDataView& market_data_view_;
+    tradebox::core::IBarDataSink& bars_;
     AlpacaCredentials credentials_;
     mutable std::mutex credentials_mutex_;
     mutable std::recursive_mutex lifecycle_mutex_;
@@ -87,6 +92,8 @@ private:
     tradebox::core::MarketDataFeed market_data_feed_ =
         tradebox::core::MarketDataFeed::Iex;
     std::mutex subscription_mutex_;
+    mutable std::mutex asset_catalog_mutex_;
+    std::unordered_map<std::string, std::string> instrument_ids_by_symbol_;
     std::mutex websocket_send_mutex_;
     std::vector<std::string> desired_symbols_;
     std::vector<std::string> subscribed_symbols_;

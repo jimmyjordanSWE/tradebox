@@ -134,6 +134,26 @@ TEST(DatabaseOrderCommandJournal,
     }
 }
 
+TEST(DatabaseSettings, PersistsUserInterfacePerformanceOptions) {
+    TemporaryDatabase temporary;
+    {
+        Database database;
+        std::string error;
+        ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+        EXPECT_FALSE(database.LoadAppSetting("ui.vsync"));
+        database.SaveAppSetting("ui.vsync", "1");
+        database.SaveAppSetting("ui.maximum_fps", "240");
+        database.SaveAppSetting("ui.maximum_fps", "120");
+    }
+    {
+        Database database;
+        std::string error;
+        ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+        EXPECT_EQ(database.LoadAppSetting("ui.vsync"), "1");
+        EXPECT_EQ(database.LoadAppSetting("ui.maximum_fps"), "120");
+    }
+}
+
 TEST(DatabaseMarketData, RetainsRawTicksAndReportsStorageByCategory) {
     TemporaryDatabase temporary;
     {
@@ -247,6 +267,210 @@ TEST(DatabaseMarketData,
     ASSERT_EQ(series.quotes.size(), 1U);
     EXPECT_EQ(series.quotes.front().bid_price.ToString(), "100.49");
     EXPECT_EQ(series.quotes.front().ask_price.ToString(), "100.51");
+}
+
+TEST(DatabaseMarketData, RetainsTicksWithNullOptionalMetadata) {
+    TemporaryDatabase temporary;
+    Database database;
+    std::string error;
+    ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+    database.StoreMarketTickEvents({
+        {"iex", "QQQ:1", "t", "QQQ", 110, 1,
+         R"({"T":"t","S":"QQQ","i":1,"p":625.125,"s":2,"x":null,"z":null,"t":null})"},
+        {"iex", "QQQ:q:120", "q", "QQQ", 120, 2,
+         R"({"T":"q","S":"QQQ","bp":625.12,"bs":4,"ap":625.13,"as":5,"bx":null,"ax":null,"z":null,"t":null})"},
+    });
+
+    const core::TickSeries series = database.LoadMarketTicks({
+        .symbol = "QQQ",
+        .start_ns = 100,
+        .end_ns = 200,
+        .feed = core::MarketDataFeed::Iex,
+        .include_trades = true,
+        .include_quotes = true,
+    });
+
+    ASSERT_EQ(series.trades.size(), 1U);
+    EXPECT_EQ(series.trades.front().price.ToString(), "625.125");
+    EXPECT_TRUE(series.trades.front().exchange.empty());
+    EXPECT_TRUE(series.trades.front().tape.empty());
+    EXPECT_TRUE(series.trades.front().broker_timestamp.empty());
+    ASSERT_EQ(series.quotes.size(), 1U);
+    EXPECT_EQ(series.quotes.front().ask_price.ToString(), "625.13");
+    EXPECT_TRUE(series.quotes.front().bid_exchange.empty());
+    EXPECT_TRUE(series.quotes.front().ask_exchange.empty());
+    EXPECT_TRUE(series.quotes.front().tape.empty());
+}
+
+TEST(DatabaseMarketData,
+     PersistsExactProviderBarsCoverageAndRevisions) {
+    TemporaryDatabase temporary;
+    const core::BarSeriesKey key{
+        .instrument_id = "alpaca:asset-qqq",
+        .feed = core::MarketDataFeed::Iex,
+        .timeframe = "1Min",
+        .adjustment = core::BarAdjustment::Raw,
+    };
+    {
+        Database database;
+        std::string error;
+        ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+        database.StoreProviderBars({
+            .key = key,
+            .symbol = "QQQ",
+            .bars = {{
+                .start_ns = 60'000'000'000,
+                .open = *core::Decimal::Parse("500.01"),
+                .high = *core::Decimal::Parse("500.20"),
+                .low = *core::Decimal::Parse("499.99"),
+                .close = *core::Decimal::Parse("500.125"),
+                .volume = *core::Decimal::Parse("12345"),
+                .within_bar_vwap =
+                    *core::Decimal::Parse("500.075"),
+                .trade_count = 321,
+                .source = core::BarSource::ProviderHistorical,
+                .state = core::BarState::Finalized,
+            }},
+            .covered_range =
+                core::BarRange{60'000'000'000,
+                               120'000'000'000},
+        });
+        ASSERT_TRUE(database.QueueProviderBars({
+            .key = key,
+            .symbol = "QQQ",
+            .bars = {{
+                .start_ns = 60'000'000'000,
+                .open = *core::Decimal::Parse("500.01"),
+                .high = *core::Decimal::Parse("500.20"),
+                .low = *core::Decimal::Parse("499.99"),
+                .close = *core::Decimal::Parse("500.15"),
+                .volume = *core::Decimal::Parse("12400"),
+                .trade_count = 322,
+                .source = core::BarSource::ProviderStream,
+                .state = core::BarState::Finalized,
+            }},
+        }));
+        const auto telemetry = database.WriterTelemetry();
+        EXPECT_EQ(telemetry.accepted_bars, 1U);
+        EXPECT_EQ(telemetry.dropped_bars, 0U);
+    }
+
+    Database reopened;
+    std::string error;
+    ASSERT_TRUE(reopened.OpenAt(temporary.path, error)) << error;
+    const auto loaded = reopened.LoadProviderBars(
+        key, {0, 180'000'000'000});
+    ASSERT_EQ(loaded.bars.size(), 1U);
+    EXPECT_EQ(loaded.bars[0].close.ToString(), "500.15");
+    EXPECT_EQ(loaded.bars[0].volume.ToString(), "12400");
+    EXPECT_EQ(loaded.bars[0].revision, 2U);
+    EXPECT_EQ(loaded.bars[0].state, core::BarState::Revised);
+    EXPECT_EQ(
+        loaded.coverage,
+        (std::vector<core::BarRange>{{
+            60'000'000'000, 120'000'000'000}}));
+}
+
+TEST(DatabaseMarketData,
+     PersistsSharedTypedTicksWithoutRawJsonRoundTrip) {
+    TemporaryDatabase temporary;
+    {
+        Database database;
+        std::string error;
+        ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+        database.QueueMarketDataEvent(
+            "sip", "trade:typed-1",
+            core::ShareMarketDataEvent(core::TradeReceived{
+                .trade = {
+                    .instrument_id = "alpaca:asset-aapl",
+                    .symbol = "AAPL",
+                    .trade_id = "typed-1",
+                    .price = *core::Decimal::Parse("201.123456"),
+                    .size = *core::Decimal::Parse("125.5"),
+                    .exchange = "V",
+                    .conditions = {"@", "I"},
+                    .tape = "C",
+                    .broker_timestamp =
+                        "2026-07-28T14:30:00.000000001Z",
+                    .event_time_ns = 100,
+                    .received_at_ms = 200,
+                },
+            }));
+        database.QueueMarketDataEvent(
+            "sip", "quote:typed-1",
+            core::ShareMarketDataEvent(core::QuoteReceived{
+                .quote = {
+                    .instrument_id = "alpaca:asset-aapl",
+                    .symbol = "AAPL",
+                    .bid_price =
+                        *core::Decimal::Parse("201.1234"),
+                    .bid_size = *core::Decimal::Parse("10"),
+                    .bid_exchange = "Q",
+                    .ask_price =
+                        *core::Decimal::Parse("201.1235"),
+                    .ask_size = *core::Decimal::Parse("12"),
+                    .ask_exchange = "P",
+                    .conditions = {"R"},
+                    .tape = "C",
+                    .broker_timestamp =
+                        "2026-07-28T14:30:00.000000002Z",
+                    .event_time_ns = 101,
+                    .received_at_ms = 201,
+                },
+            }));
+    }
+
+    Database reopened;
+    std::string error;
+    ASSERT_TRUE(reopened.OpenAt(temporary.path, error)) << error;
+    const auto loaded = reopened.LoadMarketTicks({
+        .symbol = "AAPL",
+        .start_ns = 0,
+        .end_ns = 1'000,
+        .feed = core::MarketDataFeed::Sip,
+        .include_trades = true,
+        .include_quotes = true,
+    });
+    ASSERT_EQ(loaded.trades.size(), 1U);
+    EXPECT_EQ(loaded.trades[0].instrument_id,
+              "alpaca:asset-aapl");
+    EXPECT_EQ(loaded.trades[0].price.ToString(),
+              "201.123456");
+    EXPECT_EQ(loaded.trades[0].size.ToString(), "125.5");
+    EXPECT_EQ(loaded.trades[0].conditions,
+              (std::vector<std::string>{"@", "I"}));
+    ASSERT_EQ(loaded.quotes.size(), 1U);
+    EXPECT_EQ(loaded.quotes[0].bid_price.ToString(),
+              "201.1234");
+    EXPECT_EQ(loaded.quotes[0].ask_price.ToString(),
+              "201.1235");
+    EXPECT_EQ(loaded.quotes[0].conditions,
+              (std::vector<std::string>{"R"}));
+}
+
+TEST(DatabaseMarketData,
+     RejectsAnOversizedLiveBarBatchWithoutBlocking) {
+    TemporaryDatabase temporary;
+    Database database;
+    std::string error;
+    ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+
+    core::BarUpsertBatch oversized{
+        .key = {
+            .instrument_id = "alpaca:oversized",
+            .feed = core::MarketDataFeed::Sip,
+            .timeframe = "1Min",
+            .adjustment = core::BarAdjustment::Raw,
+        },
+        .symbol = "LOAD",
+    };
+    oversized.bars.resize(50'001);
+
+    EXPECT_FALSE(database.QueueProviderBars(std::move(oversized)));
+    const auto telemetry = database.WriterTelemetry();
+    EXPECT_EQ(telemetry.accepted_bars, 0U);
+    EXPECT_EQ(telemetry.dropped_bars, 50'001U);
+    EXPECT_EQ(telemetry.pending_bars, 0U);
 }
 
 }  // namespace

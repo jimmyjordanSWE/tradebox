@@ -163,12 +163,72 @@ TEST(MarketDataStore, ReadsOnlySequencedChangesAfterCursor) {
 
     const auto second =
         store.Delta("AAPL", first.next_sequence, 10);
-    ASSERT_EQ(second.events.size(), 1U);
+    ASSERT_EQ(second.events.size(), 2U);
     EXPECT_EQ(second.events.front().sequence, 2U);
-    EXPECT_EQ(second.events.back().sequence, 2U);
-    ASSERT_TRUE(second.latest_quote);
-    EXPECT_EQ(second.latest_quote->bid_price.ToString(), "201.01");
+    EXPECT_EQ(second.events.back().sequence, 3U);
+    const auto* quote = std::get_if<QuoteReceived>(
+        second.events.front().event.get());
+    ASSERT_NE(quote, nullptr);
+    EXPECT_EQ(quote->quote.bid_price.ToString(), "201.01");
+    EXPECT_FALSE(second.latest_quote);
     EXPECT_FALSE(second.gap_detected);
+
+    const auto unchanged =
+        store.Delta("AAPL", second.next_sequence, 10);
+    EXPECT_TRUE(unchanged.events.empty());
+    EXPECT_FALSE(unchanged.latest_quote);
+}
+
+TEST(MarketDataStore, UsesStableInstrumentIdentityAndRetainsSymbolAlias) {
+    MarketDataStore store;
+    store.Ingest(TradeReceived{
+        .trade = Trade("1", "201", "first", 1)});
+
+    MarketTrade identified =
+        Trade("2", "202", "identified", 2);
+    identified.instrument_id = "instrument:apple-common";
+    store.Ingest(TradeReceived{
+        .trade = std::move(identified)});
+
+    const auto by_symbol = store.Snapshot("AAPL");
+    const auto by_identity =
+        store.Snapshot("instrument:apple-common");
+    EXPECT_EQ(by_symbol.instrument_id,
+              "instrument:apple-common");
+    EXPECT_EQ(by_symbol.symbol, "AAPL");
+    ASSERT_EQ(by_symbol.trades.size(), 2U);
+    ASSERT_EQ(by_identity.trades.size(), 2U);
+    EXPECT_EQ(by_identity.trades.front().price.ToString(), "202");
+}
+
+TEST(MarketDataStore, ReportsOnlyChangedInstrumentsAfterCursor) {
+    MarketDataStore store;
+    auto apple = Trade("1", "201", "apple", 1);
+    apple.instrument_id = "instrument:apple";
+    store.Ingest(TradeReceived{.trade = std::move(apple)});
+
+    const auto first = store.Changes(0, 10);
+    ASSERT_EQ(first.instruments.size(), 1U);
+    EXPECT_EQ(first.instruments.front().instrument_id,
+              "instrument:apple");
+    EXPECT_EQ(first.instruments.front().symbol, "AAPL");
+
+    EXPECT_TRUE(
+        store.Changes(first.next_sequence, 10)
+            .instruments.empty());
+
+    MarketQuote quote{
+        .instrument_id = "instrument:microsoft",
+        .symbol = "MSFT",
+        .bid_price = D("500.01"),
+        .ask_price = D("500.02"),
+        .event_time_ns = 2,
+    };
+    store.Ingest(QuoteReceived{.quote = std::move(quote)});
+    const auto second =
+        store.Changes(first.next_sequence, 10);
+    ASSERT_EQ(second.instruments.size(), 1U);
+    EXPECT_EQ(second.instruments.front().symbol, "MSFT");
 }
 
 TEST(MarketDataStore, ReportsGapWhenConsumerFallsBehindBoundedRing) {
@@ -187,6 +247,42 @@ TEST(MarketDataStore, ReportsGapWhenConsumerFallsBehindBoundedRing) {
     ASSERT_EQ(delta.events.size(), 2U);
     EXPECT_EQ(delta.events.front().sequence, 3U);
     EXPECT_EQ(delta.events.back().sequence, 4U);
+}
+
+TEST(MarketDataStore,
+     SharesOneImmutableEventAcrossTheDeltaRing) {
+    MarketDataStore store;
+    const auto event = ShareMarketDataEvent(TradeReceived{
+        .trade = Trade("shared", "201", "shared", 1),
+    });
+    store.Ingest(event);
+
+    const auto delta = store.Delta("AAPL", 0, 10);
+    ASSERT_EQ(delta.events.size(), 1U);
+    EXPECT_EQ(delta.events[0].event.get(), event.get());
+}
+
+TEST(MarketDataStore,
+     ChangedInstrumentRingReportsConsumerOverrun) {
+    MarketDataStore store(2, 2);
+    for (int index = 0; index < 4; ++index) {
+        MarketTrade trade =
+            Trade(("id-" + std::to_string(index)).c_str(),
+                  "201", "change", index + 1);
+        trade.symbol =
+            "S" + std::to_string(index);
+        trade.instrument_id =
+            "instrument:" + std::to_string(index);
+        store.Ingest(TradeReceived{
+            .trade = std::move(trade),
+        });
+    }
+
+    const auto changes = store.Changes(1, 10);
+    EXPECT_TRUE(changes.gap_detected);
+    ASSERT_EQ(changes.instruments.size(), 2U);
+    EXPECT_EQ(changes.instruments.front().sequence, 3U);
+    EXPECT_EQ(changes.instruments.back().sequence, 4U);
 }
 
 }  // namespace

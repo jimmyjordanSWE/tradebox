@@ -1,12 +1,14 @@
 #pragma once
 
 #include "tradebox/core/order_command.h"
+#include "tradebox/core/bar_series.h"
 #include "tradebox/core/market_data.h"
 #include "tradebox/core/types.h"
 
 #include <expected>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,11 +35,22 @@ public:
     TradingApplication& operator=(const TradingApplication&) = delete;
 
     [[nodiscard]] core::CoreSnapshot Snapshot() const;
+    [[nodiscard]] std::optional<core::CoreSnapshot> SnapshotAfter(
+        std::uint64_t revision) const;
     [[nodiscard]] core::MarketDataSnapshot MarketData(
         const std::string& symbol) const;
     [[nodiscard]] core::MarketDataDelta MarketDataChanges(
         const std::string& symbol, std::uint64_t after_sequence,
         std::size_t maximum_events = 512) const;
+    [[nodiscard]] core::ChangedInstruments ChangedMarketInstruments(
+        std::uint64_t after_sequence,
+        std::size_t maximum_instruments = 4096) const;
+    [[nodiscard]] core::BarSeriesSnapshot Bars(
+        const core::BarSeriesKey& key,
+        core::BarRange range) const;
+    [[nodiscard]] core::ChangedBarSeriesBatch ChangedBarSeries(
+        std::uint64_t after_sequence,
+        std::size_t maximum_series = 512) const;
     [[nodiscard]] std::expected<core::CommandReceipt, core::CoreError>
     Connect(ConnectionRequest request);
     [[nodiscard]] std::expected<core::CommandReceipt, core::CoreError>

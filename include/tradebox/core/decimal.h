@@ -29,12 +29,14 @@ public:
     bool operator==(const Decimal& other) const;
 
 private:
-    Decimal(bool negative, std::string digits, std::uint32_t scale);
+    Decimal(bool negative, std::string digits, std::uint32_t scale,
+            double display_value);
     std::strong_ordering CompareMagnitude(const Decimal& other) const;
 
     bool negative_ = false;
     std::string digits_ = "0";
     std::uint32_t scale_ = 0;
+    double display_value_ = 0;
 };
 
 }  // namespace tradebox::core

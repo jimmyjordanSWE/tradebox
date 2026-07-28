@@ -1,4 +1,5 @@
 #include "tradebox/broker/alpaca_service.h"
+#include "tradebox/broker/alpaca_market_stream_decoder.h"
 #include "tradebox/broker/alpaca_order_codec.h"
 
 #include <nlohmann/json.hpp>
@@ -237,8 +238,17 @@ HttpResult Get(const std::wstring& host, const std::wstring& path,
     return Request(L"GET", host, path, credentials);
 }
 
-std::wstring HistoryPath(const std::string& symbol,
-                         const std::string& timeframe) {
+const char* AlpacaFeedName(
+    tradebox::core::MarketDataFeed feed) {
+    return feed == tradebox::core::MarketDataFeed::Sip
+               ? "sip"
+               : "iex";
+}
+
+std::wstring HistoryPath(
+    const std::string& symbol,
+    const std::string& timeframe,
+    tradebox::core::MarketDataFeed feed) {
     const auto now = std::chrono::system_clock::now();
     const auto start = now - std::chrono::hours(24 * 365 * 6);
     const std::time_t start_time = std::chrono::system_clock::to_time_t(start);
@@ -248,7 +258,8 @@ std::wstring HistoryPath(const std::string& symbol,
     date << std::put_time(&utc, "%Y-%m-%d");
     return Wide("/v2/stocks/" + symbol +
                 "/bars?timeframe=" + timeframe + "&start=" + date.str() +
-                "&limit=1000&adjustment=all&feed=iex&sort=desc");
+                "&limit=1000&adjustment=all&feed=" +
+                AlpacaFeedName(feed) + "&sort=desc");
 }
 
 std::string UrlEncode(const std::string& value) {
@@ -325,8 +336,11 @@ std::string Subscription(const char* action,
         {"action", action},
         {"trades", symbols},
         {"quotes", symbols},
+        {"bars", symbols},
         {"dailyBars", symbols},
         {"updatedBars", symbols},
+        {"corrections", symbols},
+        {"cancelErrors", symbols},
     };
     return value.dump();
 }
@@ -376,12 +390,20 @@ tradebox::broker::BrokerCommandResult CommandResult(
 AlpacaService::AlpacaService(UiEventQueue& events, Database& database,
                              tradebox::core::ITradingCore& core,
                              tradebox::core::IMarketDataSink& market_data,
-                             tradebox::core::IMarketDataView& market_data_view)
+                             tradebox::core::IMarketDataView& market_data_view,
+                             tradebox::core::IBarDataSink& bars)
     : events_(events),
       database_(database),
       core_(core),
       market_data_(market_data),
-      market_data_view_(market_data_view) {}
+      market_data_view_(market_data_view),
+      bars_(bars) {
+    for (const auto& asset : database_.LoadAssetCatalog()) {
+        if (!asset.symbol.empty() && !asset.instrument_id.empty())
+            instrument_ids_by_symbol_.insert_or_assign(
+                asset.symbol, asset.instrument_id);
+    }
+}
 
 AlpacaService::~AlpacaService() {
     Disconnect();
@@ -390,6 +412,15 @@ AlpacaService::~AlpacaService() {
 AlpacaCredentials AlpacaService::CredentialsSnapshot() const {
     std::scoped_lock lock(credentials_mutex_);
     return credentials_;
+}
+
+std::string AlpacaService::InstrumentIdForSymbol(
+    const std::string& symbol) const {
+    std::scoped_lock lock(asset_catalog_mutex_);
+    const auto found = instrument_ids_by_symbol_.find(symbol);
+    return found == instrument_ids_by_symbol_.end()
+               ? std::string{}
+               : found->second;
 }
 
 void AlpacaService::Connect(AlpacaCredentials credentials,
@@ -513,8 +544,9 @@ tradebox::core::TickSeries AlpacaService::FetchTicks(
                 "No market-data credentials available for missing ranges";
         return result;
     }
-    const std::string feed =
-        query.feed == tradebox::core::MarketDataFeed::Sip ? "sip" : "iex";
+    const std::string feed = AlpacaFeedName(query.feed);
+    const std::string instrument_id =
+        InstrumentIdForSymbol(query.symbol);
     const auto fetch_kind =
         [&](std::string_view kind,
             const std::vector<tradebox::core::TickCoverage>& ranges) {
@@ -543,37 +575,100 @@ tradebox::core::TickSeries AlpacaService::FetchTicks(
                         break;
                     }
                     const json body = json::parse(response.body);
-                    std::vector<StoredMarketTick> records;
-                    for (const auto& item :
-                         body.value(resource, json::array())) {
-                        const std::string timestamp =
-                            item.value("t", "");
-                        const std::int64_t event_time_ns =
-                            ParseTimestampNs(timestamp);
-                        const std::string payload = item.dump();
-                        std::string source_id;
-                        if (kind == "t") {
-                            source_id = query.symbol + ":" +
-                                        std::to_string(event_time_ns) + ":" +
-                                        Identifier(item, "i");
-                        } else {
-                            source_id =
-                                query.symbol + ":q:" +
-                                std::to_string(event_time_ns) + ":" +
-                                StablePayloadId(payload);
+                    const auto resource_items = body.find(resource);
+                    if (resource_items != body.end() &&
+                        resource_items->is_array()) {
+                        for (const auto& item : *resource_items) {
+                            const std::string timestamp =
+                                String(item, "t");
+                            const std::int64_t event_time_ns =
+                                ParseTimestampNs(timestamp);
+                            const std::int64_t received_at_ms =
+                                WallClockNowMs();
+                            std::string source_id;
+                            tradebox::core::MarketDataEventPtr event;
+                            if (kind == "t") {
+                                tradebox::core::TradeReceived typed{
+                                    .trade = {
+                                        .instrument_id =
+                                            instrument_id,
+                                        .symbol = query.symbol,
+                                        .trade_id =
+                                            Identifier(item, "i"),
+                                        .price =
+                                            RequiredDecimal(item, "p"),
+                                        .size =
+                                            RequiredDecimal(item, "s"),
+                                        .exchange = String(item, "x"),
+                                        .conditions =
+                                            StringArray(item, "c"),
+                                        .tape = String(item, "z"),
+                                        .broker_timestamp = timestamp,
+                                        .event_time_ns = event_time_ns,
+                                        .received_at_ms = received_at_ms,
+                                    },
+                                };
+                                source_id =
+                                    query.symbol + ":" +
+                                    std::to_string(event_time_ns) + ":" +
+                                    typed.trade.trade_id;
+                                event =
+                                    tradebox::core::
+                                        ShareMarketDataEvent(
+                                            std::move(typed));
+                            } else {
+                                tradebox::core::QuoteReceived typed{
+                                    .quote = {
+                                        .instrument_id =
+                                            instrument_id,
+                                        .symbol = query.symbol,
+                                        .bid_price =
+                                            RequiredDecimal(item, "bp"),
+                                        .bid_size =
+                                            RequiredDecimal(item, "bs"),
+                                        .bid_exchange =
+                                            String(item, "bx"),
+                                        .ask_price =
+                                            RequiredDecimal(item, "ap"),
+                                        .ask_size =
+                                            RequiredDecimal(item, "as"),
+                                        .ask_exchange =
+                                            String(item, "ax"),
+                                        .conditions =
+                                            StringArray(item, "c"),
+                                        .tape = String(item, "z"),
+                                        .broker_timestamp = timestamp,
+                                        .event_time_ns = event_time_ns,
+                                        .received_at_ms = received_at_ms,
+                                    },
+                                };
+                                const std::string identity =
+                                    timestamp + "|" +
+                                    typed.quote.bid_price.ToString() +
+                                    "|" +
+                                    typed.quote.ask_price.ToString() +
+                                    "|" +
+                                    typed.quote.bid_size.ToString() +
+                                    "|" +
+                                    typed.quote.ask_size.ToString();
+                                source_id =
+                                    query.symbol + ":q:" +
+                                    std::to_string(event_time_ns) + ":" +
+                                    StablePayloadId(identity);
+                                event =
+                                    tradebox::core::
+                                        ShareMarketDataEvent(
+                                            std::move(typed));
+                            }
+                            database_.QueueMarketDataEvent(
+                                feed, std::move(source_id),
+                                std::move(event));
                         }
-                        records.push_back({
-                            .feed = feed,
-                            .source_event_id = std::move(source_id),
-                            .kind = std::string(kind),
-                            .symbol = query.symbol,
-                            .event_time_ns = event_time_ns,
-                            .received_at_ms = WallClockNowMs(),
-                            .raw_payload = payload,
-                        });
                     }
-                    database_.StoreMarketTickEvents(records);
-                    page_token = body.value("next_page_token", "");
+                    database_.FlushQueuedWrites();
+                    // Alpaca returns JSON null, rather than an empty string,
+                    // for the final page.
+                    page_token = String(body, "next_page_token");
                 } while (!page_token.empty());
                 if (succeeded)
                     database_.MarkMarketTickCoverage(
@@ -637,9 +732,7 @@ void AlpacaService::SeedLatestSnapshots(
         joined += symbol;
     }
     const std::string feed =
-        market_data_feed_ == tradebox::core::MarketDataFeed::Sip
-            ? "sip"
-            : "iex";
+        AlpacaFeedName(market_data_feed_);
     const HttpResult response = Get(
         L"data.alpaca.markets",
         Wide("/v2/stocks/snapshots?symbols=" +
@@ -660,76 +753,94 @@ void AlpacaService::SeedLatestSnapshots(
                 !snapshots[symbol].is_object())
                 continue;
             const json& snapshot = snapshots[symbol];
+            const std::string instrument_id =
+                InstrumentIdForSymbol(symbol);
             if (snapshot.contains("latestQuote") &&
                 snapshot["latestQuote"].is_object()) {
                 const json& item = snapshot["latestQuote"];
                 const std::string timestamp =
-                    item.value("t", "");
+                    String(item, "t");
                 const std::int64_t event_time_ns =
                     ParseTimestampNs(timestamp);
                 const std::int64_t received_at_ms =
                     WallClockNowMs();
-                const std::string raw_payload = item.dump();
-                database_.QueueMarketTickEvent(
+                auto event =
+                    tradebox::core::ShareMarketDataEvent(
+                        tradebox::core::QuoteReceived{
+                            .quote = {
+                                .instrument_id = instrument_id,
+                                .symbol = symbol,
+                                .bid_price =
+                                    RequiredDecimal(item, "bp"),
+                                .bid_size =
+                                    RequiredDecimal(item, "bs"),
+                                .bid_exchange = String(item, "bx"),
+                                .ask_price =
+                                    RequiredDecimal(item, "ap"),
+                                .ask_size =
+                                    RequiredDecimal(item, "as"),
+                                .ask_exchange = String(item, "ax"),
+                                .conditions = StringArray(item, "c"),
+                                .tape = String(item, "z"),
+                                .broker_timestamp = timestamp,
+                                .event_time_ns = event_time_ns,
+                                .received_at_ms = received_at_ms,
+                            },
+                        });
+                const auto& quote =
+                    std::get<tradebox::core::QuoteReceived>(
+                        *event).quote;
+                const std::string identity =
+                    timestamp + "|" +
+                    quote.bid_price.ToString() + "|" +
+                    quote.ask_price.ToString() + "|" +
+                    quote.bid_size.ToString() + "|" +
+                    quote.ask_size.ToString();
+                database_.QueueMarketDataEvent(
                     feed,
                     symbol + ":q:" +
                         std::to_string(event_time_ns) + ":" +
-                        StablePayloadId(raw_payload),
-                    "q", symbol, event_time_ns,
-                    received_at_ms, raw_payload);
-                market_data_.Ingest(
-                    tradebox::core::QuoteReceived{
-                        .quote = {
-                            .symbol = symbol,
-                            .bid_price = RequiredDecimal(item, "bp"),
-                            .bid_size = RequiredDecimal(item, "bs"),
-                            .bid_exchange = item.value("bx", ""),
-                            .ask_price = RequiredDecimal(item, "ap"),
-                            .ask_size = RequiredDecimal(item, "as"),
-                            .ask_exchange = item.value("ax", ""),
-                            .conditions = StringArray(item, "c"),
-                            .tape = item.value("z", ""),
-                            .broker_timestamp = timestamp,
-                            .event_time_ns = event_time_ns,
-                            .received_at_ms = received_at_ms,
-                        },
-                    });
+                        StablePayloadId(identity),
+                    event);
+                market_data_.Ingest(std::move(event));
             }
             if (snapshot.contains("latestTrade") &&
                 snapshot["latestTrade"].is_object()) {
                 const json& item = snapshot["latestTrade"];
                 const std::string timestamp =
-                    item.value("t", "");
+                    String(item, "t");
                 const std::int64_t event_time_ns =
                     ParseTimestampNs(timestamp);
                 const std::int64_t received_at_ms =
                     WallClockNowMs();
                 const std::string trade_id =
                     Identifier(item, "i");
-                const std::string raw_payload = item.dump();
-                database_.QueueMarketTickEvent(
+                auto event =
+                    tradebox::core::ShareMarketDataEvent(
+                        tradebox::core::TradeReceived{
+                            .trade = {
+                                .instrument_id = instrument_id,
+                                .symbol = symbol,
+                                .trade_id = trade_id,
+                                .price =
+                                    RequiredDecimal(item, "p"),
+                                .size =
+                                    RequiredDecimal(item, "s"),
+                                .exchange = String(item, "x"),
+                                .conditions = StringArray(item, "c"),
+                                .tape = String(item, "z"),
+                                .broker_timestamp = timestamp,
+                                .event_time_ns = event_time_ns,
+                                .received_at_ms = received_at_ms,
+                            },
+                        });
+                database_.QueueMarketDataEvent(
                     feed,
                     symbol + ":" +
                         std::to_string(event_time_ns) + ":" +
                         trade_id,
-                    "t",
-                    symbol, event_time_ns, received_at_ms,
-                    raw_payload);
-                market_data_.Ingest(
-                    tradebox::core::TradeReceived{
-                        .trade = {
-                            .symbol = symbol,
-                            .trade_id = trade_id,
-                            .price = RequiredDecimal(item, "p"),
-                            .size = RequiredDecimal(item, "s"),
-                            .exchange = item.value("x", ""),
-                            .conditions = StringArray(item, "c"),
-                            .tape = item.value("z", ""),
-                            .broker_timestamp = timestamp,
-                            .event_time_ns = event_time_ns,
-                            .received_at_ms = received_at_ms,
-                        },
-                    });
+                    event);
+                market_data_.Ingest(std::move(event));
             }
         }
     } catch (const std::exception& error) {
@@ -763,6 +874,10 @@ void AlpacaService::FetchAssetCatalog() {
         std::vector<tradebox::core::TradableAsset> assets;
         for (const auto& item : value) {
             tradebox::core::TradableAsset asset;
+            asset.provider_asset_id = String(item, "id");
+            if (!asset.provider_asset_id.empty())
+                asset.instrument_id =
+                    "alpaca:" + asset.provider_asset_id;
             asset.symbol = String(item, "symbol");
             asset.name = String(item, "name");
             asset.exchange = String(item, "exchange");
@@ -772,6 +887,18 @@ void AlpacaService::FetchAssetCatalog() {
             asset.fractionable = item.value("fractionable", false);
             asset.received_at_ms = WallClockNowMs();
             if (!asset.symbol.empty()) assets.push_back(std::move(asset));
+        }
+        {
+            std::unordered_map<std::string, std::string> identities;
+            identities.reserve(assets.size());
+            for (const auto& asset : assets) {
+                if (!asset.symbol.empty() &&
+                    !asset.instrument_id.empty())
+                    identities.emplace(
+                        asset.symbol, asset.instrument_id);
+            }
+            std::scoped_lock lock(asset_catalog_mutex_);
+            instrument_ids_by_symbol_ = std::move(identities);
         }
         // The asset master is intentionally fetched separately from activity
         // enrichment. Sweeping snapshots for the entire universe here can
@@ -1185,8 +1312,11 @@ void AlpacaService::MarketClockLoop() {
 
 void AlpacaService::FetchHistory(std::string symbol, std::string timeframe) {
     const AlpacaCredentials credentials = CredentialsSnapshot();
+    const tradebox::core::MarketDataFeed feed =
+        market_data_feed_;
     const HttpResult result =
-        Get(L"data.alpaca.markets", HistoryPath(symbol, timeframe), credentials);
+        Get(L"data.alpaca.markets",
+            HistoryPath(symbol, timeframe, feed), credentials);
     if (result.status != 200) {
         events_.Push({UiEventType::Status, symbol,
                       "History failed for " + symbol + ": " +
@@ -1196,17 +1326,51 @@ void AlpacaService::FetchHistory(std::string symbol, std::string timeframe) {
     try {
         const json value = json::parse(result.body);
         std::vector<Bar> bars;
+        std::vector<tradebox::core::MarketBar> core_bars;
         for (const auto& item : value.value("bars", json::array())) {
+            const std::int64_t timestamp_ns =
+                ParseTimestampNs(item.value("t", ""));
             bars.push_back({
-                ParseTimestampMs(item.value("t", "")),
+                timestamp_ns / 1'000'000,
                 Number(item, "o"),
                 Number(item, "h"),
                 Number(item, "l"),
                 Number(item, "c"),
                 Number(item, "v"),
             });
+            core_bars.push_back({
+                .start_ns = timestamp_ns,
+                .open = RequiredDecimal(item, "o"),
+                .high = RequiredDecimal(item, "h"),
+                .low = RequiredDecimal(item, "l"),
+                .close = RequiredDecimal(item, "c"),
+                .volume = RequiredDecimal(item, "v"),
+                .within_bar_vwap =
+                    OptionalDecimal(item, "vw"),
+                .trade_count = static_cast<std::uint64_t>(
+                    std::max(0.0, Number(item, "n"))),
+                .source = tradebox::core::BarSource::
+                    ProviderHistorical,
+                .state =
+                    tradebox::core::BarState::Finalized,
+            });
         }
         std::ranges::reverse(bars);
+        std::ranges::reverse(core_bars);
+        tradebox::core::BarUpsertBatch bar_batch{
+            .key = {
+                .instrument_id =
+                    InstrumentIdForSymbol(symbol),
+                .feed = feed,
+                .timeframe = timeframe,
+                .adjustment =
+                    tradebox::core::BarAdjustment::All,
+            },
+            .symbol = symbol,
+            .bars = std::move(core_bars),
+        };
+        database_.StoreProviderBars(bar_batch);
+        bars_.Upsert(std::move(bar_batch));
         if (timeframe == "1Day") database_.StoreBars(symbol, bars);
         UiEvent event;
         event.type = UiEventType::HistoricalBars;
@@ -1303,210 +1467,166 @@ void AlpacaService::StreamLoop(std::vector<std::string> symbols) {
             continue;
         if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) break;
         try {
-            const json packet = json::parse(message);
-            const json items = packet.is_array() ? packet : json::array({packet});
-            for (const auto& item : items) {
-                const std::string kind = item.value("T", "");
-                if (kind == "success") {
-                    const std::string status = item.value("msg", "");
-                    if (status == "authenticated") {
-                        connected_ = true;
-                        market_data_.Ingest(
-                            tradebox::core::MarketStreamChanged{
-                                .status = tradebox::core::
-                                    MarketStreamStatus::Authenticated,
-                                .feed = feed,
-                                .message =
-                                    std::string(feed_name) +
-                                    " market stream authenticated",
-                                .received_at_ms = WallClockNowMs(),
-                            });
-                        std::vector<std::string> desired;
-                        {
-                            std::scoped_lock subscription_lock(subscription_mutex_);
-                            desired = desired_symbols_;
-                            subscribed_symbols_ = desired;
-                        }
-                        if (!desired.empty()) {
-                            std::scoped_lock send_lock(websocket_send_mutex_);
-                            SendText(socket, Subscription("subscribe", desired));
-                        }
-                        events_.Push(
-                            {UiEventType::Status, {}, "Market stream authenticated"});
-                    }
-                    continue;
-                }
-                if (kind == "error") {
-                    const std::string error_message =
-                        "Stream error: " + item.value("msg", "");
-                    events_.Push({UiEventType::Status, {},
-                                  error_message});
+            auto frame = tradebox::broker::alpaca::DecodeMarketFrame(
+                message, WallClockNowMs(),
+                [this](std::string_view symbol) {
+                    return InstrumentIdForSymbol(
+                        std::string(symbol));
+                });
+            for (auto& control : frame.controls) {
+                using tradebox::broker::alpaca::StreamControlType;
+                if (control.type ==
+                    StreamControlType::Authenticated) {
+                    connected_ = true;
                     market_data_.Ingest(
                         tradebox::core::MarketStreamChanged{
-                            .status =
-                                tradebox::core::MarketStreamStatus::Error,
+                            .status = tradebox::core::
+                                MarketStreamStatus::Authenticated,
+                            .feed = feed,
+                            .message = std::string(feed_name) +
+                                       " market stream authenticated",
+                            .received_at_ms = WallClockNowMs(),
+                        });
+                    std::vector<std::string> desired;
+                    {
+                        std::scoped_lock subscription_lock(
+                            subscription_mutex_);
+                        desired = desired_symbols_;
+                        subscribed_symbols_ = desired;
+                    }
+                    if (!desired.empty()) {
+                        std::scoped_lock send_lock(
+                            websocket_send_mutex_);
+                        SendText(
+                            socket,
+                            Subscription("subscribe", desired));
+                    }
+                    events_.Push({
+                        UiEventType::Status, {},
+                        "Market stream authenticated",
+                    });
+                } else if (control.type ==
+                           StreamControlType::Error) {
+                    const std::string error_message =
+                        "Stream error: " + control.message;
+                    events_.Push({
+                        UiEventType::Status, {}, error_message,
+                    });
+                    market_data_.Ingest(
+                        tradebox::core::MarketStreamChanged{
+                            .status = tradebox::core::
+                                MarketStreamStatus::Error,
                             .feed = feed,
                             .message = error_message,
                             .received_at_ms = WallClockNowMs(),
                         });
-                    continue;
-                }
-                if (kind == "subscription") {
-                    const std::vector<std::string> trades =
-                        StringArray(item, "trades");
-                    const std::vector<std::string> quotes =
-                        StringArray(item, "quotes");
-                    const std::size_t subscribed = trades.size();
-                    events_.Push(
-                        {UiEventType::Status, {},
-                         "Market subscription active: " +
-                             std::to_string(subscribed) + " symbols"});
+                } else {
+                    const std::size_t subscribed =
+                        control.trade_symbols.size();
+                    events_.Push({
+                        UiEventType::Status,
+                        {},
+                        "Market subscription active: " +
+                            std::to_string(subscribed) +
+                            " symbols",
+                    });
                     market_data_.Ingest(
                         tradebox::core::MarketStreamChanged{
                             .status = tradebox::core::
                                 MarketStreamStatus::Subscribed,
                             .feed = feed,
-                            .trade_symbols = trades,
-                            .quote_symbols = quotes,
+                            .trade_symbols =
+                                control.trade_symbols,
+                            .quote_symbols =
+                                control.quote_symbols,
                             .message = std::string(feed_name) +
                                        " trades and quotes subscribed",
                             .received_at_ms = WallClockNowMs(),
                         });
-                    if (!trades.empty()) {
-                        std::scoped_lock worker_lock(workers_mutex_);
+                    if (!control.trade_symbols.empty()) {
+                        std::scoped_lock worker_lock(
+                            workers_mutex_);
                         workers_.emplace_back(
                             &AlpacaService::SeedLatestSnapshots,
-                            this, trades);
+                            this, control.trade_symbols);
                     }
-                    continue;
                 }
-                if (kind != "t" && kind != "q" && kind != "x" &&
-                    kind != "c" && kind != "d" && kind != "u")
-                    continue;
-                const std::string symbol = item.value("S", "");
-                const std::string broker_timestamp =
-                    item.value("t", "");
-                const std::int64_t timestamp =
-                    ParseTimestampMs(broker_timestamp);
-                const std::int64_t received_at = WallClockNowMs();
-                std::string source_event_id;
-                if (kind == "t" && item.contains("i")) {
-                    source_event_id = symbol + ":" +
-                                      std::to_string(
-                                          ParseTimestampNs(
-                                              broker_timestamp)) +
-                                      ":" +
-                                      Identifier(item, "i");
+            }
+            for (auto& decoded : frame.items) {
+                if (decoded.market_tick) {
+                    database_.QueueMarketDataEvent(
+                        sip ? "sip" : "iex",
+                        std::move(decoded.source_event_id),
+                        decoded.market_event);
                 }
-                const std::string raw_payload = item.dump();
-                database_.QueueTimelineEvent(
-                    sip ? "alpaca.market.sip" : "alpaca.market.iex",
-                    source_event_id, kind, symbol, timestamp, raw_payload);
-                if (kind == "t" || kind == "q" ||
-                    kind == "x" || kind == "c") {
-                    database_.QueueMarketTickEvent(
-                        sip ? "sip" : "iex", source_event_id, kind, symbol,
-                        ParseTimestampNs(broker_timestamp), received_at,
-                        raw_payload);
+                if (decoded.market_event)
+                    market_data_.Ingest(
+                        std::move(decoded.market_event));
+                if (decoded.bar) {
+                    const auto& bar = *decoded.bar;
+                    tradebox::core::BarUpsertBatch bar_batch{
+                        .key = {
+                            .instrument_id =
+                                bar.instrument_id,
+                            .feed = feed,
+                            .timeframe =
+                                bar.kind == "d"
+                                    ? "1Day"
+                                    : "1Min",
+                            .adjustment =
+                                tradebox::core::
+                                    BarAdjustment::Raw,
+                        },
+                        .symbol = bar.symbol,
+                        .bars = {{
+                            .start_ns =
+                                bar.timestamp_ms *
+                                1'000'000,
+                            .open = bar.open,
+                            .high = bar.high,
+                            .low = bar.low,
+                            .close = bar.close,
+                            .volume = bar.volume,
+                            .within_bar_vwap =
+                                bar.within_bar_vwap,
+                            .trade_count = bar.trade_count,
+                            .source =
+                                tradebox::core::BarSource::
+                                    ProviderStream,
+                            .state =
+                                bar.kind == "d"
+                                    ? tradebox::core::
+                                          BarState::Open
+                                    : tradebox::core::
+                                          BarState::Finalized,
+                        }},
+                    };
+                    bars_.Upsert(bar_batch);
+                    if (!database_.QueueProviderBars(
+                            std::move(bar_batch))) {
+                        events_.Push({
+                            UiEventType::Status,
+                            bar.symbol,
+                            "Provider-bar persistence queue full; "
+                            "live bar remains available in memory",
+                        });
+                    }
+                    if (bar.kind != "d") continue;
+                    UiEvent event;
+                    event.type = UiEventType::DailyBar;
+                    event.symbol = bar.symbol;
+                    event.bar = {
+                        bar.timestamp_ms,
+                        bar.open.ToDisplayDouble(),
+                        bar.high.ToDisplayDouble(),
+                        bar.low.ToDisplayDouble(),
+                        bar.close.ToDisplayDouble(),
+                        bar.volume.ToDisplayDouble(),
+                    };
+                    event.received_at_ms =
+                        decoded.received_at_ms;
+                    events_.Push(std::move(event));
                 }
-                if (kind == "q") {
-                    market_data_.Ingest(tradebox::core::QuoteReceived{
-                        .quote =
-                            {
-                                .symbol = symbol,
-                                .bid_price =
-                                    RequiredDecimal(item, "bp"),
-                                .bid_size =
-                                    RequiredDecimal(item, "bs"),
-                                .bid_exchange =
-                                    item.value("bx", ""),
-                                .ask_price =
-                                    RequiredDecimal(item, "ap"),
-                                .ask_size =
-                                    RequiredDecimal(item, "as"),
-                                .ask_exchange =
-                                    item.value("ax", ""),
-                                .conditions =
-                                    StringArray(item, "c"),
-                                .tape = item.value("z", ""),
-                                .broker_timestamp =
-                                    broker_timestamp,
-                                .event_time_ns =
-                                    ParseTimestampNs(
-                                        broker_timestamp),
-                                .received_at_ms = received_at,
-                            },
-                    });
-                    continue;
-                }
-                if (kind == "t") {
-                    market_data_.Ingest(tradebox::core::TradeReceived{
-                        .trade =
-                            {
-                                .symbol = symbol,
-                                .trade_id = Identifier(item, "i"),
-                                .price = RequiredDecimal(item, "p"),
-                                .size = RequiredDecimal(item, "s"),
-                                .exchange = item.value("x", ""),
-                                .conditions =
-                                    StringArray(item, "c"),
-                                .tape = item.value("z", ""),
-                                .broker_timestamp =
-                                    broker_timestamp,
-                                .event_time_ns =
-                                    ParseTimestampNs(
-                                        broker_timestamp),
-                                .received_at_ms = received_at,
-                            },
-                    });
-                    continue;
-                } else if (kind == "x") {
-                    market_data_.Ingest(tradebox::core::TradeCanceled{
-                        .symbol = symbol,
-                        .trade_id = Identifier(item, "i"),
-                        .broker_timestamp = broker_timestamp,
-                        .event_time_ns =
-                            ParseTimestampNs(broker_timestamp),
-                    });
-                    continue;
-                } else if (kind == "c") {
-                    market_data_.Ingest(tradebox::core::TradeCorrected{
-                        .symbol = symbol,
-                        .original_trade_id = Identifier(item, "oi"),
-                        .corrected_trade =
-                            {
-                                .symbol = symbol,
-                                .trade_id = Identifier(item, "ci"),
-                                .price = RequiredDecimal(item, "cp"),
-                                .size = RequiredDecimal(item, "cs"),
-                                .exchange = item.value("x", ""),
-                                .conditions =
-                                    StringArray(item, "cc"),
-                                .tape = item.value("z", ""),
-                                .broker_timestamp =
-                                    broker_timestamp,
-                                .event_time_ns =
-                                    ParseTimestampNs(
-                                        broker_timestamp),
-                                .received_at_ms = received_at,
-                            },
-                    });
-                    continue;
-                }
-                UiEvent event;
-                event.type = kind == "t" ? UiEventType::Trade : UiEventType::DailyBar;
-                event.symbol = symbol;
-                if (kind == "t") {
-                    event.bar.timestamp_ms = timestamp;
-                    event.bar.close = Number(item, "p");
-                    event.bar.volume = Number(item, "s");
-                    event.received_at_ms = received_at;
-                } else {
-                    event.bar = {timestamp, Number(item, "o"), Number(item, "h"),
-                                 Number(item, "l"), Number(item, "c"),
-                                 Number(item, "v")};
-                }
-                events_.Push(std::move(event));
             }
         } catch (const std::exception& error) {
             events_.Push({UiEventType::Status, {},
@@ -1608,10 +1728,21 @@ void AlpacaService::AccountStreamLoop() {
         if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) break;
         try {
             const json packet = json::parse(message);
-            const json items = packet.is_array() ? packet : json::array({packet});
-            for (const auto& item : items) {
+            std::vector<const json*> items;
+            if (packet.is_array()) {
+                items.reserve(packet.size());
+                for (const auto& item : packet)
+                    items.push_back(&item);
+            } else {
+                items.push_back(&packet);
+            }
+            for (const json* item_pointer : items) {
+                const json& item = *item_pointer;
                 const std::string stream = item.value("stream", "");
-                const json data = item.value("data", json::object());
+                if (!item.contains("data") ||
+                    !item["data"].is_object())
+                    continue;
+                const json& data = item["data"];
                 if (stream == "authorization") {
                     const std::string status = data.value("status", "");
                     if (status == "authorized") {

@@ -99,6 +99,20 @@ TEST(TradingCore, StartsDisconnected) {
     EXPECT_FALSE(snapshot.reconciled);
 }
 
+TEST(TradingCore, AvoidsCopyingUnchangedSnapshots) {
+    MemoryJournal journal;
+    FixedClock clock;
+    TradingCore core(journal, clock);
+
+    EXPECT_FALSE(core.SnapshotAfter(core.Snapshot().revision));
+    ASSERT_TRUE(core.Submit(
+        ConnectAccount{AccountEnvironment::Paper}));
+    const auto changed = core.SnapshotAfter(0);
+    ASSERT_TRUE(changed);
+    EXPECT_GT(changed->revision, 0U);
+    EXPECT_FALSE(core.SnapshotAfter(changed->revision));
+}
+
 TEST(TradingCore, RequiresEverySafetyBarrierBeforeLive) {
     MemoryJournal journal;
     FixedClock clock;

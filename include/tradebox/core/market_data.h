@@ -3,9 +3,12 @@
 #include "tradebox/core/decimal.h"
 
 #include <cstdint>
+#include <deque>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -22,6 +25,7 @@ enum class MarketStreamStatus {
 };
 
 struct MarketQuote {
+    std::string instrument_id;
     std::string symbol;
     Decimal bid_price;
     Decimal bid_size;
@@ -37,6 +41,7 @@ struct MarketQuote {
 };
 
 struct MarketTrade {
+    std::string instrument_id;
     std::string symbol;
     std::string trade_id;
     Decimal price;
@@ -60,13 +65,16 @@ struct TradeReceived {
 };
 
 struct TradeCanceled {
+    std::string instrument_id;
     std::string symbol;
     std::string trade_id;
     std::string broker_timestamp;
     std::int64_t event_time_ns = 0;
+    std::int64_t received_at_ms = 0;
 };
 
 struct TradeCorrected {
+    std::string instrument_id;
     std::string symbol;
     std::string original_trade_id;
     MarketTrade corrected_trade;
@@ -84,8 +92,16 @@ struct MarketStreamChanged {
 using MarketDataEvent =
     std::variant<QuoteReceived, TradeReceived, TradeCanceled,
                  TradeCorrected, MarketStreamChanged>;
+using MarketDataEventPtr = std::shared_ptr<const MarketDataEvent>;
+
+template <class Event>
+MarketDataEventPtr ShareMarketDataEvent(Event event) {
+    return std::make_shared<const MarketDataEvent>(
+        MarketDataEvent{std::move(event)});
+}
 
 struct MarketDataSnapshot {
+    std::string instrument_id;
     std::string symbol;
     MarketDataFeed feed = MarketDataFeed::Unknown;
     MarketStreamStatus stream_status =
@@ -93,7 +109,7 @@ struct MarketDataSnapshot {
     bool trades_subscribed = false;
     bool quotes_subscribed = false;
     std::optional<MarketQuote> latest_quote;
-    std::vector<MarketTrade> trades;
+    std::deque<MarketTrade> trades;
     std::uint64_t revision = 0;
     std::int64_t last_received_at_ms = 0;
     std::string status_message;
@@ -101,10 +117,11 @@ struct MarketDataSnapshot {
 
 struct SequencedMarketDataEvent {
     std::uint64_t sequence = 0;
-    MarketDataEvent event;
+    MarketDataEventPtr event;
 };
 
 struct MarketDataDelta {
+    std::string instrument_id;
     std::string symbol;
     MarketDataFeed feed = MarketDataFeed::Unknown;
     MarketStreamStatus stream_status =
@@ -117,6 +134,18 @@ struct MarketDataDelta {
     bool gap_detected = false;
     std::int64_t last_received_at_ms = 0;
     std::string status_message;
+};
+
+struct ChangedInstrument {
+    std::uint64_t sequence = 0;
+    std::string instrument_id;
+    std::string symbol;
+};
+
+struct ChangedInstruments {
+    std::vector<ChangedInstrument> instruments;
+    std::uint64_t next_sequence = 0;
+    bool gap_detected = false;
 };
 
 struct TickQuery {
@@ -146,7 +175,11 @@ struct TickSeries {
 class IMarketDataSink {
 public:
     virtual ~IMarketDataSink() = default;
-    virtual void Ingest(MarketDataEvent event) = 0;
+    virtual void Ingest(MarketDataEventPtr event) = 0;
+    void Ingest(MarketDataEvent event) {
+        Ingest(std::make_shared<const MarketDataEvent>(
+            std::move(event)));
+    }
 };
 
 class IMarketDataView {
@@ -157,6 +190,9 @@ public:
     virtual MarketDataDelta Delta(
         const std::string& symbol, std::uint64_t after_sequence,
         std::size_t maximum_events) const = 0;
+    virtual ChangedInstruments Changes(
+        std::uint64_t after_sequence,
+        std::size_t maximum_instruments) const = 0;
 };
 
 }  // namespace tradebox::core

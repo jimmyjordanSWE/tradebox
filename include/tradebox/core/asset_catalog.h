@@ -17,6 +17,13 @@ struct TradableAsset {
     std::int64_t previous_volume = 0;
     std::int64_t previous_dollar_volume = 0;
     std::int64_t received_at_ms = 0;
+    // Domain identity is opaque and stable. External identifiers and symbols
+    // are aliases that may be enriched or changed independently.
+    std::string instrument_id;
+    std::string isin;
+    std::string cusip;
+    std::string sedol;
+    std::string provider_asset_id;
 };
 
 [[nodiscard]] std::vector<TradableAsset> SearchTradableAssets(
