@@ -10,6 +10,7 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 using json = nlohmann::json;
 
@@ -161,6 +162,20 @@ std::int64_t WallClockNowMs() {
         .count();
 }
 
+std::string TimestampNs(std::int64_t timestamp_ns) {
+    const std::time_t seconds =
+        static_cast<std::time_t>(timestamp_ns / 1'000'000'000);
+    const std::int64_t nanoseconds =
+        timestamp_ns % 1'000'000'000;
+    std::tm utc{};
+    gmtime_s(&utc, &seconds);
+    std::ostringstream value;
+    value << std::put_time(&utc, "%Y-%m-%dT%H:%M:%S")
+          << '.' << std::setw(9) << std::setfill('0')
+          << nanoseconds << 'Z';
+    return value.str();
+}
+
 HttpResult Request(const wchar_t* method, const std::wstring& host,
                    const std::wstring& path,
                    const AlpacaCredentials& credentials,
@@ -222,7 +237,8 @@ HttpResult Get(const std::wstring& host, const std::wstring& path,
     return Request(L"GET", host, path, credentials);
 }
 
-std::wstring HistoryPath(const std::string& symbol) {
+std::wstring HistoryPath(const std::string& symbol,
+                         const std::string& timeframe) {
     const auto now = std::chrono::system_clock::now();
     const auto start = now - std::chrono::hours(24 * 365 * 6);
     const std::time_t start_time = std::chrono::system_clock::to_time_t(start);
@@ -231,8 +247,8 @@ std::wstring HistoryPath(const std::string& symbol) {
     std::ostringstream date;
     date << std::put_time(&utc, "%Y-%m-%d");
     return Wide("/v2/stocks/" + symbol +
-                "/bars?timeframe=1Day&start=" + date.str() +
-                "&limit=1000&adjustment=all&feed=iex&sort=asc");
+                "/bars?timeframe=" + timeframe + "&start=" + date.str() +
+                "&limit=1000&adjustment=all&feed=iex&sort=desc");
 }
 
 std::string UrlEncode(const std::string& value) {
@@ -247,6 +263,18 @@ std::string UrlEncode(const std::string& value) {
                    << static_cast<int>(character);
         }
     }
+    return result.str();
+}
+
+std::string StablePayloadId(std::string_view payload) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char value : payload) {
+        hash ^= value;
+        hash *= 1099511628211ULL;
+    }
+    std::ostringstream result;
+    result << std::hex << std::setw(16) << std::setfill('0')
+           << hash;
     return result.str();
 }
 
@@ -347,11 +375,13 @@ tradebox::broker::BrokerCommandResult CommandResult(
 
 AlpacaService::AlpacaService(UiEventQueue& events, Database& database,
                              tradebox::core::ITradingCore& core,
-                             tradebox::core::IMarketDataSink& market_data)
+                             tradebox::core::IMarketDataSink& market_data,
+                             tradebox::core::IMarketDataView& market_data_view)
     : events_(events),
       database_(database),
       core_(core),
-      market_data_(market_data) {}
+      market_data_(market_data),
+      market_data_view_(market_data_view) {}
 
 AlpacaService::~AlpacaService() {
     Disconnect();
@@ -393,8 +423,6 @@ void AlpacaService::Connect(AlpacaCredentials credentials,
         positions_dirty_ = true;
         workers_.emplace_back(&AlpacaService::AccountRefreshLoop, this);
         workers_.emplace_back(&AlpacaService::MarketClockLoop, this);
-        for (const std::string& symbol : symbols)
-            workers_.emplace_back(&AlpacaService::FetchHistory, this, symbol);
     }
     stream_thread_ = std::thread(&AlpacaService::StreamLoop, this, symbols);
     account_stream_thread_ =
@@ -417,12 +445,346 @@ void AlpacaService::RefreshSymbols(const std::vector<std::string>& symbols) {
         SendText(socket, Subscription("unsubscribe", previous));
     if (!symbols.empty())
         SendText(socket, Subscription("subscribe", symbols));
+    if (!symbols.empty()) {
+        std::scoped_lock worker_lock(workers_mutex_);
+        workers_.emplace_back(
+            &AlpacaService::SeedLatestSnapshots, this, symbols);
+    }
 }
 
-void AlpacaService::RequestHistory(const std::string& symbol) {
+void AlpacaService::RequestHistory(const std::string& symbol,
+                                   const std::string& timeframe) {
     if (!running_) return;
     std::scoped_lock lock(workers_mutex_);
-    workers_.emplace_back(&AlpacaService::FetchHistory, this, symbol);
+    workers_.emplace_back(&AlpacaService::FetchHistory, this, symbol, timeframe);
+}
+
+void AlpacaService::RequestAssetCatalog() {
+    if (!running_) return;
+    std::scoped_lock lock(workers_mutex_);
+    workers_.emplace_back(&AlpacaService::FetchAssetCatalog, this);
+}
+
+std::future<tradebox::core::TickSeries> AlpacaService::RequestTicks(
+    tradebox::core::TickQuery query) {
+    auto promise =
+        std::make_shared<std::promise<tradebox::core::TickSeries>>();
+    std::future<tradebox::core::TickSeries> result =
+        promise->get_future();
+    {
+        std::scoped_lock lock(workers_mutex_);
+        workers_.emplace_back(
+            [this, promise, query = std::move(query)]() {
+                try {
+                    promise->set_value(FetchTicks(query));
+                } catch (const std::exception& error) {
+                    tradebox::core::TickSeries failed{.query = query};
+                    failed.error = error.what();
+                    promise->set_value(std::move(failed));
+                }
+            });
+    }
+    return result;
+}
+
+tradebox::core::TickSeries AlpacaService::FetchTicks(
+    const tradebox::core::TickQuery& query) {
+    const AlpacaCredentials credentials = CredentialsSnapshot();
+    tradebox::core::TickSeries result{.query = query};
+    if (query.symbol.empty() || query.start_ns < 0 ||
+        query.end_ns <= query.start_ns) {
+        result.error = "Invalid tick query";
+        return result;
+    }
+    if (credentials.key.empty() || credentials.secret.empty()) {
+        result = database_.LoadMarketTicks(query);
+        result.missing_trade_ranges =
+            query.include_trades
+                ? database_.MissingMarketTickCoverage(query, "t")
+                : std::vector<tradebox::core::TickCoverage>{};
+        result.missing_quote_ranges =
+            query.include_quotes
+                ? database_.MissingMarketTickCoverage(query, "q")
+                : std::vector<tradebox::core::TickCoverage>{};
+        result.complete = result.missing_trade_ranges.empty() &&
+                          result.missing_quote_ranges.empty();
+        if (!result.complete)
+            result.error =
+                "No market-data credentials available for missing ranges";
+        return result;
+    }
+    const std::string feed =
+        query.feed == tradebox::core::MarketDataFeed::Sip ? "sip" : "iex";
+    const auto fetch_kind =
+        [&](std::string_view kind,
+            const std::vector<tradebox::core::TickCoverage>& ranges) {
+            const std::string resource =
+                kind == "t" ? "trades" : "quotes";
+            for (const auto& range : ranges) {
+                std::string page_token;
+                bool succeeded = true;
+                do {
+                    std::string path =
+                        "/v2/stocks/" + UrlEncode(query.symbol) + "/" +
+                        resource + "?start=" +
+                        UrlEncode(TimestampNs(range.start_ns)) + "&end=" +
+                        UrlEncode(TimestampNs(range.end_ns)) +
+                        "&limit=10000&sort=asc&feed=" + feed;
+                    if (!page_token.empty())
+                        path += "&page_token=" + UrlEncode(page_token);
+                    const HttpResult response =
+                        Get(L"data.alpaca.markets", Wide(path), credentials);
+                    if (response.status != 200) {
+                        succeeded = false;
+                        result.error =
+                            "Historical " + resource + " failed: " +
+                            (!response.error.empty() ? response.error
+                                                     : response.body);
+                        break;
+                    }
+                    const json body = json::parse(response.body);
+                    std::vector<StoredMarketTick> records;
+                    for (const auto& item :
+                         body.value(resource, json::array())) {
+                        const std::string timestamp =
+                            item.value("t", "");
+                        const std::int64_t event_time_ns =
+                            ParseTimestampNs(timestamp);
+                        const std::string payload = item.dump();
+                        std::string source_id;
+                        if (kind == "t") {
+                            source_id = query.symbol + ":" +
+                                        std::to_string(event_time_ns) + ":" +
+                                        Identifier(item, "i");
+                        } else {
+                            source_id =
+                                query.symbol + ":q:" +
+                                std::to_string(event_time_ns) + ":" +
+                                StablePayloadId(payload);
+                        }
+                        records.push_back({
+                            .feed = feed,
+                            .source_event_id = std::move(source_id),
+                            .kind = std::string(kind),
+                            .symbol = query.symbol,
+                            .event_time_ns = event_time_ns,
+                            .received_at_ms = WallClockNowMs(),
+                            .raw_payload = payload,
+                        });
+                    }
+                    database_.StoreMarketTickEvents(records);
+                    page_token = body.value("next_page_token", "");
+                } while (!page_token.empty());
+                if (succeeded)
+                    database_.MarkMarketTickCoverage(
+                        query, kind, range);
+            }
+        };
+    if (query.include_trades)
+        fetch_kind(
+            "t", database_.MissingMarketTickCoverage(query, "t"));
+    if (query.include_quotes)
+        fetch_kind(
+            "q", database_.MissingMarketTickCoverage(query, "q"));
+
+    result = database_.LoadMarketTicks(query);
+    const auto live = market_data_view_.Snapshot(query.symbol);
+    std::unordered_map<std::string, std::size_t> trade_ids;
+    for (std::size_t index = 0; index < result.trades.size(); ++index)
+        if (!result.trades[index].trade_id.empty())
+            trade_ids[result.trades[index].trade_id] = index;
+    for (const auto& trade : live.trades) {
+        if (!query.include_trades ||
+            trade.event_time_ns < query.start_ns ||
+            trade.event_time_ns > query.end_ns)
+            continue;
+        const auto found = trade_ids.find(trade.trade_id);
+        if (!trade.trade_id.empty() && found != trade_ids.end())
+            result.trades[found->second] = trade;
+        else
+            result.trades.push_back(trade);
+    }
+    std::ranges::sort(
+        result.trades, {},
+        &tradebox::core::MarketTrade::event_time_ns);
+    if (query.include_quotes && live.latest_quote &&
+        live.latest_quote->event_time_ns >= query.start_ns &&
+        live.latest_quote->event_time_ns <= query.end_ns &&
+        (result.quotes.empty() ||
+         result.quotes.back().event_time_ns <
+             live.latest_quote->event_time_ns))
+        result.quotes.push_back(*live.latest_quote);
+    result.missing_trade_ranges =
+        query.include_trades
+            ? database_.MissingMarketTickCoverage(query, "t")
+            : std::vector<tradebox::core::TickCoverage>{};
+    result.missing_quote_ranges =
+        query.include_quotes
+            ? database_.MissingMarketTickCoverage(query, "q")
+            : std::vector<tradebox::core::TickCoverage>{};
+    result.complete = result.missing_trade_ranges.empty() &&
+                      result.missing_quote_ranges.empty();
+    return result;
+}
+
+void AlpacaService::SeedLatestSnapshots(
+    std::vector<std::string> symbols) {
+    if (symbols.empty()) return;
+    const AlpacaCredentials credentials = CredentialsSnapshot();
+    std::string joined;
+    for (const std::string& symbol : symbols) {
+        if (!joined.empty()) joined += ',';
+        joined += symbol;
+    }
+    const std::string feed =
+        market_data_feed_ == tradebox::core::MarketDataFeed::Sip
+            ? "sip"
+            : "iex";
+    const HttpResult response = Get(
+        L"data.alpaca.markets",
+        Wide("/v2/stocks/snapshots?symbols=" +
+             UrlEncode(joined) + "&feed=" + feed),
+        credentials);
+    if (response.status != 200) {
+        events_.Push({
+            UiEventType::Status, {},
+            "Market snapshot seed failed: " +
+                (!response.error.empty() ? response.error
+                                         : response.body)});
+        return;
+    }
+    try {
+        const json snapshots = json::parse(response.body);
+        for (const std::string& symbol : symbols) {
+            if (!snapshots.contains(symbol) ||
+                !snapshots[symbol].is_object())
+                continue;
+            const json& snapshot = snapshots[symbol];
+            if (snapshot.contains("latestQuote") &&
+                snapshot["latestQuote"].is_object()) {
+                const json& item = snapshot["latestQuote"];
+                const std::string timestamp =
+                    item.value("t", "");
+                const std::int64_t event_time_ns =
+                    ParseTimestampNs(timestamp);
+                const std::int64_t received_at_ms =
+                    WallClockNowMs();
+                const std::string raw_payload = item.dump();
+                database_.QueueMarketTickEvent(
+                    feed,
+                    symbol + ":q:" +
+                        std::to_string(event_time_ns) + ":" +
+                        StablePayloadId(raw_payload),
+                    "q", symbol, event_time_ns,
+                    received_at_ms, raw_payload);
+                market_data_.Ingest(
+                    tradebox::core::QuoteReceived{
+                        .quote = {
+                            .symbol = symbol,
+                            .bid_price = RequiredDecimal(item, "bp"),
+                            .bid_size = RequiredDecimal(item, "bs"),
+                            .bid_exchange = item.value("bx", ""),
+                            .ask_price = RequiredDecimal(item, "ap"),
+                            .ask_size = RequiredDecimal(item, "as"),
+                            .ask_exchange = item.value("ax", ""),
+                            .conditions = StringArray(item, "c"),
+                            .tape = item.value("z", ""),
+                            .broker_timestamp = timestamp,
+                            .event_time_ns = event_time_ns,
+                            .received_at_ms = received_at_ms,
+                        },
+                    });
+            }
+            if (snapshot.contains("latestTrade") &&
+                snapshot["latestTrade"].is_object()) {
+                const json& item = snapshot["latestTrade"];
+                const std::string timestamp =
+                    item.value("t", "");
+                const std::int64_t event_time_ns =
+                    ParseTimestampNs(timestamp);
+                const std::int64_t received_at_ms =
+                    WallClockNowMs();
+                const std::string trade_id =
+                    Identifier(item, "i");
+                const std::string raw_payload = item.dump();
+                database_.QueueMarketTickEvent(
+                    feed,
+                    symbol + ":" +
+                        std::to_string(event_time_ns) + ":" +
+                        trade_id,
+                    "t",
+                    symbol, event_time_ns, received_at_ms,
+                    raw_payload);
+                market_data_.Ingest(
+                    tradebox::core::TradeReceived{
+                        .trade = {
+                            .symbol = symbol,
+                            .trade_id = trade_id,
+                            .price = RequiredDecimal(item, "p"),
+                            .size = RequiredDecimal(item, "s"),
+                            .exchange = item.value("x", ""),
+                            .conditions = StringArray(item, "c"),
+                            .tape = item.value("z", ""),
+                            .broker_timestamp = timestamp,
+                            .event_time_ns = event_time_ns,
+                            .received_at_ms = received_at_ms,
+                        },
+                    });
+            }
+        }
+    } catch (const std::exception& error) {
+        events_.Push({
+            UiEventType::Status, {},
+            "Market snapshot seed JSON error: " +
+                std::string(error.what())});
+    }
+}
+
+void AlpacaService::FetchAssetCatalog() {
+    const AlpacaCredentials credentials = CredentialsSnapshot();
+    const std::wstring host = credentials.paper ? L"paper-api.alpaca.markets"
+                                                : L"api.alpaca.markets";
+    const HttpResult assets_response =
+        Get(host, L"/v2/assets?status=active&asset_class=us_equity", credentials);
+    if (assets_response.status != 200) {
+        events_.Push({UiEventType::Status, {},
+                      "Tradable asset catalog failed: " +
+                          (!assets_response.error.empty() ? assets_response.error
+                                                           : assets_response.body)});
+        return;
+    }
+    try {
+        const json value = json::parse(assets_response.body);
+        if (!value.is_array()) {
+            events_.Push({UiEventType::Status, {},
+                          "Tradable asset catalog returned a non-array response"});
+            return;
+        }
+        std::vector<tradebox::core::TradableAsset> assets;
+        for (const auto& item : value) {
+            tradebox::core::TradableAsset asset;
+            asset.symbol = String(item, "symbol");
+            asset.name = String(item, "name");
+            asset.exchange = String(item, "exchange");
+            asset.active = String(item, "status") == "active";
+            asset.tradable = item.value("tradable", false);
+            asset.shortable = item.value("shortable", false);
+            asset.fractionable = item.value("fractionable", false);
+            asset.received_at_ms = WallClockNowMs();
+            if (!asset.symbol.empty()) assets.push_back(std::move(asset));
+        }
+        // The asset master is intentionally fetched separately from activity
+        // enrichment. Sweeping snapshots for the entire universe here can
+        // issue hundreds of network requests and make shutdown appear hung.
+        UiEvent event;
+        event.type = UiEventType::AssetCatalogReady;
+        event.assets = std::move(assets);
+        events_.Push(std::move(event));
+    } catch (const std::exception& error) {
+        events_.Push({UiEventType::Status, {},
+                      "Tradable asset catalog JSON error: " +
+                          std::string(error.what())});
+    }
 }
 
 void AlpacaService::Disconnect() {
@@ -821,18 +1183,10 @@ void AlpacaService::MarketClockLoop() {
     }
 }
 
-void AlpacaService::FetchHistory(std::string symbol) {
+void AlpacaService::FetchHistory(std::string symbol, std::string timeframe) {
     const AlpacaCredentials credentials = CredentialsSnapshot();
-    const std::vector<Bar> cached = database_.LoadBars(symbol);
-    if (!cached.empty()) {
-        UiEvent event;
-        event.type = UiEventType::HistoricalBars;
-        event.symbol = symbol;
-        event.bars = cached;
-        events_.Push(std::move(event));
-    }
     const HttpResult result =
-        Get(L"data.alpaca.markets", HistoryPath(symbol), credentials);
+        Get(L"data.alpaca.markets", HistoryPath(symbol, timeframe), credentials);
     if (result.status != 200) {
         events_.Push({UiEventType::Status, symbol,
                       "History failed for " + symbol + ": " +
@@ -852,10 +1206,12 @@ void AlpacaService::FetchHistory(std::string symbol) {
                 Number(item, "v"),
             });
         }
-        database_.StoreBars(symbol, bars);
+        std::ranges::reverse(bars);
+        if (timeframe == "1Day") database_.StoreBars(symbol, bars);
         UiEvent event;
         event.type = UiEventType::HistoricalBars;
         event.symbol = std::move(symbol);
+        event.timeframe = std::move(timeframe);
         event.bars = std::move(bars);
         events_.Push(std::move(event));
     } catch (const std::exception& error) {
@@ -1016,6 +1372,12 @@ void AlpacaService::StreamLoop(std::vector<std::string> symbols) {
                                        " trades and quotes subscribed",
                             .received_at_ms = WallClockNowMs(),
                         });
+                    if (!trades.empty()) {
+                        std::scoped_lock worker_lock(workers_mutex_);
+                        workers_.emplace_back(
+                            &AlpacaService::SeedLatestSnapshots,
+                            this, trades);
+                    }
                     continue;
                 }
                 if (kind != "t" && kind != "q" && kind != "x" &&
@@ -1030,12 +1392,23 @@ void AlpacaService::StreamLoop(std::vector<std::string> symbols) {
                 std::string source_event_id;
                 if (kind == "t" && item.contains("i")) {
                     source_event_id = symbol + ":" +
+                                      std::to_string(
+                                          ParseTimestampNs(
+                                              broker_timestamp)) +
+                                      ":" +
                                       Identifier(item, "i");
                 }
+                const std::string raw_payload = item.dump();
                 database_.QueueTimelineEvent(
                     sip ? "alpaca.market.sip" : "alpaca.market.iex",
-                    std::move(source_event_id), kind,
-                    symbol, timestamp, item.dump());
+                    source_event_id, kind, symbol, timestamp, raw_payload);
+                if (kind == "t" || kind == "q" ||
+                    kind == "x" || kind == "c") {
+                    database_.QueueMarketTickEvent(
+                        sip ? "sip" : "iex", source_event_id, kind, symbol,
+                        ParseTimestampNs(broker_timestamp), received_at,
+                        raw_payload);
+                }
                 if (kind == "q") {
                     market_data_.Ingest(tradebox::core::QuoteReceived{
                         .quote =
@@ -1086,11 +1459,14 @@ void AlpacaService::StreamLoop(std::vector<std::string> symbols) {
                                 .received_at_ms = received_at,
                             },
                     });
+                    continue;
                 } else if (kind == "x") {
                     market_data_.Ingest(tradebox::core::TradeCanceled{
                         .symbol = symbol,
                         .trade_id = Identifier(item, "i"),
                         .broker_timestamp = broker_timestamp,
+                        .event_time_ns =
+                            ParseTimestampNs(broker_timestamp),
                     });
                     continue;
                 } else if (kind == "c") {

@@ -35,6 +35,9 @@ public:
     [[nodiscard]] core::CoreSnapshot Snapshot() const;
     [[nodiscard]] core::MarketDataSnapshot MarketData(
         const std::string& symbol) const;
+    [[nodiscard]] core::MarketDataDelta MarketDataChanges(
+        const std::string& symbol, std::uint64_t after_sequence,
+        std::size_t maximum_events = 512) const;
     [[nodiscard]] std::expected<core::CommandReceipt, core::CoreError>
     Connect(ConnectionRequest request);
     [[nodiscard]] std::expected<core::CommandReceipt, core::CoreError>
@@ -45,7 +48,11 @@ public:
     OrderCommandStatus(const std::string& request_id);
 
     void RefreshMarketSymbols(const std::vector<std::string>& symbols);
-    void RequestMarketHistory(const std::string& symbol);
+    void RequestMarketHistory(const std::string& symbol,
+                              const std::string& timeframe = "1Day");
+    [[nodiscard]] std::future<core::TickSeries> RequestTicks(
+        core::TickQuery query);
+    void RefreshAssetCatalog();
 
 private:
     class Impl;

@@ -24,6 +24,8 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -61,11 +63,16 @@ struct LaunchOptions {
 
 struct Chart {
     std::string symbol;
+    std::string timeframe = "1Day";
     std::vector<Bar> bars;
     int visible_bars = 120;
     double last_trade_price = 0;
     std::int64_t last_trade_timestamp_ms = 0;
-    bool window_open = true;
+    std::vector<tradebox::core::MarketTrade> ticks;
+    std::optional<std::future<tradebox::core::TickSeries>> tick_request;
+    std::int64_t tick_range_ns = 60LL * 60 * 1'000'000'000;
+    std::string tick_status;
+    bool window_open = false;
 };
 
 struct App {
@@ -77,7 +84,13 @@ struct App {
     UiEventQueue events;
     tradebox::application::TradingApplication application;
     std::vector<std::string> watchlist;
+    std::vector<std::string> requested_market_symbols;
     std::unordered_map<std::string, Chart> charts;
+    struct MarketProjection {
+        tradebox::core::MarketDataSnapshot snapshot;
+        std::uint64_t cursor = 0;
+    };
+    std::unordered_map<std::string, MarketProjection> market_views;
     // Read-only projections copied from the headless core for rendering.
     tradebox::core::CoreSnapshot core_view;
     tradebox::core::AccountState account;
@@ -110,6 +123,27 @@ struct App {
     std::array<char, 160> secret{};
     std::array<char, 24> new_symbol{};
     std::vector<std::string> messages;
+    struct OrderTicket {
+        OrderEntryDraft draft;
+        std::array<char, 96> name{'U','n','t','i','t','l','e','d',' ','o','r','d','e','r'};
+        std::array<char, 64> amount{'1'};
+        std::array<char, 64> limit{};
+        std::array<char, 64> stop{};
+        bool window_open = true;
+        bool was_visible = false;
+    };
+    std::vector<OrderTicket> order_tickets;
+    std::vector<tradebox::core::TradableAsset> asset_catalog;
+    std::array<char, 96> asset_query{};
+    int asset_cursor = 0;
+    std::vector<tradebox::core::TradableAsset> asset_matches;
+    std::string selected_symbol = "AMD";
+    bool show_order_entry = true;
+    bool command_in_flight = false;
+    std::string command_request_id;
+    std::string command_status;
+    std::uint64_t next_request_id = 1;
+    std::vector<std::jthread> command_workers;
     bool capture_requested = false;
     std::filesystem::path capture_path;
     bool exit_after_capture = false;
@@ -120,7 +154,11 @@ struct App {
     bool software_frame_pacing = false;
     Uint64 display_sync_changed_at = 0;
     Uint64 next_frame_deadline_ns = 0;
+    MarketDataStorageUsage market_storage;
+    Uint64 market_storage_sampled_at = 0;
 };
+
+void RequestChartData(App& app, Chart& chart);
 
 void AddMessage(App& app, std::string message) {
     app.messages.push_back(std::move(message));
@@ -388,6 +426,188 @@ void RefreshCoreProjection(App& app) {
     }
 }
 
+void InsertProjectedTrade(
+    std::vector<tradebox::core::MarketTrade>& trades,
+    tradebox::core::MarketTrade trade) {
+    if (!trade.trade_id.empty()) {
+        const auto duplicate = std::ranges::find_if(
+            trades, [&trade](const auto& existing) {
+                constexpr std::int64_t day_ns =
+                    24LL * 60 * 60 * 1'000'000'000;
+                return existing.trade_id == trade.trade_id &&
+                       (existing.event_time_ns <= 0 ||
+                        trade.event_time_ns <= 0 ||
+                        existing.event_time_ns / day_ns ==
+                            trade.event_time_ns / day_ns);
+            });
+        if (duplicate != trades.end()) *duplicate = std::move(trade);
+        else {
+            const auto position = std::ranges::find_if(
+                trades, [&trade](const auto& existing) {
+                    return existing.event_time_ns < trade.event_time_ns;
+                });
+            trades.insert(position, std::move(trade));
+        }
+    } else {
+        const auto position = std::ranges::find_if(
+            trades, [&trade](const auto& existing) {
+                return existing.event_time_ns < trade.event_time_ns;
+            });
+        trades.insert(position, std::move(trade));
+    }
+    if (trades.size() > 2'000) trades.resize(2'000);
+}
+
+void RefreshMarketProjection(App& app, const std::string& symbol) {
+    auto& projection = app.market_views[symbol];
+    auto delta = app.application.MarketDataChanges(
+        symbol, projection.cursor, 512);
+    if (delta.gap_detected) {
+        projection.snapshot = app.application.MarketData(symbol);
+        projection.cursor = delta.next_sequence;
+        return;
+    }
+    auto& snapshot = projection.snapshot;
+    snapshot.symbol = symbol;
+    snapshot.feed = delta.feed;
+    snapshot.stream_status = delta.stream_status;
+    snapshot.trades_subscribed = delta.trades_subscribed;
+    snapshot.quotes_subscribed = delta.quotes_subscribed;
+    snapshot.status_message = std::move(delta.status_message);
+    snapshot.last_received_at_ms = delta.last_received_at_ms;
+    snapshot.latest_quote = std::move(delta.latest_quote);
+    for (auto& sequenced : delta.events) {
+        std::visit(
+            [&](auto& event) {
+                using Event = std::decay_t<decltype(event)>;
+                if constexpr (std::is_same_v<
+                                  Event,
+                                  tradebox::core::TradeReceived>) {
+                    if (event.trade.received_at_ms > 0 &&
+                        event.trade.event_time_ns > 0) {
+                        app.market_latency_ms =
+                            event.trade.received_at_ms -
+                            event.trade.event_time_ns / 1'000'000;
+                        app.last_market_received_at_ms =
+                            event.trade.received_at_ms;
+                    }
+                    if (auto chart = app.charts.find(symbol);
+                        chart != app.charts.end()) {
+                        ApplyTrade(
+                            chart->second,
+                            {event.trade.event_time_ns / 1'000'000,
+                             0, 0, 0,
+                             event.trade.price.ToDisplayDouble(),
+                             event.trade.size.ToDisplayDouble()});
+                        if (chart->second.timeframe == "Ticks") {
+                            chart->second.ticks.push_back(event.trade);
+                            if (chart->second.ticks.size() > 100'000)
+                                chart->second.ticks.erase(
+                                    chart->second.ticks.begin(),
+                                    chart->second.ticks.begin() + 10'000);
+                        }
+                    }
+                    InsertProjectedTrade(snapshot.trades,
+                                         std::move(event.trade));
+                } else if constexpr (std::is_same_v<
+                                         Event,
+                                         tradebox::core::TradeCanceled>) {
+                    std::erase_if(
+                        snapshot.trades,
+                        [&](const auto& trade) {
+                            constexpr std::int64_t day_ns =
+                                24LL * 60 * 60 * 1'000'000'000;
+                            return trade.trade_id == event.trade_id &&
+                                   (event.event_time_ns <= 0 ||
+                                    trade.event_time_ns / day_ns ==
+                                        event.event_time_ns / day_ns);
+                        });
+                    if (auto chart = app.charts.find(symbol);
+                        chart != app.charts.end())
+                        std::erase_if(
+                            chart->second.ticks,
+                            [&](const auto& trade) {
+                                constexpr std::int64_t day_ns =
+                                    24LL * 60 * 60 * 1'000'000'000;
+                                return trade.trade_id == event.trade_id &&
+                                       (event.event_time_ns <= 0 ||
+                                        trade.event_time_ns / day_ns ==
+                                            event.event_time_ns /
+                                                day_ns);
+                            });
+                } else if constexpr (std::is_same_v<
+                                         Event,
+                                         tradebox::core::TradeCorrected>) {
+                    std::erase_if(
+                        snapshot.trades,
+                        [&](const auto& trade) {
+                            return trade.trade_id ==
+                                   event.original_trade_id;
+                        });
+                    if (auto chart = app.charts.find(symbol);
+                        chart != app.charts.end()) {
+                        std::erase_if(
+                            chart->second.ticks,
+                            [&](const auto& trade) {
+                                return trade.trade_id ==
+                                       event.original_trade_id;
+                            });
+                        chart->second.ticks.push_back(
+                            event.corrected_trade);
+                    }
+                    InsertProjectedTrade(
+                        snapshot.trades,
+                        std::move(event.corrected_trade));
+                }
+            },
+            sequenced.event);
+    }
+    projection.cursor = delta.next_sequence;
+    snapshot.revision = projection.cursor;
+}
+
+void RefreshVisibleMarketData(App& app) {
+    for (const std::string& symbol : app.watchlist)
+        RefreshMarketProjection(app, symbol);
+    for (const auto& ticket : app.order_tickets)
+        if (!ticket.draft.symbol.empty() &&
+            std::ranges::find(app.watchlist, ticket.draft.symbol) ==
+                app.watchlist.end())
+            RefreshMarketProjection(app, ticket.draft.symbol);
+}
+
+void RefreshRequiredMarketSymbols(App& app) {
+    if (app.connection_state == ConnectionState::Disconnected ||
+        app.connection_state == ConnectionState::Error)
+        return;
+    std::vector<std::string> required = app.watchlist;
+    for (const auto& ticket : app.order_tickets)
+        if (!ticket.draft.symbol.empty())
+            required.push_back(ticket.draft.symbol);
+    for (const auto& position : app.positions)
+        if (!position.symbol.empty())
+            required.push_back(position.symbol);
+    for (const auto& order : app.orders)
+        if (!order.symbol.empty())
+            required.push_back(order.symbol);
+    std::ranges::sort(required);
+    required.erase(std::unique(required.begin(), required.end()),
+                   required.end());
+    if (required == app.requested_market_symbols) return;
+    app.application.RefreshMarketSymbols(required);
+    app.requested_market_symbols = std::move(required);
+}
+
+const tradebox::core::MarketDataSnapshot& MarketView(
+    App& app, const std::string& symbol) {
+    auto found = app.market_views.find(symbol);
+    if (found == app.market_views.end()) {
+        RefreshMarketProjection(app, symbol);
+        found = app.market_views.find(symbol);
+    }
+    return found->second.snapshot;
+}
+
 void DrainEvents(App& app) {
     RefreshCoreProjection(app);
     for (UiEvent& event : app.events.Drain()) {
@@ -439,26 +659,219 @@ void DrainEvents(App& app) {
             app.account_event_latency_ms = event.latency_ms;
             continue;
         }
+        if (event.type == UiEventType::OrderCommandCompleted) {
+            app.command_in_flight = false;
+            const auto& result = event.command_result;
+            if (result.outcome == tradebox::core::OrderCommandOutcome::Indeterminate)
+                app.command_status = "indeterminate: " + result.message;
+            else
+                app.command_status = result.message.empty()
+                    ? "order command completed"
+                    : result.message;
+            AddMessage(app, "Order " + event.request_id + ": " + app.command_status);
+            continue;
+        }
+        if (event.type == UiEventType::AssetCatalogReady) {
+            app.asset_catalog = std::move(event.assets);
+            app.database.SaveAssetCatalog(app.asset_catalog);
+            AddMessage(app, "Tradable asset catalog ready: " +
+                                std::to_string(app.asset_catalog.size()) + " assets");
+            continue;
+        }
         auto found = app.charts.find(event.symbol);
         if (found == app.charts.end()) continue;
         Chart& chart = found->second;
         if (event.type == UiEventType::HistoricalBars) {
+            if (event.timeframe != chart.timeframe) continue;
             chart.bars = std::move(event.bars);
             AddMessage(app, event.symbol + ": " +
                                 std::to_string(chart.bars.size()) +
                                 " daily bars ready");
-        } else if (event.type == UiEventType::Trade) {
-            if (event.received_at_ms > 0 && event.bar.timestamp_ms > 0) {
-                app.market_latency_ms =
-                    event.received_at_ms - event.bar.timestamp_ms;
-                app.last_market_received_at_ms = event.received_at_ms;
-            }
-            ApplyTrade(chart, event.bar);
         } else if (event.type == UiEventType::DailyBar) {
             UpsertDailyBar(chart, event.bar);
         }
     }
     RefreshCoreProjection(app);
+}
+
+std::string NextRequestId(App& app) {
+    return "gui-" + std::to_string(SystemNowMs()) + "-" +
+           std::to_string(app.next_request_id++);
+}
+
+std::optional<tradebox::core::NativeOrderRequest> BuildOrderRequest(
+    const OrderEntryDraft& draft, std::string& error) {
+    const auto errors = ValidateOrderEntry(draft);
+    if (!errors.empty()) {
+        error = errors.front().field + ": " + errors.front().message;
+        return std::nullopt;
+    }
+    auto amount = tradebox::core::Decimal::Parse(draft.amount);
+    if (!amount) { error = "amount: invalid decimal"; return std::nullopt; }
+    tradebox::core::NativeOrderRequest request;
+    request.asset_class = tradebox::core::AssetClass::Equity;
+    request.symbol = draft.symbol;
+    request.side = draft.side == "Sell" ? tradebox::core::OrderSide::Sell
+                                         : tradebox::core::OrderSide::Buy;
+    request.type = draft.type == "Limit" ? tradebox::core::OrderType::Limit
+        : draft.type == "Stop" ? tradebox::core::OrderType::Stop
+        : draft.type == "Stop-limit" ? tradebox::core::OrderType::StopLimit
+                                      : tradebox::core::OrderType::Market;
+    request.time_in_force = draft.time_in_force == "Gtc"
+        ? tradebox::core::TimeInForce::Gtc : tradebox::core::TimeInForce::Day;
+    request.extended_hours = draft.extended_hours;
+    if (draft.amount_is_notional) request.notional = *amount;
+    else request.qty = *amount;
+    if (!draft.limit_price.empty()) request.limit_price = *tradebox::core::Decimal::Parse(draft.limit_price);
+    if (!draft.stop_price.empty()) request.stop_price = *tradebox::core::Decimal::Parse(draft.stop_price);
+    return request;
+}
+
+void SubmitUiCommand(App& app, tradebox::core::NativeOrderCommand command,
+                     std::string request_id) {
+    if (app.command_in_flight) return;
+    app.command_in_flight = true;
+    app.command_request_id = request_id;
+    auto future = app.application.SubmitOrder(std::move(command));
+    app.command_workers.emplace_back([&app, request_id = std::move(request_id),
+                                       future = std::move(future)]() mutable {
+        UiEvent event;
+        event.type = UiEventType::OrderCommandCompleted;
+        event.request_id = request_id;
+        event.command_result = future.get();
+        app.events.Push(std::move(event));
+    });
+}
+
+void DrawOrderEntry(App& app) {
+    if (app.order_tickets.empty()) app.order_tickets.emplace_back();
+    for (std::size_t ticket_index = 0; ticket_index < app.order_tickets.size(); ++ticket_index) {
+        auto& ticket = app.order_tickets[ticket_index];
+        if (!ticket.window_open) continue;
+        ticket.draft.name = ticket.name.data();
+        ImGui::PushID(static_cast<int>(ticket_index));
+        const std::string title = ticket.draft.name + "###order-ticket-" + std::to_string(ticket_index);
+        if (!ticket.was_visible) {
+            ImGui::SetNextWindowPos(ImVec2(920.0f + static_cast<float>(ticket_index) * 28.0f,
+                                           40.0f + static_cast<float>(ticket_index) * 28.0f),
+                                    ImGuiCond_Always);
+            ImGui::SetNextWindowFocus();
+        }
+        ImGui::SetNextWindowSize(ImVec2(360, 460), ImGuiCond_FirstUseEver);
+        if (!ImGui::Begin(title.c_str(), &ticket.window_open)) { ImGui::End(); ImGui::PopID(); continue; }
+        ticket.was_visible = true;
+        if (ImGui::InputText("Ticket name", ticket.name.data(), ticket.name.size()))
+            ticket.draft.name = ticket.name.data();
+    const char* symbols[] = {"AMD", "MSFT", "AAPL", "QQQ"};
+    int symbol_index = 0;
+    for (int i = 0; i < 4; ++i) if (ticket.draft.symbol == symbols[i]) symbol_index = i;
+    if (ImGui::Combo("Symbol", &symbol_index, symbols, 4)) {
+        ticket.draft.symbol = symbols[symbol_index];
+        app.selected_symbol = ticket.draft.symbol;
+    }
+    const char* sides[] = {"Buy", "Sell"};
+    int side_index = ticket.draft.side == "Sell" ? 1 : 0;
+    if (ImGui::Combo("Side", &side_index, sides, 2)) ticket.draft.side = sides[side_index];
+    ImGui::InputText("Quantity / notional", ticket.amount.data(), ticket.amount.size());
+    ImGui::Checkbox("Notional", &ticket.draft.amount_is_notional);
+    const char* types[] = {"Market", "Limit", "Stop", "Stop-limit"};
+    int type_index = ticket.draft.type == "Limit" ? 1 : ticket.draft.type == "Stop" ? 2 : ticket.draft.type == "Stop-limit" ? 3 : 0;
+    if (ImGui::Combo("Type", &type_index, types, 4)) ticket.draft.type = types[type_index];
+    if (ticket.draft.type == "Limit" || ticket.draft.type == "Stop-limit")
+        ImGui::InputText("Limit price", ticket.limit.data(), ticket.limit.size());
+    if (ticket.draft.type == "Stop" || ticket.draft.type == "Stop-limit")
+        ImGui::InputText("Stop price", ticket.stop.data(), ticket.stop.size());
+    const char* tifs[] = {"Day", "Gtc"};
+    int tif_index = ticket.draft.time_in_force == "Gtc" ? 1 : 0;
+    if (ImGui::Combo("Time in force", &tif_index, tifs, 2)) ticket.draft.time_in_force = tifs[tif_index];
+    ImGui::Checkbox("Extended hours", &ticket.draft.extended_hours);
+    const auto& market = MarketView(app, ticket.draft.symbol);
+    if (market.latest_quote) {
+        ImGui::Text("Bid %s   Ask %s", market.latest_quote->bid_price.ToString().c_str(),
+                    market.latest_quote->ask_price.ToString().c_str());
+    } else ImGui::TextDisabled("Bid/ask unavailable");
+    std::string validation;
+    ImGui::BeginDisabled(app.command_in_flight);
+    if (ImGui::Button("Send Order", ImVec2(140, 0))) {
+        ticket.draft.amount = ticket.amount.data();
+        ticket.draft.limit_price = ticket.limit.data();
+        ticket.draft.stop_price = ticket.stop.data();
+        auto order = BuildOrderRequest(ticket.draft, validation);
+        if (!order) app.command_status = validation;
+        else {
+            const auto snapshot = app.application.Snapshot();
+            const std::string request_id = NextRequestId(app);
+            SubmitUiCommand(app, tradebox::core::PlaceOrderCommand{
+                .context = {.request_id = request_id, .source = "gui",
+                            .account_id = snapshot.account ? snapshot.account->id : "",
+                            .environment = snapshot.environment,
+                            .generation = snapshot.generation,
+                            .live_trading_confirmed = false},
+                .order = std::move(*order)}, request_id);
+            app.command_status = "pending";
+        }
+    }
+    ImGui::EndDisabled();
+    if (!app.command_status.empty()) ImGui::TextWrapped("%s", app.command_status.c_str());
+    ImGui::End();
+        ImGui::PopID();
+    }
+}
+
+void DrawMarketPanel(App& app) {
+    const auto& market = MarketView(app, app.selected_symbol);
+    ImGui::SetNextWindowSize(ImVec2(600, 360), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("MARKET DATA")) { ImGui::End(); return; }
+    const bool stale = market.last_received_at_ms > 0 &&
+        SystemNowMs() - market.last_received_at_ms > 5000;
+    const char* stream = market.stream_status == tradebox::core::MarketStreamStatus::Subscribed
+        ? "CONNECTED" : market.stream_status == tradebox::core::MarketStreamStatus::Stale
+        ? "STALE" : "DISCONNECTED";
+    ImGui::TextColored(stale ? ImVec4(1, .65f, .2f, 1) : ImVec4(.3f, .9f, .5f, 1),
+                       "%s  |  %s  |  %s", app.selected_symbol.c_str(), stream,
+                       market.trades_subscribed && market.quotes_subscribed ? "SUBSCRIBED" : "NOT SUBSCRIBED");
+    if (market.latest_quote) {
+        const auto& quote = *market.latest_quote;
+        ImGui::Text("Bid %s x %s (%s)    Ask %s x %s (%s)",
+                    quote.bid_price.ToString().c_str(), quote.bid_size.ToString().c_str(), quote.bid_exchange.c_str(),
+                    quote.ask_price.ToString().c_str(), quote.ask_size.ToString().c_str(), quote.ask_exchange.c_str());
+    }
+    if (!market.trades.empty()) {
+        ImGui::Text("Latest trade  %s x %s  %s", market.trades.front().price.ToString().c_str(),
+                    market.trades.front().size.ToString().c_str(), market.trades.front().broker_timestamp.c_str());
+        const ImVec2 size(ImGui::GetContentRegionAvail().x, 85);
+        ImGui::InvisibleButton("##tick-chart", size);
+        const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        draw->AddRectFilled(a, b, IM_COL32(18, 24, 34, 255));
+        double low = market.trades.front().price.ToDisplayDouble();
+        double high = low;
+        for (const auto& trade : market.trades) { const double p = trade.price.ToDisplayDouble(); low = std::min(low, p); high = std::max(high, p); }
+        const double span = std::max(high - low, 0.000001);
+        for (std::size_t i = 1; i < market.trades.size(); ++i) {
+            const auto px = [&](std::size_t n) { return a.x + size.x * static_cast<float>(n - 1) / static_cast<float>(std::max<std::size_t>(market.trades.size() - 1, 1)); };
+            const auto py = [&](std::size_t n) { return b.y - 5.0f - (static_cast<float>((market.trades[n].price.ToDisplayDouble() - low) / span) * (size.y - 10.0f)); };
+            draw->AddLine(ImVec2(px(i), py(i)), ImVec2(a.x + size.x * static_cast<float>(i) / static_cast<float>(std::max<std::size_t>(market.trades.size() - 1, 1)), py(i)), IM_COL32(78, 177, 255, 255), 1.5f);
+        }
+    } else ImGui::TextDisabled("No trades received");
+    ImGui::SeparatorText("Trade tape (newest first)");
+    if (ImGui::BeginTable("trade-tape", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+                          ImVec2(0, ImGui::GetContentRegionAvail().y))) {
+        ImGui::TableSetupColumn("Time"); ImGui::TableSetupColumn("Price"); ImGui::TableSetupColumn("Size");
+        ImGui::TableSetupColumn("Exchange"); ImGui::TableSetupColumn("Conditions"); ImGui::TableHeadersRow();
+        for (const auto& trade : market.trades) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(trade.broker_timestamp.c_str());
+            ImGui::TableNextColumn(); ImGui::TextColored(trade.corrected ? ImVec4(1, .7f, .25f, 1) : ImVec4(.75f, .85f, 1, 1), "%s", trade.price.ToString().c_str());
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(trade.size.ToString().c_str());
+            ImGui::TableNextColumn(); ImGui::TextUnformatted(trade.exchange.c_str());
+            ImGui::TableNextColumn();
+            std::string conditions; for (const auto& c : trade.conditions) { if (!conditions.empty()) conditions += ","; conditions += c; }
+            ImGui::TextUnformatted(conditions.c_str());
+        }
+        ImGui::EndTable();
+    }
+    ImGui::End();
 }
 
 void DrawConnectionBadge(const App& app) {
@@ -522,6 +935,7 @@ void ConnectSavedAccount(App& app, bool paper) {
                                 : core_result->message);
             return;
         }
+        app.application.RefreshAssetCatalog();
         AddMessage(app, std::string("Connecting ") +
                             (paper ? "paper" : "live") + " account...");
     } else {
@@ -548,6 +962,7 @@ void DisconnectAccount(App& app) {
     app.market_latency_ms = -1;
     app.last_market_received_at_ms = 0;
     app.market_subscription_active = false;
+    app.requested_market_symbols.clear();
     app.has_market_clock = false;
     app.market_clock = {};
     app.account_stream_latency_ms = -1;
@@ -863,8 +1278,27 @@ void DrawPerformanceOverlay(const App& app) {
                   usage.core_equivalents,
                   static_cast<double>(usage.working_set_bytes) /
                       (1024.0 * 1024.0));
-    const std::array<std::string_view, 3> lines = {
-        clock_label, session_label, performance_label};
+    const auto storage_size = [](std::uint64_t bytes) {
+        constexpr double kMegabyte = 1024.0 * 1024.0;
+        constexpr double kGigabyte = 1024.0 * kMegabyte;
+        char value[32];
+        if (bytes >= static_cast<std::uint64_t>(kGigabyte))
+            std::snprintf(value, sizeof(value), "%.2f GB",
+                          static_cast<double>(bytes) / kGigabyte);
+        else
+            std::snprintf(value, sizeof(value), "%.1f MB",
+                          static_cast<double>(bytes) / kMegabyte);
+        return std::string(value);
+    };
+    const std::string storage_label =
+        "MARKET DATA  |  CANDLES " +
+        storage_size(app.market_storage.candlestick_bytes) + " (" +
+        std::to_string(app.market_storage.candlestick_rows) +
+        ")  |  TICKS " + storage_size(app.market_storage.tick_bytes) + " (" +
+        std::to_string(app.market_storage.tick_rows) + ")  |  DISK " +
+        storage_size(app.market_storage.database_bytes);
+    const std::array<std::string_view, 4> lines = {
+        clock_label, session_label, performance_label, storage_label};
     float text_width = 0;
     for (const std::string_view line : lines)
         text_width =
@@ -1096,9 +1530,13 @@ bool DrawTitleBar(App& app, SDL_Window* window) {
         }
         if (ImGui::BeginMenu("Add")) {
             if (ImGui::MenuItem("Chart")) {
-                for (auto& [symbol, chart] : app.charts)
+                for (auto& [symbol, chart] : app.charts) {
+                    static_cast<void>(symbol);
                     chart.window_open = true;
+                    RequestChartData(app, chart);
+                }
             }
+            if (ImGui::MenuItem("Order")) app.order_tickets.emplace_back();
             if (ImGui::MenuItem("Watchlist")) app.show_watchlist = true;
             if (ImGui::MenuItem("Account")) app.show_account = true;
             if (ImGui::MenuItem("Orders")) app.show_orders = true;
@@ -1283,6 +1721,7 @@ void DrawCredentials(App& app) {
                                         ? core_result.error().message
                                         : core_result->message);
                 } else {
+                    app.application.RefreshAssetCatalog();
                     app.credentials_open = false;
                     ImGui::CloseCurrentPopup();
                 }
@@ -1338,11 +1777,37 @@ void AddSymbol(App& app, const std::string& symbol) {
         return;
     app.watchlist.push_back(symbol);
     Chart chart{symbol};
-    chart.bars = app.database.LoadBars(symbol);
     app.charts.emplace(symbol, std::move(chart));
     app.database.SaveWatchlist(app.watchlist);
-    app.application.RequestMarketHistory(symbol);
     app.application.RefreshMarketSymbols(app.watchlist);
+}
+
+void RequestChartData(App& app, Chart& chart) {
+    if (chart.timeframe != "Ticks") {
+        app.application.RequestMarketHistory(
+            chart.symbol, chart.timeframe);
+        return;
+    }
+    const std::int64_t end_ns =
+        SystemNowMs() * 1'000'000;
+    auto feed =
+        app.application.MarketData(chart.symbol).feed;
+    if (feed == tradebox::core::MarketDataFeed::Unknown)
+        feed = tradebox::core::MarketDataFeed::Iex;
+    chart.tick_status = "Loading cached and historical ticks...";
+    chart.tick_request.emplace(app.application.RequestTicks({
+        .symbol = chart.symbol,
+        .start_ns = end_ns - chart.tick_range_ns,
+        .end_ns = end_ns,
+        .feed = feed,
+        .include_trades = true,
+        .include_quotes = false,
+    }));
+}
+
+void OpenChart(App& app, Chart& chart) {
+    chart.window_open = true;
+    RequestChartData(app, chart);
 }
 
 void RemoveSymbol(App& app, std::size_t index) {
@@ -1364,10 +1829,35 @@ void DrawWatchlist(App& app) {
         return;
     }
     ConstrainCurrentWindowToWorkspace();
-    ImGui::SetNextItemWidth(120);
+    ImGui::SetNextItemWidth(180);
     const bool submitted = ImGui::InputText(
         "##symbol", app.new_symbol.data(), app.new_symbol.size(),
         ImGuiInputTextFlags_CharsUppercase | ImGuiInputTextFlags_EnterReturnsTrue);
+    app.asset_matches = tradebox::core::SearchTradableAssets(
+        app.asset_catalog, app.new_symbol.data(), 5);
+    if (ImGui::IsItemActive() && !app.asset_matches.empty()) {
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
+            app.asset_cursor = (app.asset_cursor + 1) % static_cast<int>(app.asset_matches.size());
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))
+            app.asset_cursor = (app.asset_cursor + static_cast<int>(app.asset_matches.size()) - 1) % static_cast<int>(app.asset_matches.size());
+        if (ImGui::IsKeyPressed(ImGuiKey_Enter)) {
+            std::snprintf(app.new_symbol.data(), app.new_symbol.size(), "%s",
+                          app.asset_matches[static_cast<std::size_t>(app.asset_cursor)].symbol.c_str());
+            AddSymbol(app, app.new_symbol.data());
+            app.new_symbol.fill('\0');
+            app.asset_matches.clear();
+        }
+    }
+    if ((ImGui::IsItemHovered() || ImGui::IsItemActive()) && !app.asset_matches.empty()) {
+        ImGui::BeginTooltip();
+        for (std::size_t index = 0; index < app.asset_matches.size(); ++index) {
+            const auto& asset = app.asset_matches[index];
+            if (static_cast<int>(index) == app.asset_cursor) ImGui::TextColored(ImVec4(.3f,.85f,1,1), "> %s", asset.symbol.c_str());
+            else ImGui::Text("  %s", asset.symbol.c_str());
+            ImGui::SameLine(100); ImGui::TextDisabled("%s | %s", asset.name.c_str(), asset.exchange.c_str());
+        }
+        ImGui::EndTooltip();
+    }
     ImGui::SameLine();
     if ((ImGui::Button("+ Add") || submitted)) {
         AddSymbol(app, NormalizeSymbol(app.new_symbol.data()));
@@ -1397,10 +1887,34 @@ void DrawWatchlist(App& app) {
             if (ImGui::Selectable(app.watchlist[i].c_str(), false,
                                   ImGuiSelectableFlags_None) &&
                 chart)
-                chart->window_open = true;
+                OpenChart(app, *chart);
+            if (ImGui::BeginPopupContextItem("watch-symbol-menu")) {
+                if (ImGui::MenuItem("Open chart")) {
+                    if (chart) OpenChart(app, *chart);
+                }
+                if (ImGui::MenuItem("Open trade order")) {
+                    App::OrderTicket ticket;
+                    ticket.draft.symbol = app.watchlist[i];
+                    ticket.name = {};
+                    const std::string label = "Order " + app.watchlist[i];
+                    std::copy(label.begin(), label.end(), ticket.name.begin());
+                    ticket.draft.name = label;
+                    app.order_tickets.push_back(std::move(ticket));
+                }
+                ImGui::EndPopup();
+            }
             ImGui::TableNextColumn();
-            if (chart && chart->last_trade_price > 0)
-                ImGui::Text("%.2f", chart->last_trade_price);
+            const auto market = app.market_views.find(app.watchlist[i]);
+            const bool has_live_trade =
+                market != app.market_views.end() &&
+                !market->second.snapshot.trades.empty();
+            const double live_trade =
+                has_live_trade
+                    ? market->second.snapshot.trades.front()
+                          .price.ToDisplayDouble()
+                    : 0;
+            if (has_live_trade)
+                ImGui::Text("%.2f", live_trade);
             else if (chart && !chart->bars.empty()) {
                 ImGui::TextDisabled("%.2f", chart->bars.back().close);
                 if (ImGui::IsItemHovered()) {
@@ -1414,9 +1928,9 @@ void DrawWatchlist(App& app) {
             ImGui::TableNextColumn();
             const double previous_close =
                 chart ? PreviousSessionClose(*chart) : 0;
-            if (chart && chart->last_trade_price > 0 && previous_close > 0) {
+            if (has_live_trade && previous_close > 0) {
                 const double change =
-                    (chart->last_trade_price / previous_close - 1.0) * 100.0;
+                    (live_trade / previous_close - 1.0) * 100.0;
                 ImGui::TextColored(
                     change >= 0 ? ImVec4(0.25f, 0.9f, 0.58f, 1)
                                 : ImVec4(0.96f, 0.38f, 0.43f, 1),
@@ -1549,19 +2063,122 @@ void DrawChartCanvas(Chart& chart) {
     }
 }
 
+void DrawTickChartCanvas(const Chart& chart) {
+    ImVec2 size = ImGui::GetContentRegionAvail();
+    size.x = std::max(size.x, 240.0f);
+    size.y = std::max(size.y, 180.0f);
+    ImGui::InvisibleButton("tick-chart-canvas", size);
+    const ImVec2 a = ImGui::GetItemRectMin();
+    const ImVec2 b = ImGui::GetItemRectMax();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(a, b, IM_COL32(12, 17, 25, 255));
+    if (chart.ticks.empty()) {
+        draw->AddText(
+            ImVec2(a.x + 16, a.y + 16),
+            IM_COL32(145, 155, 170, 255),
+            chart.tick_status.empty() ? "No ticks in range"
+                                      : chart.tick_status.c_str());
+        return;
+    }
+    const std::size_t maximum_points =
+        static_cast<std::size_t>(std::max(1.0f, size.x * 2));
+    const std::size_t stride =
+        std::max<std::size_t>(
+            1, (chart.ticks.size() + maximum_points - 1) /
+                   maximum_points);
+    double low = chart.ticks.front().price.ToDisplayDouble();
+    double high = low;
+    for (std::size_t index = 0; index < chart.ticks.size();
+         index += stride) {
+        const double price =
+            chart.ticks[index].price.ToDisplayDouble();
+        low = std::min(low, price);
+        high = std::max(high, price);
+    }
+    const double span = std::max(high - low, 0.000001);
+    ImVec2 previous{};
+    bool has_previous = false;
+    std::size_t point = 0;
+    const std::size_t points =
+        (chart.ticks.size() + stride - 1) / stride;
+    for (std::size_t index = 0; index < chart.ticks.size();
+         index += stride, ++point) {
+        const float x =
+            a.x + size.x * static_cast<float>(point) /
+                      static_cast<float>(
+                          std::max<std::size_t>(points - 1, 1));
+        const float y =
+            b.y - 8.0f -
+            static_cast<float>(
+                (chart.ticks[index].price.ToDisplayDouble() - low) /
+                span) *
+                (size.y - 16.0f);
+        const ImVec2 current{x, y};
+        if (has_previous)
+            draw->AddLine(previous, current,
+                          IM_COL32(78, 177, 255, 255), 1.2f);
+        previous = current;
+        has_previous = true;
+    }
+}
+
 void DrawCharts(App& app) {
     for (const std::string& symbol : app.watchlist) {
         auto found = app.charts.find(symbol);
         if (found == app.charts.end()) continue;
         Chart& chart = found->second;
         if (!chart.window_open) continue;
-        const std::string title = symbol + " - Daily###chart-" + symbol;
+        const std::string title = symbol + " - " + chart.timeframe + "###chart-" + symbol;
         ImGui::SetNextWindowSize(ImVec2(640, 390), ImGuiCond_FirstUseEver);
         if (!ImGui::Begin(title.c_str(), &chart.window_open)) {
             ImGui::End();
             continue;
         }
         ConstrainCurrentWindowToWorkspace();
+        const char* timeframes[] = {"1Day", "1Hour", "1Min", "Ticks"};
+        int timeframe_index =
+            chart.timeframe == "1Hour"
+                ? 1
+                : chart.timeframe == "1Min"
+                      ? 2
+                      : chart.timeframe == "Ticks" ? 3 : 0;
+        if (ImGui::Combo("Timeframe", &timeframe_index, timeframes, 4)) {
+            chart.timeframe = timeframes[timeframe_index];
+            RequestChartData(app, chart);
+        }
+        if (chart.timeframe == "Ticks") {
+            ImGui::SameLine();
+            if (ImGui::Button("1 hour")) {
+                chart.tick_range_ns =
+                    60LL * 60 * 1'000'000'000;
+                RequestChartData(app, chart);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("1 day")) {
+                chart.tick_range_ns =
+                    24LL * 60 * 60 * 1'000'000'000;
+                RequestChartData(app, chart);
+            }
+            if (chart.tick_request &&
+                chart.tick_request->wait_for(
+                    std::chrono::seconds(0)) ==
+                    std::future_status::ready) {
+                auto series = chart.tick_request->get();
+                chart.ticks = std::move(series.trades);
+                chart.tick_status =
+                    series.error.empty()
+                        ? std::to_string(chart.ticks.size()) +
+                              " ticks"
+                        : std::move(series.error);
+                chart.tick_request.reset();
+            }
+            ImGui::TextDisabled(
+                "%zu ticks | %s", chart.ticks.size(),
+                chart.tick_status.c_str());
+            DrawTickChartCanvas(chart);
+            ImGui::End();
+            continue;
+        }
         if (!chart.bars.empty()) {
             const Bar& latest = chart.bars.back();
             const ImVec4 color = latest.close >= latest.open
@@ -1572,7 +2189,7 @@ void DrawCharts(App& app) {
             ImGui::TextDisabled("%zu bars | mouse wheel zoom",
                                 chart.bars.size());
         } else {
-            ImGui::TextDisabled("Daily / IEX");
+            ImGui::TextDisabled("%s / IEX", chart.timeframe.c_str());
         }
         DrawChartCanvas(chart);
         ImGui::End();
@@ -1705,7 +2322,7 @@ void DrawOrders(App& app) {
             app.core_view.status_message.c_str());
     }
     if (ImGui::BeginTable(
-            "orders-table", 9,
+            "orders-table", 10,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
                 ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
                 ImGuiTableFlags_SizingStretchProp,
@@ -1719,7 +2336,8 @@ void DrawOrders(App& app) {
         ImGui::TableSetupColumn("Filled");
         ImGui::TableSetupColumn("Average fill");
         ImGui::TableSetupColumn("TIF");
-        ImGui::TableSetupColumn("Status");
+            ImGui::TableSetupColumn("Status");
+            ImGui::TableSetupColumn("Action");
         ImGui::TableHeadersRow();
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(app.orders.size()));
@@ -1759,7 +2377,24 @@ void DrawOrders(App& app) {
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(order.time_in_force.c_str());
                 ImGui::TableNextColumn();
-                ImGui::TextUnformatted(order.status.c_str());
+                const UiOrderState ui_state = UiOrderStateFromCore(order, app.core_view);
+                ImGui::TextUnformatted(UiOrderStateLabel(ui_state).c_str());
+                ImGui::TableNextColumn();
+                const bool cancelable = ui_state == UiOrderState::Accepted ||
+                                        ui_state == UiOrderState::Pending;
+                ImGui::BeginDisabled(!cancelable || app.command_in_flight);
+                if (ImGui::SmallButton("Cancel")) {
+                    const auto snapshot = app.application.Snapshot();
+                    const std::string request_id = NextRequestId(app);
+                    SubmitUiCommand(app, tradebox::core::CancelOrderCommand{
+                        .context = {.request_id = request_id, .source = "gui",
+                                    .account_id = snapshot.account ? snapshot.account->id : "",
+                                    .environment = snapshot.environment,
+                                    .generation = snapshot.generation},
+                        .order_id = order.id}, request_id);
+                    app.command_status = "pending cancel";
+                }
+                ImGui::EndDisabled();
             }
         }
         ImGui::EndTable();
@@ -1861,6 +2496,7 @@ int RunApplication(const LaunchOptions& options) {
     ImGui_ImplOpenGL3_Init("#version 150");
 
     App app(database);
+    app.order_tickets.emplace_back();
     RefreshDisplaySync(app, window, false);
     const Uint64 launched_at = SDL_GetTicks();
     if (options.capture_and_exit) {
@@ -1870,22 +2506,29 @@ int RunApplication(const LaunchOptions& options) {
         app.frames_before_capture = 3;
     }
     app.watchlist = database.LoadWatchlist();
+    app.asset_catalog = {
+        {"AMD", "Advanced Micro Devices", "NASDAQ", true, true, true, true, 45'000'000, 7'000'000'000, SystemNowMs()},
+        {"MSFT", "Microsoft Corporation", "NASDAQ", true, true, true, true, 22'000'000, 9'000'000'000, SystemNowMs()},
+        {"AAPL", "Apple Inc.", "NASDAQ", true, true, true, true, 52'000'000, 11'000'000'000, SystemNowMs()},
+        {"QQQ", "Invesco QQQ Trust", "NASDAQ", true, true, true, true, 31'000'000, 15'000'000'000, SystemNowMs()},
+    };
+    if (const auto cached_assets = database.LoadAssetCatalog(); !cached_assets.empty())
+        app.asset_catalog = cached_assets;
     if (app.watchlist.empty()) {
-        app.watchlist = {"AAPL", "SPY", "QQQ"};
+        app.watchlist = {"AMD", "MSFT", "AAPL", "QQQ"};
     } else {
-        for (const char* symbol : {"SPY", "QQQ", "TSLA"}) {
-            if (app.watchlist.size() >= 3) break;
+        for (const char* symbol : {"AMD", "MSFT", "AAPL", "QQQ"}) {
+            if (app.watchlist.size() >= 4) break;
             if (std::find(app.watchlist.begin(), app.watchlist.end(), symbol) ==
                 app.watchlist.end())
                 app.watchlist.emplace_back(symbol);
         }
     }
-    if (app.watchlist.size() >= 3) {
+    if (app.watchlist.size() >= 4) {
         database.SaveWatchlist(app.watchlist);
     }
     for (const std::string& symbol : app.watchlist) {
         Chart chart{symbol};
-        chart.bars = database.LoadBars(symbol);
         app.charts.emplace(symbol, std::move(chart));
     }
     AddMessage(app, "Workspace loaded from " +
@@ -1950,6 +2593,14 @@ int RunApplication(const LaunchOptions& options) {
                 static_cast<Uint64>(options.run_for_ms))
             done = true;
         DrainEvents(app);
+        RefreshRequiredMarketSymbols(app);
+        RefreshVisibleMarketData(app);
+        const Uint64 storage_now = SDL_GetTicks();
+        if (app.market_storage_sampled_at == 0 ||
+            storage_now - app.market_storage_sampled_at >= 2000) {
+            app.market_storage = database.LoadMarketDataStorageUsage();
+            app.market_storage_sampled_at = storage_now;
+        }
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
@@ -1965,6 +2616,8 @@ int RunApplication(const LaunchOptions& options) {
         ImGui::SetNextWindowSize(ImVec2(400, 250), ImGuiCond_FirstUseEver);
         DrawLog(app);
         DrawCredentials(app);
+        DrawOrderEntry(app);
+        DrawMarketPanel(app);
         DrawCharts(app);
         ImGui::SetNextWindowPos(ImVec2(420, 10), ImGuiCond_FirstUseEver);
         DrawPositions(app);

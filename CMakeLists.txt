@@ -43,7 +43,11 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(sqlite_amalgamation)
 add_library(sqlite3 STATIC ${sqlite_amalgamation_SOURCE_DIR}/sqlite3.c)
 target_include_directories(sqlite3 PUBLIC ${sqlite_amalgamation_SOURCE_DIR})
-target_compile_definitions(sqlite3 PRIVATE SQLITE_THREADSAFE=1 SQLITE_OMIT_LOAD_EXTENSION)
+target_compile_definitions(sqlite3 PRIVATE
+  SQLITE_THREADSAFE=1
+  SQLITE_OMIT_LOAD_EXTENSION
+  SQLITE_ENABLE_DBSTAT_VTAB
+)
 
 add_library(imgui STATIC
   ${dear_imgui_SOURCE_DIR}/imgui.cpp
@@ -79,6 +83,7 @@ endfunction()
 
 add_library(tradebox_core STATIC
   src/core/decimal.cpp
+  src/core/asset_catalog.cpp
   src/core/market_data_store.cpp
   src/core/order_request.cpp
   src/core/system_clock.cpp
@@ -141,6 +146,7 @@ tradebox_enable_strict_warnings(tradebox_application)
 
 add_executable(tradebox_gui WIN32
   src/adapters/gui/main.cpp
+  src/adapters/gui/model.cpp
 )
 set_target_properties(tradebox_gui PROPERTIES OUTPUT_NAME TradeBoxNative)
 target_compile_features(tradebox_gui PRIVATE cxx_std_23)
@@ -202,6 +208,13 @@ if(BUILD_TESTING)
   )
   tradebox_enable_strict_warnings(tradebox_order_pipeline_tests)
   gtest_discover_tests(tradebox_order_pipeline_tests)
+
+  add_executable(tradebox_ui_tests tests/unit/ui_model_tests.cpp
+    src/adapters/gui/model.cpp)
+  target_compile_features(tradebox_ui_tests PRIVATE cxx_std_23)
+  target_link_libraries(tradebox_ui_tests PRIVATE tradebox_core GTest::gtest_main)
+  tradebox_enable_strict_warnings(tradebox_ui_tests)
+  gtest_discover_tests(tradebox_ui_tests)
 
   add_test(
     NAME Architecture.CoreHasNoAdapterDependencies

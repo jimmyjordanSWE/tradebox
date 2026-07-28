@@ -3,6 +3,7 @@
 #include "tradebox/core/decimal.h"
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <variant>
@@ -62,6 +63,7 @@ struct TradeCanceled {
     std::string symbol;
     std::string trade_id;
     std::string broker_timestamp;
+    std::int64_t event_time_ns = 0;
 };
 
 struct TradeCorrected {
@@ -97,6 +99,50 @@ struct MarketDataSnapshot {
     std::string status_message;
 };
 
+struct SequencedMarketDataEvent {
+    std::uint64_t sequence = 0;
+    MarketDataEvent event;
+};
+
+struct MarketDataDelta {
+    std::string symbol;
+    MarketDataFeed feed = MarketDataFeed::Unknown;
+    MarketStreamStatus stream_status =
+        MarketStreamStatus::Disconnected;
+    bool trades_subscribed = false;
+    bool quotes_subscribed = false;
+    std::optional<MarketQuote> latest_quote;
+    std::vector<SequencedMarketDataEvent> events;
+    std::uint64_t next_sequence = 0;
+    bool gap_detected = false;
+    std::int64_t last_received_at_ms = 0;
+    std::string status_message;
+};
+
+struct TickQuery {
+    std::string symbol;
+    std::int64_t start_ns = 0;
+    std::int64_t end_ns = std::numeric_limits<std::int64_t>::max();
+    MarketDataFeed feed = MarketDataFeed::Iex;
+    bool include_trades = true;
+    bool include_quotes = false;
+};
+
+struct TickCoverage {
+    std::int64_t start_ns = 0;
+    std::int64_t end_ns = 0;
+};
+
+struct TickSeries {
+    TickQuery query;
+    std::vector<MarketTrade> trades;
+    std::vector<MarketQuote> quotes;
+    std::vector<TickCoverage> missing_trade_ranges;
+    std::vector<TickCoverage> missing_quote_ranges;
+    bool complete = false;
+    std::string error;
+};
+
 class IMarketDataSink {
 public:
     virtual ~IMarketDataSink() = default;
@@ -108,6 +154,9 @@ public:
     virtual ~IMarketDataView() = default;
     virtual MarketDataSnapshot Snapshot(
         const std::string& symbol) const = 0;
+    virtual MarketDataDelta Delta(
+        const std::string& symbol, std::uint64_t after_sequence,
+        std::size_t maximum_events) const = 0;
 };
 
 }  // namespace tradebox::core

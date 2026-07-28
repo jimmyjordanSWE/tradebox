@@ -1,5 +1,9 @@
 #pragma once
 
+#include "tradebox/core/order_command.h"
+#include "tradebox/core/order_request.h"
+#include "tradebox/core/asset_catalog.h"
+
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -31,8 +35,41 @@ enum class UiEventType {
     Trade,
     DailyBar,
     AccountStreamConnected,
-    AccountStreamEvent
+    AccountStreamEvent,
+    OrderCommandCompleted,
+    AssetCatalogReady
 };
+
+struct OrderEntryDraft {
+    std::string name = "Untitled order";
+    std::string symbol = "AMD";
+    std::string side = "Buy";
+    std::string amount = "1";
+    bool amount_is_notional = false;
+    std::string type = "Market";
+    std::string limit_price;
+    std::string stop_price;
+    std::string time_in_force = "Day";
+    bool extended_hours = false;
+};
+
+struct UiValidationMessage {
+    std::string field;
+    std::string message;
+};
+
+enum class UiOrderState {
+    Pending, Accepted, Rejected, Canceled, Filled, Indeterminate, Stale,
+    Reconciling
+};
+
+[[nodiscard]] std::vector<UiValidationMessage> ValidateOrderEntry(
+    const OrderEntryDraft& draft);
+[[nodiscard]] std::string UiOrderStateLabel(UiOrderState state);
+[[nodiscard]] UiOrderState UiOrderStateFromCore(
+    const tradebox::core::OrderState& order,
+    const tradebox::core::CoreSnapshot& snapshot,
+    bool command_indeterminate = false);
 
 struct UiEvent {
     UiEventType type = UiEventType::Status;
@@ -43,6 +80,10 @@ struct UiEvent {
     MarketClockSnapshot market_clock;
     std::int64_t received_at_ms = 0;
     std::int64_t latency_ms = -1;
+    std::string request_id;
+    tradebox::core::OrderCommandResult command_result;
+    std::string timeframe = "1Day";
+    std::vector<tradebox::core::TradableAsset> assets;
 };
 
 class UiEventQueue {

@@ -7,6 +7,9 @@
 
 #include <chrono>
 #include <cstring>
+#include <map>
+#include <ranges>
+#include <system_error>
 #include <type_traits>
 
 namespace {
@@ -15,6 +18,57 @@ std::int64_t NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+std::string FeedName(tradebox::core::MarketDataFeed feed) {
+    switch (feed) {
+        case tradebox::core::MarketDataFeed::Sip:
+            return "sip";
+        case tradebox::core::MarketDataFeed::Iex:
+            return "iex";
+        default:
+            return "unknown";
+    }
+}
+
+constexpr std::int64_t kDayNs =
+    24LL * 60 * 60 * 1'000'000'000;
+
+std::string TickTradeKey(std::string_view trade_id,
+                         std::int64_t event_time_ns) {
+    return std::string(trade_id) + "@" +
+           std::to_string(event_time_ns / kDayNs);
+}
+
+std::vector<std::string> JsonStrings(
+    const nlohmann::json& value, const char* key) {
+    std::vector<std::string> result;
+    if (!value.contains(key) || !value[key].is_array()) return result;
+    for (const auto& item : value[key])
+        if (item.is_string()) result.push_back(item.get<std::string>());
+    return result;
+}
+
+std::string JsonIdentifier(
+    const nlohmann::json& value, const char* key) {
+    if (!value.contains(key) || value[key].is_null()) return {};
+    if (value[key].is_string()) return value[key].get<std::string>();
+    if (value[key].is_number_integer())
+        return std::to_string(value[key].get<std::int64_t>());
+    if (value[key].is_number_unsigned())
+        return std::to_string(value[key].get<std::uint64_t>());
+    return {};
+}
+
+tradebox::core::Decimal JsonDecimal(
+    const nlohmann::json& value, const char* key) {
+    if (!value.contains(key) || value[key].is_null())
+        return tradebox::core::Decimal::Zero();
+    const std::string text =
+        value[key].is_string() ? value[key].get<std::string>()
+                               : value[key].dump();
+    const auto parsed = tradebox::core::Decimal::Parse(text);
+    return parsed ? *parsed : tradebox::core::Decimal::Zero();
 }
 
 nlohmann::json CommandContextJson(
@@ -141,6 +195,7 @@ Database::~Database() {
     }
     queue_cv_.notify_all();
     if (writer_.joinable()) writer_.join();
+    if (market_db_) sqlite3_close(market_db_);
     if (db_) sqlite3_close(db_);
 }
 
@@ -159,7 +214,7 @@ bool Database::Open(std::string& error) {
         error = "Could not create data directory: " + ec.message();
         return false;
     }
-    return OpenAt(data_directory_ / L"tradebox.db", error);
+    return OpenAt(data_directory_ / L"tradebox_app.db", error);
 }
 
 bool Database::OpenAt(const std::filesystem::path& database_path,
@@ -306,6 +361,60 @@ SELECT
 FROM market_events;
 )SQL";
     if (!Execute(schema, &error)) return false;
+    const int market_rc = sqlite3_open_v2(
+        (data_directory_ / L"market_data.db").string().c_str(), &market_db_,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+        nullptr);
+    if (market_rc != SQLITE_OK) {
+        error = market_db_ ? sqlite3_errmsg(market_db_) : "Could not open market data database";
+        return false;
+    }
+    sqlite3_busy_timeout(market_db_, 3000);
+    const char* market_schema = R"SQL(
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=FULL;
+CREATE TABLE IF NOT EXISTS daily_bars (
+  symbol TEXT NOT NULL,
+  timestamp_ms INTEGER NOT NULL,
+  open REAL NOT NULL,
+  high REAL NOT NULL,
+  low REAL NOT NULL,
+  close REAL NOT NULL,
+  volume REAL NOT NULL,
+  feed TEXT NOT NULL DEFAULT 'iex',
+  timeframe TEXT NOT NULL DEFAULT '1Day',
+  PRIMARY KEY(symbol, timestamp_ms, feed, timeframe)
+);
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS market_tick_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  feed TEXT NOT NULL,
+  source_event_id TEXT,
+  kind TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  event_time_ns INTEGER NOT NULL,
+  received_at_ms INTEGER NOT NULL,
+  raw_payload TEXT NOT NULL,
+  UNIQUE(feed, source_event_id, kind)
+);
+CREATE INDEX IF NOT EXISTS market_tick_events_series
+  ON market_tick_events(symbol, event_time_ns, feed, kind);
+CREATE TABLE IF NOT EXISTS market_tick_coverage (
+  symbol TEXT NOT NULL,
+  feed TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  start_ns INTEGER NOT NULL,
+  end_ns INTEGER NOT NULL,
+  completed_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(symbol, feed, kind, start_ns, end_ns)
+);
+CREATE INDEX IF NOT EXISTS market_tick_coverage_lookup
+  ON market_tick_coverage(symbol, feed, kind, start_ns, end_ns);
+)SQL";
+    if (!ExecuteMarket(market_schema, &error)) return false;
     writer_ = std::thread(&Database::WriterLoop, this);
     return true;
 }
@@ -315,6 +424,17 @@ bool Database::Execute(const char* sql, std::string* error) {
     const int rc = sqlite3_exec(db_, sql, nullptr, nullptr, &sqlite_error);
     if (rc != SQLITE_OK) {
         if (error) *error = sqlite_error ? sqlite_error : "SQLite error";
+        sqlite3_free(sqlite_error);
+        return false;
+    }
+    return true;
+}
+
+bool Database::ExecuteMarket(const char* sql, std::string* error) {
+    char* sqlite_error = nullptr;
+    const int rc = sqlite3_exec(market_db_, sql, nullptr, nullptr, &sqlite_error);
+    if (rc != SQLITE_OK) {
+        if (error) *error = sqlite_error ? sqlite_error : "SQLite market data error";
         sqlite3_free(sqlite_error);
         return false;
     }
@@ -543,6 +663,50 @@ void Database::SaveWatchlist(const std::vector<std::string>& symbols) {
     Execute("COMMIT;");
 }
 
+std::vector<tradebox::core::TradableAsset> Database::LoadAssetCatalog() {
+    std::vector<tradebox::core::TradableAsset> result;
+    std::scoped_lock lock(db_mutex_);
+    sqlite3_stmt* statement = nullptr;
+    sqlite3_prepare_v2(market_db_, "SELECT value FROM app_settings WHERE key='asset_catalog'",
+                       -1, &statement, nullptr);
+    if (sqlite3_step(statement) == SQLITE_ROW) {
+        try {
+            const auto json = nlohmann::json::parse(reinterpret_cast<const char*>(sqlite3_column_text(statement, 0)));
+            for (const auto& item : json) {
+                result.push_back({
+                    item.value("symbol", ""), item.value("name", ""),
+                    item.value("exchange", ""), item.value("active", false),
+                    item.value("tradable", false), item.value("shortable", false),
+                    item.value("fractionable", false), item.value("previous_volume", 0LL),
+                    item.value("previous_dollar_volume", 0LL), item.value("received_at_ms", 0LL)});
+            }
+        } catch (...) { result.clear(); }
+    }
+    sqlite3_finalize(statement);
+    return result;
+}
+
+void Database::SaveAssetCatalog(
+    const std::vector<tradebox::core::TradableAsset>& assets) {
+    nlohmann::json json = nlohmann::json::array();
+    for (const auto& asset : assets) json.push_back({
+        {"symbol", asset.symbol}, {"name", asset.name}, {"exchange", asset.exchange},
+        {"active", asset.active}, {"tradable", asset.tradable},
+        {"shortable", asset.shortable}, {"fractionable", asset.fractionable},
+        {"previous_volume", asset.previous_volume},
+        {"previous_dollar_volume", asset.previous_dollar_volume},
+        {"received_at_ms", asset.received_at_ms}});
+    std::scoped_lock lock(db_mutex_);
+    sqlite3_stmt* statement = nullptr;
+    sqlite3_prepare_v2(market_db_, "INSERT INTO app_settings(key,value) VALUES('asset_catalog',?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                       -1, &statement, nullptr);
+    const std::string text = json.dump();
+    sqlite3_bind_text(statement, 1, text.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(statement);
+    sqlite3_finalize(statement);
+}
+
 std::optional<bool> Database::LoadLastConnectedPaper() {
     std::scoped_lock lock(db_mutex_);
     sqlite3_stmt* statement = nullptr;
@@ -667,7 +831,7 @@ std::vector<Bar> Database::LoadBars(const std::string& symbol) {
     std::scoped_lock lock(db_mutex_);
     sqlite3_stmt* statement = nullptr;
     sqlite3_prepare_v2(
-        db_,
+        market_db_,
         "SELECT timestamp_ms,open,high,low,close,volume FROM daily_bars "
         "WHERE symbol=? AND feed='iex' ORDER BY timestamp_ms",
         -1, &statement, nullptr);
@@ -689,12 +853,12 @@ std::vector<Bar> Database::LoadBars(const std::string& symbol) {
 void Database::StoreBars(const std::string& symbol, const std::vector<Bar>& bars) {
     if (bars.empty()) return;
     std::scoped_lock lock(db_mutex_);
-    Execute("BEGIN IMMEDIATE;");
+    ExecuteMarket("BEGIN IMMEDIATE;");
     sqlite3_stmt* statement = nullptr;
     sqlite3_prepare_v2(
-        db_,
-        "INSERT INTO daily_bars(symbol,timestamp_ms,open,high,low,close,volume,feed)"
-        " VALUES(?,?,?,?,?,?,?,'iex') ON CONFLICT(symbol,timestamp_ms,feed) DO "
+        market_db_,
+        "INSERT INTO daily_bars(symbol,timestamp_ms,open,high,low,close,volume,feed,timeframe)"
+        " VALUES(?,?,?,?,?,?,?,'iex','1Day') ON CONFLICT(symbol,timestamp_ms,feed,timeframe) DO "
         "UPDATE SET open=excluded.open,high=excluded.high,low=excluded.low,"
         "close=excluded.close,volume=excluded.volume",
         -1, &statement, nullptr);
@@ -710,7 +874,7 @@ void Database::StoreBars(const std::string& symbol, const std::vector<Bar>& bars
         sqlite3_reset(statement);
     }
     sqlite3_finalize(statement);
-    Execute("COMMIT;");
+    ExecuteMarket("COMMIT;");
 }
 
 void Database::QueueTimelineEvent(std::string source,
@@ -721,10 +885,316 @@ void Database::QueueTimelineEvent(std::string source,
     {
         std::scoped_lock lock(queue_mutex_);
         pending_.push_back(
-            {std::move(source), std::move(source_event_id), std::move(kind),
-             std::move(symbol), event_time_ms, NowMs(), std::move(payload)});
+            {false, std::move(source), std::move(source_event_id),
+             std::move(kind), std::move(symbol), event_time_ms, NowMs(),
+             std::move(payload)});
     }
     queue_cv_.notify_one();
+}
+
+void Database::QueueMarketTickEvent(
+    std::string feed, std::string source_event_id, std::string kind,
+    std::string symbol, std::int64_t event_time_ns,
+    std::int64_t received_at_ms, std::string payload) {
+    {
+        std::scoped_lock lock(queue_mutex_);
+        pending_.push_back(
+            {true, std::move(feed), std::move(source_event_id),
+             std::move(kind), std::move(symbol), event_time_ns,
+             received_at_ms, std::move(payload)});
+    }
+    queue_cv_.notify_one();
+}
+
+void Database::StoreMarketTickEvents(
+    const std::vector<StoredMarketTick>& events) {
+    if (events.empty()) return;
+    std::scoped_lock lock(db_mutex_);
+    ExecuteMarket("BEGIN IMMEDIATE;");
+    sqlite3_stmt* statement = nullptr;
+    sqlite3_prepare_v2(
+        market_db_,
+        "INSERT OR IGNORE INTO market_tick_events("
+        "feed,source_event_id,kind,symbol,event_time_ns,received_at_ms,"
+        "raw_payload) VALUES(?,?,?,?,?,?,?)",
+        -1, &statement, nullptr);
+    for (const StoredMarketTick& event : events) {
+        sqlite3_bind_text(statement, 1, event.feed.c_str(), -1,
+                          SQLITE_TRANSIENT);
+        if (event.source_event_id.empty())
+            sqlite3_bind_null(statement, 2);
+        else
+            sqlite3_bind_text(statement, 2,
+                              event.source_event_id.c_str(), -1,
+                              SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 3, event.kind.c_str(), -1,
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 4, event.symbol.c_str(), -1,
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_int64(statement, 5, event.event_time_ns);
+        sqlite3_bind_int64(statement, 6, event.received_at_ms);
+        sqlite3_bind_text(statement, 7, event.raw_payload.c_str(), -1,
+                          SQLITE_TRANSIENT);
+        sqlite3_step(statement);
+        sqlite3_reset(statement);
+        sqlite3_clear_bindings(statement);
+    }
+    sqlite3_finalize(statement);
+    ExecuteMarket("COMMIT;");
+}
+
+tradebox::core::TickSeries Database::LoadMarketTicks(
+    const tradebox::core::TickQuery& query) {
+    tradebox::core::TickSeries result{.query = query};
+    std::map<std::string, tradebox::core::MarketTrade> trades;
+    std::scoped_lock lock(db_mutex_);
+    sqlite3_stmt* statement = nullptr;
+    sqlite3_prepare_v2(
+        market_db_,
+        "SELECT kind,event_time_ns,received_at_ms,raw_payload,id "
+        "FROM market_tick_events WHERE symbol=? AND feed=? "
+        "AND ((event_time_ns>=? AND event_time_ns<=?) "
+        "OR kind IN ('x','c')) "
+        "ORDER BY event_time_ns,id",
+        -1, &statement, nullptr);
+    const std::string feed = FeedName(query.feed);
+    sqlite3_bind_text(statement, 1, query.symbol.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 2, feed.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_int64(statement, 3, query.start_ns);
+    sqlite3_bind_int64(statement, 4, query.end_ns);
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        const std::string kind = reinterpret_cast<const char*>(
+            sqlite3_column_text(statement, 0));
+        const std::int64_t event_time_ns =
+            sqlite3_column_int64(statement, 1);
+        const std::int64_t received_at_ms =
+            sqlite3_column_int64(statement, 2);
+        const auto* payload_text = sqlite3_column_text(statement, 3);
+        if (!payload_text) continue;
+        try {
+            const nlohmann::json payload = nlohmann::json::parse(
+                reinterpret_cast<const char*>(payload_text));
+            if (kind == "q" && query.include_quotes) {
+                result.quotes.push_back({
+                    .symbol = query.symbol,
+                    .bid_price = JsonDecimal(payload, "bp"),
+                    .bid_size = JsonDecimal(payload, "bs"),
+                    .bid_exchange = payload.value("bx", ""),
+                    .ask_price = JsonDecimal(payload, "ap"),
+                    .ask_size = JsonDecimal(payload, "as"),
+                    .ask_exchange = payload.value("ax", ""),
+                    .conditions = JsonStrings(payload, "c"),
+                    .tape = payload.value("z", ""),
+                    .broker_timestamp = payload.value("t", ""),
+                    .event_time_ns = event_time_ns,
+                    .received_at_ms = received_at_ms,
+                });
+            } else if (kind == "t" && query.include_trades) {
+                tradebox::core::MarketTrade trade{
+                    .symbol = query.symbol,
+                    .trade_id = JsonIdentifier(payload, "i"),
+                    .price = JsonDecimal(payload, "p"),
+                    .size = JsonDecimal(payload, "s"),
+                    .exchange = payload.value("x", ""),
+                    .conditions = JsonStrings(payload, "c"),
+                    .tape = payload.value("z", ""),
+                    .broker_timestamp = payload.value("t", ""),
+                    .event_time_ns = event_time_ns,
+                    .received_at_ms = received_at_ms,
+                };
+                std::string key = trade.trade_id;
+                if (key.empty())
+                    key = "row:" + std::to_string(
+                                       sqlite3_column_int64(statement, 4));
+                else
+                    key = TickTradeKey(key, event_time_ns);
+                trades.insert_or_assign(std::move(key), std::move(trade));
+            } else if (kind == "x" && query.include_trades) {
+                const std::string canceled_id =
+                    JsonIdentifier(payload, "i");
+                const std::size_t erased = std::erase_if(
+                    trades, [&](const auto& entry) {
+                        return entry.second.trade_id == canceled_id &&
+                               entry.second.event_time_ns / kDayNs ==
+                                   event_time_ns / kDayNs;
+                    });
+                if (erased == 0) {
+                    const auto fallback = std::ranges::find_if(
+                        trades, [&](const auto& entry) {
+                            return entry.second.trade_id ==
+                                   canceled_id;
+                        });
+                    if (fallback != trades.end())
+                        trades.erase(fallback);
+                }
+            } else if (kind == "c" && query.include_trades) {
+                const std::string original_id =
+                    JsonIdentifier(payload, "oi");
+                auto original = std::ranges::find_if(
+                    trades, [&](const auto& entry) {
+                        return entry.second.trade_id == original_id &&
+                               entry.second.event_time_ns / kDayNs ==
+                                   event_time_ns / kDayNs;
+                    });
+                if (original == trades.end())
+                    original = std::ranges::find_if(
+                        trades, [&](const auto& entry) {
+                            return entry.second.trade_id ==
+                                   original_id;
+                        });
+                if (original == trades.end()) continue;
+                const std::int64_t original_event_time_ns =
+                    original->second.event_time_ns;
+                trades.erase(original);
+                tradebox::core::MarketTrade corrected{
+                    .symbol = query.symbol,
+                    .trade_id = JsonIdentifier(payload, "ci"),
+                    .price = JsonDecimal(payload, "cp"),
+                    .size = JsonDecimal(payload, "cs"),
+                    .exchange = payload.value("x", ""),
+                    .conditions = JsonStrings(payload, "cc"),
+                    .tape = payload.value("z", ""),
+                    .broker_timestamp = payload.value("t", ""),
+                    .event_time_ns = original_event_time_ns,
+                    .received_at_ms = received_at_ms,
+                    .corrected = true,
+                };
+                trades.insert_or_assign(
+                    TickTradeKey(corrected.trade_id,
+                                 original_event_time_ns),
+                    std::move(corrected));
+            }
+        } catch (const std::exception&) {
+        }
+    }
+    sqlite3_finalize(statement);
+    result.trades.reserve(trades.size());
+    for (auto& [id, trade] : trades) {
+        static_cast<void>(id);
+        result.trades.push_back(std::move(trade));
+    }
+    std::ranges::sort(result.trades, {}, &tradebox::core::MarketTrade::event_time_ns);
+    std::ranges::sort(result.quotes, {}, &tradebox::core::MarketQuote::event_time_ns);
+    return result;
+}
+
+std::vector<tradebox::core::TickCoverage>
+Database::MissingMarketTickCoverage(
+    const tradebox::core::TickQuery& query, std::string_view kind) {
+    std::vector<tradebox::core::TickCoverage> covered;
+    {
+        std::scoped_lock lock(db_mutex_);
+        sqlite3_stmt* statement = nullptr;
+        sqlite3_prepare_v2(
+            market_db_,
+            "SELECT start_ns,end_ns FROM market_tick_coverage "
+            "WHERE symbol=? AND feed=? AND kind=? AND end_ns>=? "
+            "AND start_ns<=? ORDER BY start_ns,end_ns",
+            -1, &statement, nullptr);
+        const std::string feed = FeedName(query.feed);
+        sqlite3_bind_text(statement, 1, query.symbol.c_str(), -1,
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, feed.c_str(), -1,
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 3, kind.data(),
+                          static_cast<int>(kind.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_int64(statement, 4, query.start_ns);
+        sqlite3_bind_int64(statement, 5, query.end_ns);
+        while (sqlite3_step(statement) == SQLITE_ROW)
+            covered.push_back({
+                sqlite3_column_int64(statement, 0),
+                sqlite3_column_int64(statement, 1),
+            });
+        sqlite3_finalize(statement);
+    }
+    std::vector<tradebox::core::TickCoverage> missing;
+    std::int64_t cursor = query.start_ns;
+    for (const auto& interval : covered) {
+        if (interval.end_ns < cursor) continue;
+        if (interval.start_ns > cursor)
+            missing.push_back({
+                cursor, std::min(query.end_ns, interval.start_ns)});
+        cursor = std::max(cursor, interval.end_ns);
+        if (cursor >= query.end_ns) break;
+    }
+    if (cursor < query.end_ns)
+        missing.push_back({cursor, query.end_ns});
+    return missing;
+}
+
+void Database::MarkMarketTickCoverage(
+    const tradebox::core::TickQuery& query, std::string_view kind,
+    tradebox::core::TickCoverage coverage) {
+    std::scoped_lock lock(db_mutex_);
+    sqlite3_stmt* statement = nullptr;
+    sqlite3_prepare_v2(
+        market_db_,
+        "INSERT OR IGNORE INTO market_tick_coverage("
+        "symbol,feed,kind,start_ns,end_ns,completed_at_ms)"
+        " VALUES(?,?,?,?,?,?)",
+        -1, &statement, nullptr);
+    const std::string feed = FeedName(query.feed);
+    sqlite3_bind_text(statement, 1, query.symbol.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 2, feed.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 3, kind.data(),
+                      static_cast<int>(kind.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_int64(statement, 4, coverage.start_ns);
+    sqlite3_bind_int64(statement, 5, coverage.end_ns);
+    sqlite3_bind_int64(statement, 6, NowMs());
+    sqlite3_step(statement);
+    sqlite3_finalize(statement);
+}
+
+MarketDataStorageUsage Database::LoadMarketDataStorageUsage() {
+    MarketDataStorageUsage usage;
+    std::scoped_lock lock(db_mutex_);
+    const auto scalar = [this](const char* sql) -> std::uint64_t {
+        sqlite3_stmt* statement = nullptr;
+        if (sqlite3_prepare_v2(market_db_, sql, -1, &statement, nullptr) !=
+            SQLITE_OK)
+            return 0;
+        std::uint64_t result = 0;
+        if (sqlite3_step(statement) == SQLITE_ROW)
+            result = static_cast<std::uint64_t>(
+                sqlite3_column_int64(statement, 0));
+        sqlite3_finalize(statement);
+        return result;
+    };
+    usage.candlestick_rows =
+        scalar("SELECT count(*) FROM daily_bars");
+    usage.tick_rows =
+        scalar("SELECT count(*) FROM market_tick_events");
+    usage.candlestick_bytes = scalar(
+        "SELECT coalesce(sum(pgsize),0) FROM dbstat "
+        "WHERE name IN ('daily_bars',"
+        "'sqlite_autoindex_daily_bars_1')");
+    usage.tick_bytes = scalar(
+        "SELECT coalesce(sum(pgsize),0) FROM dbstat "
+        "WHERE name IN ('market_tick_events',"
+        "'sqlite_autoindex_market_tick_events_1',"
+        "'market_tick_events_series',"
+        "'market_tick_coverage',"
+        "'sqlite_autoindex_market_tick_coverage_1',"
+        "'market_tick_coverage_lookup')");
+
+    std::error_code error;
+    for (const std::filesystem::path path : {
+             data_directory_ / L"market_data.db",
+             data_directory_ / L"market_data.db-wal",
+             data_directory_ / L"market_data.db-shm"}) {
+        if (std::filesystem::exists(path, error)) {
+            usage.database_bytes +=
+                std::filesystem::file_size(path, error);
+            if (error) error.clear();
+        } else {
+            error.clear();
+        }
+    }
+    return usage;
 }
 
 void Database::WriterLoop() {
@@ -757,33 +1227,64 @@ void Database::WriterLoop() {
 void Database::FlushEvents(std::vector<PendingEvent>& events) {
     if (events.empty()) return;
     std::scoped_lock lock(db_mutex_);
-    Execute("BEGIN IMMEDIATE;");
-    sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(
-        db_,
-        "INSERT OR IGNORE INTO timeline_events("
-        "source,source_event_id,kind,symbol,event_time_ms,available_at_ms,"
-        "recorded_at_ms,payload_json,schema_version) VALUES(?,?,?,?,?,?,?,?,1)",
-        -1, &statement, nullptr);
+    const auto flush_destination =
+        [&](bool market_tick) {
+            if (market_tick)
+                ExecuteMarket("BEGIN IMMEDIATE;");
+            else
+                Execute("BEGIN IMMEDIATE;");
+            sqlite3_stmt* statement = nullptr;
+            const char* sql =
+                market_tick
+                    ? "INSERT OR IGNORE INTO market_tick_events("
+                      "feed,source_event_id,kind,symbol,event_time_ns,"
+                      "received_at_ms,raw_payload) VALUES(?,?,?,?,?,?,?)"
+                    : "INSERT OR IGNORE INTO timeline_events("
+                      "source,source_event_id,kind,symbol,event_time_ms,"
+                      "available_at_ms,recorded_at_ms,payload_json,"
+                      "schema_version) VALUES(?,?,?,?,?,?,?,?,1)";
+            sqlite3* connection = market_tick ? market_db_ : db_;
+            sqlite3_prepare_v2(connection, sql, -1, &statement, nullptr);
+            for (const PendingEvent& event : events) {
+                if (event.market_tick != market_tick) continue;
+                sqlite3_bind_text(statement, 1, event.source.c_str(), -1,
+                                  SQLITE_TRANSIENT);
+                if (event.source_event_id.empty())
+                    sqlite3_bind_null(statement, 2);
+                else
+                    sqlite3_bind_text(statement, 2,
+                                      event.source_event_id.c_str(), -1,
+                                      SQLITE_TRANSIENT);
+                sqlite3_bind_text(statement, 3, event.kind.c_str(), -1,
+                                  SQLITE_TRANSIENT);
+                sqlite3_bind_text(statement, 4, event.symbol.c_str(), -1,
+                                  SQLITE_TRANSIENT);
+                sqlite3_bind_int64(statement, 5, event.event_time);
+                sqlite3_bind_int64(statement, 6, event.available_at_ms);
+                if (market_tick) {
+                    sqlite3_bind_text(statement, 7, event.payload.c_str(), -1,
+                                      SQLITE_TRANSIENT);
+                } else {
+                    sqlite3_bind_int64(statement, 7, NowMs());
+                    sqlite3_bind_text(statement, 8, event.payload.c_str(), -1,
+                                      SQLITE_TRANSIENT);
+                }
+                sqlite3_step(statement);
+                sqlite3_reset(statement);
+                sqlite3_clear_bindings(statement);
+            }
+            sqlite3_finalize(statement);
+            if (market_tick)
+                ExecuteMarket("COMMIT;");
+            else
+                Execute("COMMIT;");
+        };
+    bool has_timeline = false;
+    bool has_ticks = false;
     for (const PendingEvent& event : events) {
-        sqlite3_bind_text(statement, 1, event.source.c_str(), -1,
-                          SQLITE_TRANSIENT);
-        if (event.source_event_id.empty())
-            sqlite3_bind_null(statement, 2);
-        else
-            sqlite3_bind_text(statement, 2, event.source_event_id.c_str(), -1,
-                              SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 3, event.kind.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 4, event.symbol.c_str(), -1,
-                          SQLITE_TRANSIENT);
-        sqlite3_bind_int64(statement, 5, event.event_time_ms);
-        sqlite3_bind_int64(statement, 6, event.available_at_ms);
-        sqlite3_bind_int64(statement, 7, NowMs());
-        sqlite3_bind_text(statement, 8, event.payload.c_str(), -1,
-                          SQLITE_TRANSIENT);
-        sqlite3_step(statement);
-        sqlite3_reset(statement);
+        has_ticks = has_ticks || event.market_tick;
+        has_timeline = has_timeline || !event.market_tick;
     }
-    sqlite3_finalize(statement);
-    Execute("COMMIT;");
+    if (has_timeline) flush_destination(false);
+    if (has_ticks) flush_destination(true);
 }

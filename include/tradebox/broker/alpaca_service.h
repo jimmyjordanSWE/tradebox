@@ -8,6 +8,7 @@
 #include "tradebox/ui/model.h"
 
 #include <atomic>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -20,7 +21,8 @@ class AlpacaService : public tradebox::broker::IOrderGateway {
 public:
     AlpacaService(UiEventQueue& events, Database& database,
                   tradebox::core::ITradingCore& core,
-                  tradebox::core::IMarketDataSink& market_data);
+                  tradebox::core::IMarketDataSink& market_data,
+                  tradebox::core::IMarketDataView& market_data_view);
     ~AlpacaService();
 
     AlpacaService(const AlpacaService&) = delete;
@@ -31,7 +33,11 @@ public:
                  tradebox::core::MarketDataFeed feed =
                      tradebox::core::MarketDataFeed::Iex);
     void RefreshSymbols(const std::vector<std::string>& symbols);
-    void RequestHistory(const std::string& symbol);
+    void RequestHistory(const std::string& symbol,
+                        const std::string& timeframe = "1Day");
+    void RequestAssetCatalog();
+    std::future<tradebox::core::TickSeries> RequestTicks(
+        tradebox::core::TickQuery query);
     void Disconnect();
     bool Connected() const { return connected_; }
     bool AccountConnected() const { return account_connected_; }
@@ -50,7 +56,11 @@ private:
     void AccountRefreshLoop();
     void FetchMarketClock();
     void MarketClockLoop();
-    void FetchHistory(std::string symbol);
+    void FetchHistory(std::string symbol, std::string timeframe = "1Day");
+    void FetchAssetCatalog();
+    void SeedLatestSnapshots(std::vector<std::string> symbols);
+    tradebox::core::TickSeries FetchTicks(
+        const tradebox::core::TickQuery& query);
     void StreamLoop(std::vector<std::string> symbols);
     void AccountStreamLoop();
     void JoinWorkers();
@@ -61,6 +71,7 @@ private:
     Database& database_;
     tradebox::core::ITradingCore& core_;
     tradebox::core::IMarketDataSink& market_data_;
+    tradebox::core::IMarketDataView& market_data_view_;
     AlpacaCredentials credentials_;
     mutable std::mutex credentials_mutex_;
     mutable std::recursive_mutex lifecycle_mutex_;

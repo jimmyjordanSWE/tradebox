@@ -20,14 +20,14 @@ public:
           journal(database),
           order_journal(database),
           core(journal, clock),
-          broker(*owned_events, database, core, market_data),
+          broker(*owned_events, database, core, market_data, market_data),
           order_execution(core, broker, order_journal, clock) {}
 
     Impl(UiEventQueue& events, Database& database)
         : journal(database),
           order_journal(database),
           core(journal, clock),
-          broker(events, database, core, market_data),
+          broker(events, database, core, market_data, market_data),
           order_execution(core, broker, order_journal, clock) {}
 
     std::unique_ptr<UiEventQueue> owned_events;
@@ -56,6 +56,13 @@ core::CoreSnapshot TradingApplication::Snapshot() const {
 core::MarketDataSnapshot TradingApplication::MarketData(
     const std::string& symbol) const {
     return impl_->market_data.Snapshot(symbol);
+}
+
+core::MarketDataDelta TradingApplication::MarketDataChanges(
+    const std::string& symbol, std::uint64_t after_sequence,
+    std::size_t maximum_events) const {
+    return impl_->market_data.Delta(
+        symbol, after_sequence, maximum_events);
 }
 
 std::expected<core::CommandReceipt, core::CoreError>
@@ -98,8 +105,17 @@ void TradingApplication::RefreshMarketSymbols(
 }
 
 void TradingApplication::RequestMarketHistory(
-    const std::string& symbol) {
-    impl_->broker.RequestHistory(symbol);
+    const std::string& symbol, const std::string& timeframe) {
+    impl_->broker.RequestHistory(symbol, timeframe);
+}
+
+std::future<core::TickSeries> TradingApplication::RequestTicks(
+    core::TickQuery query) {
+    return impl_->broker.RequestTicks(std::move(query));
+}
+
+void TradingApplication::RefreshAssetCatalog() {
+    impl_->broker.RequestAssetCatalog();
 }
 
 }  // namespace tradebox::application

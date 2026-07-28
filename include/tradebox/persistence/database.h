@@ -1,14 +1,18 @@
 #pragma once
 
 #include "tradebox/core/order_command.h"
+#include "tradebox/core/asset_catalog.h"
+#include "tradebox/core/market_data.h"
 #include "tradebox/ui/model.h"
 
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -21,6 +25,24 @@ struct WindowPlacement {
     int height = 900;
     bool maximized = false;
     bool exists = false;
+};
+
+struct MarketDataStorageUsage {
+    std::uint64_t candlestick_bytes = 0;
+    std::uint64_t tick_bytes = 0;
+    std::uint64_t database_bytes = 0;
+    std::uint64_t candlestick_rows = 0;
+    std::uint64_t tick_rows = 0;
+};
+
+struct StoredMarketTick {
+    std::string feed;
+    std::string source_event_id;
+    std::string kind;
+    std::string symbol;
+    std::int64_t event_time_ns = 0;
+    std::int64_t received_at_ms = 0;
+    std::string raw_payload;
 };
 
 class Database {
@@ -36,6 +58,8 @@ public:
                 std::string& error);
     std::vector<std::string> LoadWatchlist();
     void SaveWatchlist(const std::vector<std::string>& symbols);
+    std::vector<tradebox::core::TradableAsset> LoadAssetCatalog();
+    void SaveAssetCatalog(const std::vector<tradebox::core::TradableAsset>& assets);
     WindowPlacement LoadWindowPlacement();
     void SaveWindowPlacement(const WindowPlacement& placement);
     std::optional<bool> LoadLastConnectedPaper();
@@ -50,6 +74,25 @@ public:
     void QueueTimelineEvent(std::string source, std::string source_event_id,
                             std::string kind, std::string symbol,
                             std::int64_t event_time_ms, std::string payload);
+    void QueueMarketTickEvent(std::string feed,
+                              std::string source_event_id,
+                              std::string kind, std::string symbol,
+                              std::int64_t event_time_ns,
+                              std::int64_t received_at_ms,
+                              std::string payload);
+    void StoreMarketTickEvents(
+        const std::vector<StoredMarketTick>& events);
+    tradebox::core::TickSeries LoadMarketTicks(
+        const tradebox::core::TickQuery& query);
+    std::vector<tradebox::core::TickCoverage>
+    MissingMarketTickCoverage(
+        const tradebox::core::TickQuery& query,
+        std::string_view kind);
+    void MarkMarketTickCoverage(
+        const tradebox::core::TickQuery& query,
+        std::string_view kind,
+        tradebox::core::TickCoverage coverage);
+    MarketDataStorageUsage LoadMarketDataStorageUsage();
     bool AppendCoreEvent(std::string source_event_id, std::string kind,
                          std::uint64_t generation,
                          std::int64_t received_at_ms, std::string payload,
@@ -67,11 +110,12 @@ public:
 
 private:
     struct PendingEvent {
+        bool market_tick = false;
         std::string source;
         std::string source_event_id;
         std::string kind;
         std::string symbol;
-        std::int64_t event_time_ms = 0;
+        std::int64_t event_time = 0;
         std::int64_t available_at_ms = 0;
         std::string payload;
     };
@@ -79,8 +123,10 @@ private:
     void WriterLoop();
     void FlushEvents(std::vector<PendingEvent>& events);
     bool Execute(const char* sql, std::string* error = nullptr);
+    bool ExecuteMarket(const char* sql, std::string* error = nullptr);
 
     sqlite3* db_ = nullptr;
+    sqlite3* market_db_ = nullptr;
     std::filesystem::path data_directory_;
     std::mutex db_mutex_;
     std::mutex queue_mutex_;
