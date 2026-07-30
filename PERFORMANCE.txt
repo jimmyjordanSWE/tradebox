@@ -18,6 +18,22 @@ Measurement rules
 7. Treat changes smaller than 3% as noise until repeated on another day.
 8. Run all correctness tests before accepting a compiler option or code change.
 
+Optimization-cycle build policy
+-------------------------------
+Use one optimized, symbol-capable build for all code-change comparisons:
+baseline Release optimization plus /Zi /Zo and /DEBUG:FULL. Debug symbols do
+not add application tracing or disable optimization; they let WPR resolve the
+optimized code. Run ordinary throughput suites without an active WPR session,
+and make targeted WPR captures from the same executable when call stacks are
+needed. Continuously recording WPR would add profiler overhead and would make
+the throughput number less representative, even if comparisons remained
+nominally apples-to-apples.
+
+At the eventual release pass, repeat the complete matrix with the shipping
+symbol/debug-link policy and re-evaluate all compiler flags. Do not compare
+numbers from that final build directly with the optimization-cycle baseline;
+establish a separate release baseline.
+
 Reference machine
 -----------------
 Date: 2026-07-30
@@ -28,7 +44,7 @@ Power plan: Balanced (381b4222-f694-41f0-9685-ff5bb260df2e)
 Hypervisor present: yes
 Compiler: MSVC 19.44.35222, x64
 Generator: Ninja
-Source: commit 240703f plus GUI-only monitor-refresh working-tree change
+Source: commit 7c6c146
 
 Workloads
 ---------
@@ -77,12 +93,165 @@ SIP runs: 5 measured after 1 warm-up
 Change versus baseline median: ingestion +21.9%, durable +19.3%
 Decision: accept; the complete Release suite passed 157/157 tests.
 
+2026-07-30 market hot-path rebuild - accepted stages
+Build: optimized symbol-capable build (/O2 /Ob2 /DNDEBUG /Zi /Zo,
+/DEBUG:FULL), portable x64 ISA, no IPO. All measurements below use the
+500,000-event SIP workload and five measured runs unless identified as a
+single phase profile.
+
+DOM-free SAX event construction:
+  ingestion median: 226684 events/s
+  durable median:   193003 events/s
+Decision: accept. Canonical events are constructed while parsing instead of
+building and then walking a general JSON DOM. The fixed timestamp parser and
+exact Decimal representation remain unchanged.
+
+Frame-level persistence/projection batching:
+  ingestion median: 272892 events/s
+  durable median:   219489 events/s
+Decision: accept. One decoded WebSocket frame is validated and enqueued
+atomically, projection takes one lock per frame, queue capacity remains
+bounded, and failure remains visible to the caller.
+
+SQLite writer refinements:
+  - SQLITE_STATIC bindings whose owners remain alive through sqlite3_step;
+  - one externally serialized SQLITE_OPEN_NOMUTEX connection per database;
+  - deterministic 128-row typed-tick INSERT statements within the existing
+    synchronous=FULL transaction and unique-dedup contract.
+128-row typed insert median:
+  ingestion: 261881 events/s
+  durable:   235020 events/s
+Decision: accept. The durable measure improved; the producer-side variation
+does not indicate a decoder regression.
+
+Validated direct JSON common path with SAX fallback:
+  ingestion min/median/max: 311981 / 320286 / 323191 events/s
+  durable   min/median/max: 249619 / 261383 / 264460 events/s
+Change versus the accepted fixed-timestamp reference:
+  ingestion +90.6%; durable +69.7%
+Single phase profile:
+  decode 734.42 ms; persistence enqueue 81.15 ms;
+  in-memory projection 738.56 ms; durable flush 303.58 ms.
+Decision: accept. Ordinary Alpaca ASCII frames use the strict direct reader.
+Escapes, Unicode, unusual input, and any fast-path parse failure are reparsed
+by the fully validating nlohmann SAX path. Malformed input still produces no
+partial success and all decoder tests pass.
+
+Final profiler-off verification after the complete rebuild and full build:
+IEX, 9 measured runs after 2 warm-ups:
+  ingestion min/median/mean/max/stddev:
+    356125 / 382296 / 380013 / 390929 / 9786 events/s
+  durable min/median/mean/max/stddev:
+    198574 / 206090 / 205180 / 210262 / 3552 events/s
+SIP, 5 measured runs after 1 warm-up:
+  ingestion min/median/max:
+    309900 / 313625 / 320711 events/s
+  durable min/median/max:
+    246786 / 253802 / 256409 events/s
+The complete optimized-symbol build, including the GUI, succeeded and all
+162/162 tests passed.
+
+2026-07-30 persistence experiments - rejected
+  256 rows per typed INSERT:
+    median ingestion 268722; durable 232701 events/s, with a severe durable
+    outlier. No stable gain over 128 rows.
+  WITHOUT ROWID time-series clustering:
+    median ingestion 268298; durable 198367 events/s. Durable regression.
+  PRAGMA wal_autocheckpoint=8192:
+    bounded 250000-event queue saturated during the first replay. Rejected.
+  100000-event writer transactions:
+    median ingestion 285350; durable 215751 events/s; queue peak reached
+    230800. Both stability and backpressure headroom regressed.
+  Heap-backed lean PendingEvent representation:
+    no repeatable gain; one run correctly surfaced bounded queue saturation.
+  Heterogeneous string-view lookup in MarketDataStore:
+    median ingestion 304262; durable 241288 events/s. Rejected as slower.
+All rejected source experiments were reverted. They remain recorded here so
+they are not accidentally repeated.
+
 Profiling status
 ----------------
-Windows Performance Recorder and Analyzer are installed. A WPR CPU-sampling
-start failed with 0xc5585011 because this process lacks the system-profile
-privilege. This is an elevation issue, not a WSL, Hyper-V, or VBS conflict.
-No Windows security or virtualization feature was disabled.
+Windows Performance Recorder and Analyzer are installed and working from an
+elevated VS Code session. No Windows security or virtualization feature was
+disabled.
+
+2026-07-30 elevated sampled-CPU profile
+Build: isolated build-profile Release build with the accepted portable flags,
+plus /Zi /Zo and /DEBUG:FULL for optimized source symbols. No IPO.
+Capture: WPR CPU file-mode trace over four uninstrumented 500,000-event SIP
+replays; 26,627 sampled-profile stacks for the benchmark processes.
+Trace-time throughput:
+  ingestion runs: 137133 / 155896 / 152650 / 155494 events/s
+  durable runs:   127614 / 143584 / 135988 / 136634 events/s
+  ingestion median: 154072 events/s
+  durable median:   136311 events/s
+These are profiler-context observations, not a replacement performance
+baseline.
+
+Post-trace clean SIP verification, 5 measured after 1 warm-up:
+  ingestion min/median/mean/max/stddev: 149630 / 152283 / 152085 / 154448 / 2037 events/s
+  durable   min/median/mean/max/stddev: 136092 / 138811 / 138498 / 140194 / 1453 events/s
+This is 9.4%/9.9% below the accepted same-day SIP median despite no source or
+compiler change. Keep the accepted reference; the machine had just sustained
+trace processing and symbol work. Repeat on a cool/quiet run before attributing
+this change to code or updating the reference.
+
+Top inclusive sampled-CPU stacks (percentages overlap by construction):
+  Database::WriterLoop                         35.62%
+  DecodeMarketFrame                           33.56%
+  Database::FlushEvents                       31.08%
+  sqlite3VdbeExec                             26.09%
+  nlohmann JSON parse                         14.99%
+  MarketDataStore::Ingest                     13.38%
+  operator new / RtlAllocateHeap              12.08% / 11.23%
+  Alpaca decimal extraction                    6.24%
+  SQLite WAL checkpoint                        4.86%
+
+Interpretation:
+- Work is already divided almost evenly between the producer and database
+  writer, so optimizing only the decoder cannot double end-to-end durable
+  throughput.
+- Inside decoding, construction of a complete nlohmann JSON DOM accounts for
+  about 15% of all process CPU, or roughly 45% of DecodeMarketFrame's inclusive
+  samples. A direct frame parser/SAX decoder is the best next decoder
+  experiment.
+- Heap allocation is a cross-cutting cost. Avoiding the JSON DOM should also
+  reduce map/string/node allocations, so measure that before adding a custom
+  allocator.
+- SQLite statement execution is the other major branch. Do not weaken
+  durability to improve its number. First measure larger bounded transactions
+  and less text/JSON serialization while preserving the existing durability
+  contract.
+- MarketDataStore projection is material but smaller than either decoding or
+  persistence. Keep it serialized until the decoder and writer experiments
+  establish a new profile.
+
+2026-07-30 post-rebuild sampled-CPU profile
+Capture: xperf sampled CPU with enlarged in-memory ETW buffers and merged
+image metadata, from the same optimized-symbol executable. The first WPR
+attempt lost events to ETW disk pressure and was discarded. Trace-time
+throughput was 259431 ingestion / 209834 durable events/s; profiler-context
+numbers are not throughput baselines.
+
+Top inclusive sampled stacks (5393 benchmark-process samples; percentages
+overlap by construction):
+  Database::WriterLoop                         37.44%
+  sqlite3VdbeExec                             36.29%
+  Database::FlushEvents                       33.88%
+  MarketDataStore::IngestBatch                16.71%
+  DecodeMarketFrame / DirectJsonReader        16.32%
+  sqlite3BtreeInsert                          16.06%
+
+Interpretation:
+- Decoder share fell from 33.56% to 16.32% and is no longer the sole dominant
+  branch.
+- Durable SQLite insertion and its required unique-index work are now the
+  largest application branch. Experiments that weakened checkpoint cadence,
+  enlarged transactions, or changed table clustering all reduced stability or
+  throughput and were rejected.
+- Projection is now comparable to decoding. Parallel work should be evaluated
+  only with ordered commit and bounded failure-visible queues; do not shard
+  mutable state casually.
 
 The benchmark supports an optional final "profile" argument that reports time
 spent in JSON/frame decoding, persistence queueing, in-memory projection, and
@@ -145,10 +314,24 @@ SIP repeated run:
 Phase profile:
   build\tradebox_market_replay_benchmark.exe build\testdata\alpaca_sip_stream_20x25000.jsonl 500000 build\benchmark-results\sip-profile.json sip 20 profile
 
+Optimized symbol build for WPR:
+  cmake -S . -B build-profile -G Ninja -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE="/O2 /Ob2 /DNDEBUG /Zi /Zo" -DCMAKE_C_FLAGS_RELEASE="/O2 /Ob2 /DNDEBUG /Zi" -DCMAKE_EXE_LINKER_FLAGS_RELEASE="/DEBUG:FULL /INCREMENTAL:NO /OPT:REF /OPT:ICF"
+  cmake --build build-profile --target tradebox_market_replay_benchmark
+
+Sampled-CPU capture (run from an elevated terminal):
+  wpr -start CPU -filemode
+  build-profile\tradebox_market_replay_benchmark.exe build-profile\testdata\alpaca_sip_stream_20x25000.jsonl 500000 build-profile\benchmark-results\sip-wpr.json sip 20
+  wpr -stop build-profile\profiles\sip-cpu.etl
+
+Local-symbol stack report:
+  $env:_NT_SYMBOL_PATH = "<workspace>\build-profile"
+  xperf -i build-profile\profiles\sip-cpu.etl -symbols -o build-profile\profiles\sip-cpu-profile-stacks.txt -a stack -butterfly 5 -process tradebox_market_replay_benchmark.exe -event '.*Profile.*'
+
 Potential next experiments
 --------------------------
-- Use an elevated WPR CPU trace to obtain call-stack hotspots.
-- Measure allocation reduction in market-frame decoding.
+- Replace the general JSON DOM market decoder with a direct frame decoder,
+  preserving exact validation/error behavior and benchmarking it independently.
+- Measure the resulting allocation reduction in market-frame decoding.
 - Measure persistence batching and queue synchronization separately.
 - Test profile-guided optimization only after a representative training corpus
   and repeatable clean PGO build procedure exist.

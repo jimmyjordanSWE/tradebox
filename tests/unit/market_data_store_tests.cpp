@@ -99,6 +99,34 @@ TEST(MarketDataStore, KeepsNewestTradesFirstAndBoundsTape) {
     EXPECT_EQ(snapshot.trades[1].trade_id, "2");
 }
 
+TEST(MarketDataStore, BatchIngestPreservesEventOrder) {
+    MarketDataStore store;
+    std::vector<MarketDataEventPtr> events;
+    events.push_back(ShareMarketDataEvent(TradeReceived{
+        .trade = Trade(
+            "first", "201",
+            "2026-07-28T12:00:00.000000001Z", 1),
+    }));
+    events.push_back(ShareMarketDataEvent(TradeReceived{
+        .trade = Trade(
+            "second", "202",
+            "2026-07-28T12:00:00.000000002Z", 2),
+    }));
+
+    store.IngestBatch(std::move(events));
+
+    const auto delta = store.Delta("AAPL", 0, 10);
+    ASSERT_EQ(delta.events.size(), 2U);
+    const auto* first =
+        std::get_if<TradeReceived>(delta.events[0].event.get());
+    const auto* second =
+        std::get_if<TradeReceived>(delta.events[1].event.get());
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(first->trade.trade_id, "first");
+    EXPECT_EQ(second->trade.trade_id, "second");
+}
+
 TEST(MarketDataStore, AppliesTradeCorrectionAndCancellation) {
     MarketDataStore store;
     store.Ingest(TradeReceived{

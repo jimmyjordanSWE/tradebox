@@ -66,6 +66,11 @@ struct StoredMarketTick {
     std::string raw_payload;
 };
 
+struct QueuedMarketDataEvent {
+    std::string source_event_id;
+    tradebox::core::MarketDataEventPtr event;
+};
+
 struct StoredBarSeries {
     tradebox::core::BarSeriesKey key;
     std::string symbol;
@@ -122,6 +127,9 @@ public:
     bool QueueMarketDataEvent(
         std::string feed, std::string source_event_id,
         tradebox::core::MarketDataEventPtr event);
+    bool QueueMarketDataEvents(
+        std::string feed,
+        std::vector<QueuedMarketDataEvent> events);
     std::expected<void, std::string> FlushQueuedWrites();
     std::expected<void, std::string> StoreMarketTickEvents(
         const std::vector<StoredMarketTick>& events);

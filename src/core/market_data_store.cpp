@@ -110,6 +110,20 @@ void MarketDataStore::Ingest(MarketDataEventPtr event) {
         *event);
 }
 
+void MarketDataStore::IngestBatch(
+    std::vector<MarketDataEventPtr> events) {
+    if (events.empty()) return;
+    std::scoped_lock lock(mutex_);
+    for (MarketDataEventPtr& event : events) {
+        if (!event) continue;
+        std::visit(
+            [this, &event](const auto& typed) {
+                Apply(event, typed);
+            },
+            *event);
+    }
+}
+
 MarketDataSnapshot MarketDataStore::Snapshot(
     const std::string& symbol) const {
     std::scoped_lock lock(mutex_);

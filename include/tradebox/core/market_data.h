@@ -244,6 +244,11 @@ class IMarketDataSink {
 public:
     virtual ~IMarketDataSink() = default;
     virtual void Ingest(MarketDataEventPtr event) = 0;
+    virtual void IngestBatch(
+        std::vector<MarketDataEventPtr> events) {
+        for (MarketDataEventPtr& event : events)
+            Ingest(std::move(event));
+    }
     void Ingest(MarketDataEvent event) {
         Ingest(std::make_shared<const MarketDataEvent>(
             std::move(event)));

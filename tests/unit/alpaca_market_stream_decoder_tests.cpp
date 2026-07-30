@@ -173,4 +173,74 @@ TEST(AlpacaMarketStreamDecoder, RejectsNonArrayPackets) {
         std::runtime_error);
 }
 
+TEST(AlpacaMarketStreamDecoder,
+     PreservesEscapesUnicodeAndExponentDecimals) {
+    constexpr std::string_view frame = R"([
+      {"T":"t","S":"A\u0041PL","i":"escaped-\"id",
+       "x":"\u0056","p":5.00015e2,"s":1e2,
+       "c":["\u0040"],"z":"C",
+       "t":"2026-07-28T13:30:00.123456789Z"}
+    ])";
+
+    const auto decoded =
+        broker::alpaca::DecodeMarketFrame(
+            frame, 1234,
+            [](std::string_view symbol) {
+                return "asset:" + std::string(symbol);
+            });
+
+    ASSERT_EQ(decoded.items.size(), 1U);
+    const auto& trade = std::get<core::TradeReceived>(
+        *decoded.items[0].market_event);
+    EXPECT_EQ(trade.trade.symbol, "AAPL");
+    EXPECT_EQ(trade.trade.instrument_id, "asset:AAPL");
+    EXPECT_EQ(trade.trade.trade_id, "escaped-\"id");
+    EXPECT_EQ(trade.trade.exchange, "V");
+    EXPECT_EQ(trade.trade.price.ToString(), "500.015");
+    EXPECT_EQ(trade.trade.size.ToString(), "100");
+    EXPECT_EQ(trade.trade.conditions,
+              std::vector<std::string>{"@"});
+}
+
+TEST(AlpacaMarketStreamDecoder,
+     DuplicateFieldsUseLastValueLikeJsonObjects) {
+    constexpr std::string_view frame = R"([
+      {"T":"t","S":"WRONG","S":"QQQ","i":"old","i":"new",
+       "p":1,"p":2.5,"s":1,"c":["A"],"c":null,
+       "t":"2026-07-28T13:30:00Z"}
+    ])";
+
+    const auto decoded =
+        broker::alpaca::DecodeMarketFrame(
+            frame, 1234,
+            [](std::string_view symbol) {
+                return std::string(symbol);
+            });
+
+    ASSERT_EQ(decoded.items.size(), 1U);
+    const auto& trade = std::get<core::TradeReceived>(
+        *decoded.items[0].market_event);
+    EXPECT_EQ(trade.trade.symbol, "QQQ");
+    EXPECT_EQ(trade.trade.trade_id, "new");
+    EXPECT_EQ(trade.trade.price.ToString(), "2.5");
+    EXPECT_TRUE(trade.trade.conditions.empty());
+}
+
+TEST(AlpacaMarketStreamDecoder,
+     RejectsMalformedAndTruncatedJsonWithoutPartialSuccess) {
+    for (const std::string_view frame : {
+             std::string_view{R"([{"T":"t","S":"QQQ")"},
+             std::string_view{R"([{"T":"t","S":"\uD800"}])"},
+             std::string_view{R"([{"T":"t","S":"QQQ","p":01}])"},
+         }) {
+        EXPECT_THROW(
+            broker::alpaca::DecodeMarketFrame(
+                frame, 1234,
+                [](std::string_view symbol) {
+                    return std::string(symbol);
+                }),
+            std::runtime_error);
+    }
+}
+
 }  // namespace

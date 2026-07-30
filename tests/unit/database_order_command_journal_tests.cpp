@@ -918,6 +918,62 @@ TEST(DatabaseMarketData,
 }
 
 TEST(DatabaseMarketData,
+     TypedTickBatchIsValidatedAtomicallyAndPersistsInOrder) {
+    TemporaryDatabase temporary;
+    Database database;
+    std::string error;
+    ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+
+    const auto trade = [](std::string id,
+                          std::int64_t event_time_ns) {
+        return core::ShareMarketDataEvent(core::TradeReceived{
+            .trade = {
+                .instrument_id = "alpaca:asset-aapl",
+                .symbol = "AAPL",
+                .trade_id = std::move(id),
+                .price = *core::Decimal::Parse("201.25"),
+                .size = *core::Decimal::Parse("10"),
+                .broker_timestamp =
+                    "2026-07-28T14:30:00.000000001Z",
+                .event_time_ns = event_time_ns,
+                .received_at_ms = 200,
+            },
+        });
+    };
+
+    EXPECT_FALSE(database.QueueMarketDataEvents(
+        "sip",
+        {
+            {.source_event_id = "not-queued",
+             .event = trade("not-queued", 99)},
+            {.source_event_id = "invalid", .event = {}},
+        }));
+    EXPECT_EQ(database.WriterTelemetry().accepted_events, 0U);
+
+    ASSERT_TRUE(database.QueueMarketDataEvents(
+        "sip",
+        {
+            {.source_event_id = "trade:batch-1",
+             .event = trade("batch-1", 100)},
+            {.source_event_id = "trade:batch-2",
+             .event = trade("batch-2", 101)},
+        }));
+    ASSERT_TRUE(database.FlushQueuedWrites());
+
+    const auto loaded = database.LoadMarketTicks({
+        .instrument_id = "alpaca:asset-aapl",
+        .symbol = "AAPL",
+        .start_ns = 0,
+        .end_ns = 1'000,
+        .feed = core::MarketDataFeed::Sip,
+        .include_trades = true,
+    });
+    ASSERT_EQ(loaded.trades.size(), 2U);
+    EXPECT_EQ(loaded.trades[0].trade_id, "batch-1");
+    EXPECT_EQ(loaded.trades[1].trade_id, "batch-2");
+}
+
+TEST(DatabaseMarketData,
      RejectsAnOversizedLiveBarBatchWithoutBlocking) {
     TemporaryDatabase temporary;
     Database database;

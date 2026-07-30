@@ -21,6 +21,8 @@ public:
 
     using IMarketDataSink::Ingest;
     void Ingest(MarketDataEventPtr event) override;
+    void IngestBatch(
+        std::vector<MarketDataEventPtr> events) override;
     MarketDataSnapshot Snapshot(
         const std::string& symbol) const override;
     MarketDataDelta Delta(

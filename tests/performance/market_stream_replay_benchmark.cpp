@@ -153,6 +153,12 @@ int main(int argc, char** argv) {
                     std::chrono::steady_clock::now() -
                     decode_start;
             control_events += frame.controls.size();
+            std::vector<QueuedMarketDataEvent>
+                persistence_events;
+            std::vector<tradebox::core::MarketDataEventPtr>
+                projection_events;
+            persistence_events.reserve(frame.items.size());
+            projection_events.reserve(frame.items.size());
             for (auto& item : frame.items) {
                 ++decoded_events;
                 if (item.market_event &&
@@ -166,35 +172,40 @@ int main(int argc, char** argv) {
                         *item.market_event))
                     ++cancellation_events;
                 if (item.market_tick) {
-                    const auto enqueue_start =
-                        profile_phases
-                            ? std::chrono::steady_clock::now()
-                            : std::chrono::steady_clock::
-                                  time_point{};
-                    if (!database.QueueMarketDataEvent(
-                            feed_name,
+                    persistence_events.push_back({
+                        .source_event_id =
                             std::move(item.source_event_id),
-                            item.market_event))
-                        persistence_rejected = true;
-                    if (profile_phases)
-                        persistence_enqueue_elapsed +=
-                            std::chrono::steady_clock::now() -
-                            enqueue_start;
+                        .event = item.market_event,
+                    });
                 }
-                if (item.market_event) {
-                    const auto projection_start =
-                        profile_phases
-                            ? std::chrono::steady_clock::now()
-                            : std::chrono::steady_clock::
-                                  time_point{};
-                    market_data.Ingest(
+                if (item.market_event)
+                    projection_events.push_back(
                         std::move(item.market_event));
-                    if (profile_phases)
-                        projection_elapsed +=
-                            std::chrono::steady_clock::now() -
-                            projection_start;
-                }
             }
+            const auto enqueue_start =
+                profile_phases
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::
+                          time_point{};
+            if (!database.QueueMarketDataEvents(
+                    feed_name,
+                    std::move(persistence_events)))
+                persistence_rejected = true;
+            if (profile_phases)
+                persistence_enqueue_elapsed +=
+                    std::chrono::steady_clock::now() -
+                    enqueue_start;
+            const auto projection_start =
+                profile_phases
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::
+                          time_point{};
+            market_data.IngestBatch(
+                std::move(projection_events));
+            if (profile_phases)
+                projection_elapsed +=
+                    std::chrono::steady_clock::now() -
+                    projection_start;
             if (sip_soak && !stale_observed &&
                 decoded_events >= stale_at) {
                 market_data.Ingest(

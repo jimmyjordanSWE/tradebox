@@ -2,9 +2,13 @@
 
 #include <nlohmann/json.hpp>
 
-#include <algorithm>
+#include <charconv>
+#include <cstdint>
+#include <limits>
 #include <optional>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace tradebox::broker::alpaca {
@@ -124,43 +128,308 @@ std::int64_t ParseTimestampNs(std::string_view value) {
            fractional_ns;
 }
 
-std::string String(const json& object, const char* key) {
-    if (!object.contains(key) || object[key].is_null() ||
-        !object[key].is_string())
-        return {};
-    return object[key].get<std::string>();
+enum class Field {
+    Unknown,
+    Kind,
+    Message,
+    Symbol,
+    Identifier,
+    OriginalIdentifier,
+    CorrectedIdentifier,
+    Timestamp,
+    Exchange,
+    BidExchange,
+    AskExchange,
+    Tape,
+    BidPrice,
+    BidSize,
+    AskPrice,
+    AskSize,
+    Price,
+    Size,
+    CorrectedPrice,
+    CorrectedSize,
+    Open,
+    High,
+    Low,
+    CloseOrConditions,
+    Volume,
+    Vwap,
+    TradeCount,
+    Conditions,
+    CorrectedConditions,
+    StatusCode,
+    StatusMessage,
+    ReasonCode,
+    ReasonMessage,
+    TradeSymbols,
+    QuoteSymbols,
+    StatusSymbols,
+};
+
+Field FieldFor(std::string_view key) {
+    if (key == "T") return Field::Kind;
+    if (key == "msg") return Field::Message;
+    if (key == "S") return Field::Symbol;
+    if (key == "i") return Field::Identifier;
+    if (key == "oi") return Field::OriginalIdentifier;
+    if (key == "ci") return Field::CorrectedIdentifier;
+    if (key == "t") return Field::Timestamp;
+    if (key == "x") return Field::Exchange;
+    if (key == "bx") return Field::BidExchange;
+    if (key == "ax") return Field::AskExchange;
+    if (key == "z") return Field::Tape;
+    if (key == "bp") return Field::BidPrice;
+    if (key == "bs") return Field::BidSize;
+    if (key == "ap") return Field::AskPrice;
+    if (key == "as") return Field::AskSize;
+    if (key == "p") return Field::Price;
+    if (key == "s") return Field::Size;
+    if (key == "cp") return Field::CorrectedPrice;
+    if (key == "cs") return Field::CorrectedSize;
+    if (key == "o") return Field::Open;
+    if (key == "h") return Field::High;
+    if (key == "l") return Field::Low;
+    if (key == "c") return Field::CloseOrConditions;
+    if (key == "v") return Field::Volume;
+    if (key == "vw") return Field::Vwap;
+    if (key == "n") return Field::TradeCount;
+    if (key == "cc") return Field::CorrectedConditions;
+    if (key == "sc") return Field::StatusCode;
+    if (key == "sm") return Field::StatusMessage;
+    if (key == "rc") return Field::ReasonCode;
+    if (key == "rm") return Field::ReasonMessage;
+    if (key == "trades") return Field::TradeSymbols;
+    if (key == "quotes") return Field::QuoteSymbols;
+    if (key == "statuses") return Field::StatusSymbols;
+    return Field::Unknown;
 }
 
-std::string Identifier(const json& object, const char* key) {
-    if (!object.contains(key) || object[key].is_null()) return {};
-    if (object[key].is_string())
-        return object[key].get<std::string>();
-    if (object[key].is_number_integer())
-        return std::to_string(object[key].get<std::int64_t>());
-    if (object[key].is_number_unsigned())
-        return std::to_string(object[key].get<std::uint64_t>());
-    return {};
-}
+enum class ScalarType {
+    Missing,
+    Null,
+    String,
+    Signed,
+    Unsigned,
+    Float,
+    Boolean,
+};
 
-std::uint64_t Unsigned(const json& object, const char* key) {
-    const std::string value = Identifier(object, key);
-    if (value.empty()) return 0;
-    try {
-        return std::stoull(value);
-    } catch (...) {
-        return 0;
+struct Scalar {
+    ScalarType type = ScalarType::Missing;
+    std::string text;
+};
+
+struct ItemFields {
+    Scalar kind;
+    Scalar message;
+    Scalar symbol;
+    Scalar identifier;
+    Scalar original_identifier;
+    Scalar corrected_identifier;
+    Scalar timestamp;
+    Scalar exchange;
+    Scalar bid_exchange;
+    Scalar ask_exchange;
+    Scalar tape;
+    Scalar bid_price;
+    Scalar bid_size;
+    Scalar ask_price;
+    Scalar ask_size;
+    Scalar price;
+    Scalar size;
+    Scalar corrected_price;
+    Scalar corrected_size;
+    Scalar open;
+    Scalar high;
+    Scalar low;
+    Scalar close;
+    Scalar volume;
+    Scalar vwap;
+    Scalar trade_count;
+    Scalar status_code;
+    Scalar status_message;
+    Scalar reason_code;
+    Scalar reason_message;
+    std::vector<std::string> conditions;
+    std::vector<std::string> corrected_conditions;
+    std::vector<std::string> trade_symbols;
+    std::vector<std::string> quote_symbols;
+    std::vector<std::string> status_symbols;
+};
+
+Scalar* ScalarFor(ItemFields& item, Field field) {
+    switch (field) {
+        case Field::Kind: return &item.kind;
+        case Field::Message: return &item.message;
+        case Field::Symbol: return &item.symbol;
+        case Field::Identifier: return &item.identifier;
+        case Field::OriginalIdentifier:
+            return &item.original_identifier;
+        case Field::CorrectedIdentifier:
+            return &item.corrected_identifier;
+        case Field::Timestamp: return &item.timestamp;
+        case Field::Exchange: return &item.exchange;
+        case Field::BidExchange: return &item.bid_exchange;
+        case Field::AskExchange: return &item.ask_exchange;
+        case Field::Tape: return &item.tape;
+        case Field::BidPrice: return &item.bid_price;
+        case Field::BidSize: return &item.bid_size;
+        case Field::AskPrice: return &item.ask_price;
+        case Field::AskSize: return &item.ask_size;
+        case Field::Price: return &item.price;
+        case Field::Size: return &item.size;
+        case Field::CorrectedPrice: return &item.corrected_price;
+        case Field::CorrectedSize: return &item.corrected_size;
+        case Field::Open: return &item.open;
+        case Field::High: return &item.high;
+        case Field::Low: return &item.low;
+        case Field::CloseOrConditions: return &item.close;
+        case Field::Volume: return &item.volume;
+        case Field::Vwap: return &item.vwap;
+        case Field::TradeCount: return &item.trade_count;
+        case Field::StatusCode: return &item.status_code;
+        case Field::StatusMessage: return &item.status_message;
+        case Field::ReasonCode: return &item.reason_code;
+        case Field::ReasonMessage: return &item.reason_message;
+        default: return nullptr;
     }
 }
 
-std::vector<std::string> StringArray(
-    const json& object, const char* key) {
-    std::vector<std::string> result;
-    if (!object.contains(key) || !object[key].is_array())
-        return result;
-    for (const auto& value : object[key])
-        if (value.is_string())
-            result.push_back(value.get<std::string>());
+std::vector<std::string>* ArrayFor(ItemFields& item,
+                                   Field field) {
+    switch (field) {
+        case Field::CloseOrConditions:
+        case Field::Conditions:
+            return &item.conditions;
+        case Field::CorrectedConditions:
+            return &item.corrected_conditions;
+        case Field::TradeSymbols:
+            return &item.trade_symbols;
+        case Field::QuoteSymbols:
+            return &item.quote_symbols;
+        case Field::StatusSymbols:
+            return &item.status_symbols;
+        default:
+            return nullptr;
+    }
+}
+
+std::string StringValue(const Scalar& value) {
+    return value.type == ScalarType::String
+               ? value.text
+               : std::string{};
+}
+
+std::string IdentifierValue(const Scalar& value) {
+    if (value.type == ScalarType::String ||
+        value.type == ScalarType::Signed ||
+        value.type == ScalarType::Unsigned)
+        return value.text;
+    return {};
+}
+
+std::string ExpandExponent(std::string_view text) {
+    const std::size_t exponent_at = text.find_first_of("eE");
+    if (exponent_at == std::string_view::npos)
+        return std::string(text);
+
+    int exponent = 0;
+    const std::string_view exponent_text =
+        text.substr(exponent_at + 1);
+    const auto converted = std::from_chars(
+        exponent_text.data(),
+        exponent_text.data() + exponent_text.size(),
+        exponent);
+    if (converted.ec != std::errc{} ||
+        converted.ptr != exponent_text.data() +
+                             exponent_text.size())
+        return std::string(text);
+
+    bool negative = false;
+    std::size_t cursor = 0;
+    if (text[cursor] == '-' || text[cursor] == '+') {
+        negative = text[cursor] == '-';
+        ++cursor;
+    }
+    const std::string_view mantissa =
+        text.substr(cursor, exponent_at - cursor);
+    const std::size_t point = mantissa.find('.');
+    const std::size_t digits_before_point =
+        point == std::string_view::npos ? mantissa.size()
+                                        : point;
+    std::string digits;
+    digits.reserve(mantissa.size());
+    for (const char character : mantissa)
+        if (character != '.') digits.push_back(character);
+
+    const std::int64_t decimal_position =
+        static_cast<std::int64_t>(digits_before_point) +
+        exponent;
+    std::string result;
+    result.reserve(digits.size() +
+                   static_cast<std::size_t>(
+                       std::max<std::int64_t>(
+                           0, -decimal_position)) +
+                   4);
+    if (negative) result.push_back('-');
+    if (decimal_position <= 0) {
+        result += "0.";
+        result.append(
+            static_cast<std::size_t>(-decimal_position), '0');
+        result += digits;
+    } else if (static_cast<std::size_t>(decimal_position) >=
+               digits.size()) {
+        result += digits;
+        result.append(
+            static_cast<std::size_t>(decimal_position) -
+                digits.size(),
+            '0');
+    } else {
+        result.append(
+            digits.data(),
+            static_cast<std::size_t>(decimal_position));
+        result.push_back('.');
+        result.append(
+            digits.data() + decimal_position,
+            digits.size() -
+                static_cast<std::size_t>(decimal_position));
+    }
     return result;
+}
+
+tradebox::core::Decimal DecimalValue(
+    const Scalar& value, std::string_view key) {
+    if (value.type == ScalarType::Missing ||
+        value.type == ScalarType::Null)
+        return tradebox::core::Decimal::Zero();
+    if (value.type != ScalarType::String &&
+        value.type != ScalarType::Signed &&
+        value.type != ScalarType::Unsigned &&
+        value.type != ScalarType::Float)
+        throw std::runtime_error(
+            "Expected decimal field: " + std::string(key));
+    const std::string normalized =
+        value.type == ScalarType::Float
+            ? ExpandExponent(value.text)
+            : value.text;
+    auto parsed = tradebox::core::Decimal::Parse(normalized);
+    if (!parsed)
+        throw std::runtime_error(
+            "Invalid decimal field: " + std::string(key));
+    return std::move(*parsed);
+}
+
+std::uint64_t UnsignedValue(const Scalar& value) {
+    const std::string text = IdentifierValue(value);
+    if (text.empty()) return 0;
+    std::uint64_t result = 0;
+    const auto parsed = std::from_chars(
+        text.data(), text.data() + text.size(), result);
+    return parsed.ec == std::errc{} &&
+                   parsed.ptr == text.data() + text.size()
+               ? result
+               : 0;
 }
 
 tradebox::core::SecurityTradingState TradingState(
@@ -174,72 +443,191 @@ tradebox::core::SecurityTradingState TradingState(
     return tradebox::core::SecurityTradingState::Unknown;
 }
 
-tradebox::core::Decimal Decimal(
-    const json& object, const char* key) {
-    if (!object.contains(key) || object[key].is_null())
-        return tradebox::core::Decimal::Zero();
-    std::string text;
-    if (object[key].is_string())
-        text = object[key].get<std::string>();
-    else if (object[key].is_number())
-        text = object[key].dump();
-    else
-        throw std::runtime_error(
-            std::string("Expected decimal field: ") + key);
-    auto parsed = tradebox::core::Decimal::Parse(text);
-    if (!parsed)
-        throw std::runtime_error(
-            std::string("Invalid decimal field: ") + key);
-    return std::move(*parsed);
-}
+class MarketFrameSax {
+public:
+    MarketFrameSax(
+        std::int64_t received_at_ms,
+        const InstrumentResolver& resolve_instrument)
+        : received_at_ms_(received_at_ms),
+          resolve_instrument_(resolve_instrument) {
+        result_.controls.reserve(2);
+    }
 
-}  // namespace
+    bool null() {
+        return SetScalar(ScalarType::Null, {});
+    }
 
-DecodedMarketFrame DecodeMarketFrame(
-    std::string_view raw_frame, std::int64_t received_at_ms,
-    const InstrumentResolver& resolve_instrument) {
-    const json packet =
-        json::parse(raw_frame.begin(), raw_frame.end());
-    if (!packet.is_array())
-        throw std::runtime_error(
-            "market stream packet is not an array");
+    bool boolean(bool value) {
+        return SetScalar(
+            ScalarType::Boolean, value ? "true" : "false");
+    }
 
-    DecodedMarketFrame result;
-    result.controls.reserve(2);
-    result.items.reserve(packet.size());
-    for (const auto& item : packet) {
-        const std::string kind = String(item, "T");
+    bool number_integer(json::number_integer_t value) {
+        return SetScalar(
+            ScalarType::Signed, std::to_string(value));
+    }
+
+    bool number_unsigned(json::number_unsigned_t value) {
+        return SetScalar(
+            ScalarType::Unsigned, std::to_string(value));
+    }
+
+    bool number_float(
+        json::number_float_t,
+        const json::string_t& token) {
+        return SetScalar(ScalarType::Float, token);
+    }
+
+    bool string(json::string_t& value) {
+        if (item_active_ && depth_ == 3 &&
+            active_array_) {
+            active_array_->push_back(std::move(value));
+            return true;
+        }
+        return SetScalar(
+            ScalarType::String, std::move(value));
+    }
+
+    bool binary(json::binary_t&) {
+        return SetScalar(ScalarType::Missing, {});
+    }
+
+    bool start_object(std::size_t) {
+        if (depth_ == 0) {
+            root_is_array_ = false;
+            return false;
+        }
+        if (root_is_array_ && depth_ == 1) {
+            item_ = {};
+            item_active_ = true;
+            current_field_ = Field::Unknown;
+        }
+        ++depth_;
+        return true;
+    }
+
+    bool key(json::string_t& value) {
+        if (item_active_ && depth_ == 2)
+            current_field_ = FieldFor(value);
+        return true;
+    }
+
+    bool end_object() {
+        if (item_active_ && depth_ == 2) {
+            FinalizeItem();
+            item_active_ = false;
+            current_field_ = Field::Unknown;
+        }
+        if (depth_ == 0) return false;
+        --depth_;
+        return true;
+    }
+
+    bool start_array(std::size_t elements) {
+        if (depth_ == 0) {
+            root_is_array_ = true;
+            root_closed_ = false;
+            result_.items.reserve(
+                elements == json::size_type(-1) ? 0 : elements);
+            ++depth_;
+            return true;
+        }
+        if (item_active_ && depth_ == 2)
+            active_array_ = ArrayFor(item_, current_field_);
+        else if (root_is_array_ && depth_ == 1)
+            ++result_.ignored_items;
+        if (active_array_ && depth_ == 2) {
+            active_array_->clear();
+            if (Scalar* scalar =
+                    ScalarFor(item_, current_field_))
+                *scalar = {};
+        }
+        ++depth_;
+        return true;
+    }
+
+    bool end_array() {
+        if (depth_ == 0) return false;
+        if (item_active_ && depth_ == 3)
+            active_array_ = nullptr;
+        --depth_;
+        if (depth_ == 0) root_closed_ = true;
+        return true;
+    }
+
+    bool parse_error(
+        std::size_t, const std::string&,
+        const nlohmann::detail::exception& error) {
+        error_ = error.what();
+        return false;
+    }
+
+    [[nodiscard]] bool Complete() const {
+        return root_is_array_ && root_closed_ &&
+               depth_ == 0;
+    }
+
+    [[nodiscard]] const std::string& Error() const {
+        return error_;
+    }
+
+    DecodedMarketFrame TakeResult() {
+        return std::move(result_);
+    }
+
+private:
+    bool SetScalar(ScalarType type, std::string text) {
+        if (root_is_array_ && depth_ == 1) {
+            ++result_.ignored_items;
+            return true;
+        }
+        if (!item_active_ || depth_ != 2) return true;
+        if (std::vector<std::string>* array =
+                ArrayFor(item_, current_field_))
+            array->clear();
+        Scalar* destination =
+            ScalarFor(item_, current_field_);
+        if (destination)
+            *destination = {
+                .type = type,
+                .text = std::move(text),
+            };
+        return true;
+    }
+
+    void FinalizeItem() {
+        const std::string kind = StringValue(item_.kind);
         if (kind == "success") {
-            if (String(item, "msg") == "authenticated")
-                result.controls.push_back({
+            if (StringValue(item_.message) == "authenticated")
+                result_.controls.push_back({
                     .type = StreamControlType::Authenticated,
                     .message = "authenticated",
                 });
             else
-                ++result.ignored_items;
-            continue;
+                ++result_.ignored_items;
+            return;
         }
         if (kind == "error") {
-            result.controls.push_back({
+            result_.controls.push_back({
                 .type = StreamControlType::Error,
-                .message = String(item, "msg"),
+                .message = StringValue(item_.message),
             });
-            continue;
+            return;
         }
         if (kind == "subscription") {
-            result.controls.push_back({
+            result_.controls.push_back({
                 .type = StreamControlType::Subscription,
-                .trade_symbols = StringArray(item, "trades"),
-                .quote_symbols = StringArray(item, "quotes"),
-                .status_symbols = StringArray(item, "statuses"),
+                .trade_symbols = std::move(item_.trade_symbols),
+                .quote_symbols = std::move(item_.quote_symbols),
+                .status_symbols = std::move(item_.status_symbols),
             });
-            continue;
+            return;
         }
         if (kind != "t" && kind != "q" && kind != "x" &&
             kind != "c" && kind != "b" &&
             kind != "d" && kind != "u" && kind != "s") {
-            ++result.ignored_items;
-            continue;
+            ++result_.ignored_items;
+            return;
         }
 
         DecodedStreamItem decoded{
@@ -247,27 +635,31 @@ DecodedMarketFrame DecodeMarketFrame(
                 kind == "t" || kind == "q" ||
                 kind == "x" || kind == "c",
             .kind = kind,
-            .symbol = String(item, "S"),
-            .received_at_ms = received_at_ms,
+            .symbol = StringValue(item_.symbol),
+            .received_at_ms = received_at_ms_,
         };
-        const std::string broker_timestamp = String(item, "t");
+        const std::string broker_timestamp =
+            StringValue(item_.timestamp);
         decoded.event_time_ns =
             ParseTimestampNs(broker_timestamp);
-        if (kind == "t" && item.contains("i"))
+        const std::string identifier =
+            IdentifierValue(item_.identifier);
+        if (kind == "t")
             decoded.source_event_id =
                 decoded.symbol + ":" +
                 std::to_string(decoded.event_time_ns) + ":" +
-                Identifier(item, "i");
+                identifier;
 
         const std::string instrument_id =
-            resolve_instrument(decoded.symbol);
+            resolve_instrument_(decoded.symbol);
         if (kind == "s") {
             const std::string status_code =
-                String(item, "sc");
+                StringValue(item_.status_code);
             decoded.source_event_id =
                 decoded.symbol + ":s:" +
                 std::to_string(decoded.event_time_ns) + ":" +
-                status_code + ":" + String(item, "rc");
+                status_code + ":" +
+                StringValue(item_.reason_code);
             decoded.market_event =
                 tradebox::core::ShareMarketDataEvent(
                     tradebox::core::TradingStatusReceived{
@@ -276,14 +668,17 @@ DecodedMarketFrame DecodeMarketFrame(
                             .symbol = decoded.symbol,
                             .state = TradingState(status_code),
                             .status_code = status_code,
-                            .status_message = String(item, "sm"),
-                            .reason_code = String(item, "rc"),
-                            .reason_message = String(item, "rm"),
-                            .tape = String(item, "z"),
+                            .status_message =
+                                StringValue(item_.status_message),
+                            .reason_code =
+                                StringValue(item_.reason_code),
+                            .reason_message =
+                                StringValue(item_.reason_message),
+                            .tape = StringValue(item_.tape),
                             .broker_timestamp = broker_timestamp,
                             .event_time_ns =
                                 decoded.event_time_ns,
-                            .received_at_ms = received_at_ms,
+                            .received_at_ms = received_at_ms_,
                         },
                     });
         } else if (kind == "q") {
@@ -293,17 +688,23 @@ DecodedMarketFrame DecodeMarketFrame(
                     .quote = {
                         .instrument_id = instrument_id,
                         .symbol = decoded.symbol,
-                        .bid_price = Decimal(item, "bp"),
-                        .bid_size = Decimal(item, "bs"),
-                        .bid_exchange = String(item, "bx"),
-                        .ask_price = Decimal(item, "ap"),
-                        .ask_size = Decimal(item, "as"),
-                        .ask_exchange = String(item, "ax"),
-                        .conditions = StringArray(item, "c"),
-                        .tape = String(item, "z"),
+                        .bid_price =
+                            DecimalValue(item_.bid_price, "bp"),
+                        .bid_size =
+                            DecimalValue(item_.bid_size, "bs"),
+                        .bid_exchange =
+                            StringValue(item_.bid_exchange),
+                        .ask_price =
+                            DecimalValue(item_.ask_price, "ap"),
+                        .ask_size =
+                            DecimalValue(item_.ask_size, "as"),
+                        .ask_exchange =
+                            StringValue(item_.ask_exchange),
+                        .conditions = std::move(item_.conditions),
+                        .tape = StringValue(item_.tape),
                         .broker_timestamp = broker_timestamp,
                         .event_time_ns = decoded.event_time_ns,
-                        .received_at_ms = received_at_ms,
+                        .received_at_ms = received_at_ms_,
                     },
                 });
         } else if (kind == "t") {
@@ -313,15 +714,15 @@ DecodedMarketFrame DecodeMarketFrame(
                     .trade = {
                         .instrument_id = instrument_id,
                         .symbol = decoded.symbol,
-                        .trade_id = Identifier(item, "i"),
-                        .price = Decimal(item, "p"),
-                        .size = Decimal(item, "s"),
-                        .exchange = String(item, "x"),
-                        .conditions = StringArray(item, "c"),
-                        .tape = String(item, "z"),
+                        .trade_id = identifier,
+                        .price = DecimalValue(item_.price, "p"),
+                        .size = DecimalValue(item_.size, "s"),
+                        .exchange = StringValue(item_.exchange),
+                        .conditions = std::move(item_.conditions),
+                        .tape = StringValue(item_.tape),
                         .broker_timestamp = broker_timestamp,
                         .event_time_ns = decoded.event_time_ns,
-                        .received_at_ms = received_at_ms,
+                        .received_at_ms = received_at_ms_,
                     },
                 });
         } else if (kind == "x") {
@@ -330,10 +731,10 @@ DecodedMarketFrame DecodeMarketFrame(
                     tradebox::core::TradeCanceled{
                     .instrument_id = instrument_id,
                     .symbol = decoded.symbol,
-                    .trade_id = Identifier(item, "i"),
+                    .trade_id = identifier,
                     .broker_timestamp = broker_timestamp,
                     .event_time_ns = decoded.event_time_ns,
-                    .received_at_ms = received_at_ms,
+                    .received_at_ms = received_at_ms_,
                 });
         } else if (kind == "c") {
             decoded.market_event =
@@ -341,19 +742,30 @@ DecodedMarketFrame DecodeMarketFrame(
                     tradebox::core::TradeCorrected{
                     .instrument_id = instrument_id,
                     .symbol = decoded.symbol,
-                    .original_trade_id = Identifier(item, "oi"),
+                    .original_trade_id =
+                        IdentifierValue(
+                            item_.original_identifier),
                     .corrected_trade = {
                         .instrument_id = instrument_id,
                         .symbol = decoded.symbol,
-                        .trade_id = Identifier(item, "ci"),
-                        .price = Decimal(item, "cp"),
-                        .size = Decimal(item, "cs"),
-                        .exchange = String(item, "x"),
-                        .conditions = StringArray(item, "cc"),
-                        .tape = String(item, "z"),
+                        .trade_id =
+                            IdentifierValue(
+                                item_.corrected_identifier),
+                        .price =
+                            DecimalValue(
+                                item_.corrected_price, "cp"),
+                        .size =
+                            DecimalValue(
+                                item_.corrected_size, "cs"),
+                        .exchange =
+                            StringValue(item_.exchange),
+                        .conditions =
+                            std::move(
+                                item_.corrected_conditions),
+                        .tape = StringValue(item_.tape),
                         .broker_timestamp = broker_timestamp,
                         .event_time_ns = decoded.event_time_ns,
-                        .received_at_ms = received_at_ms,
+                        .received_at_ms = received_at_ms_,
                     },
                 });
         } else {
@@ -363,23 +775,301 @@ DecodedMarketFrame DecodeMarketFrame(
                 .symbol = decoded.symbol,
                 .timestamp_ms =
                     decoded.event_time_ns / 1'000'000,
-                .open = Decimal(item, "o"),
-                .high = Decimal(item, "h"),
-                .low = Decimal(item, "l"),
-                .close = Decimal(item, "c"),
-                .volume = Decimal(item, "v"),
+                .open = DecimalValue(item_.open, "o"),
+                .high = DecimalValue(item_.high, "h"),
+                .low = DecimalValue(item_.low, "l"),
+                .close = DecimalValue(item_.close, "c"),
+                .volume = DecimalValue(item_.volume, "v"),
                 .within_bar_vwap =
-                    item.contains("vw") &&
-                            !item["vw"].is_null()
+                    item_.vwap.type != ScalarType::Missing &&
+                            item_.vwap.type != ScalarType::Null
                         ? std::optional<core::Decimal>(
-                              Decimal(item, "vw"))
+                              DecimalValue(item_.vwap, "vw"))
                         : std::nullopt,
-                .trade_count = Unsigned(item, "n"),
+                .trade_count =
+                    UnsignedValue(item_.trade_count),
             };
         }
-        result.items.push_back(std::move(decoded));
+        result_.items.push_back(std::move(decoded));
     }
-    return result;
+
+    std::int64_t received_at_ms_ = 0;
+    const InstrumentResolver& resolve_instrument_;
+    DecodedMarketFrame result_;
+    ItemFields item_;
+    Field current_field_ = Field::Unknown;
+    std::vector<std::string>* active_array_ = nullptr;
+    std::size_t depth_ = 0;
+    bool root_is_array_ = false;
+    bool root_closed_ = false;
+    bool item_active_ = false;
+    std::string error_;
+};
+
+class DirectJsonReader {
+public:
+    DirectJsonReader(
+        std::string_view input, MarketFrameSax& destination)
+        : input_(input), destination_(destination) {}
+
+    bool Parse() {
+        SkipWhitespace();
+        if (!ParseValue(0)) return false;
+        SkipWhitespace();
+        return cursor_ == input_.size() &&
+               destination_.Complete();
+    }
+
+private:
+    void SkipWhitespace() {
+        while (cursor_ < input_.size()) {
+            const char value = input_[cursor_];
+            if (value != ' ' && value != '\t' &&
+                value != '\r' && value != '\n')
+                break;
+            ++cursor_;
+        }
+    }
+
+    bool Consume(char expected) {
+        SkipWhitespace();
+        if (cursor_ >= input_.size() ||
+            input_[cursor_] != expected)
+            return false;
+        ++cursor_;
+        return true;
+    }
+
+    bool ParseString(std::string& result) {
+        SkipWhitespace();
+        if (cursor_ >= input_.size() ||
+            input_[cursor_] != '"')
+            return false;
+        const std::size_t start = ++cursor_;
+        while (cursor_ < input_.size()) {
+            const unsigned char value =
+                static_cast<unsigned char>(input_[cursor_]);
+            if (value == '"') {
+                result.assign(
+                    input_.data() + start,
+                    cursor_ - start);
+                ++cursor_;
+                return true;
+            }
+            // Escapes and non-ASCII input use the fully validating
+            // nlohmann SAX fallback.
+            if (value == '\\' || value < 0x20 ||
+                value >= 0x80)
+                return false;
+            ++cursor_;
+        }
+        return false;
+    }
+
+    bool ParseObject(std::size_t depth) {
+        if (!destination_.start_object(
+                json::size_type(-1)))
+            return false;
+        ++cursor_;
+        SkipWhitespace();
+        if (cursor_ < input_.size() &&
+            input_[cursor_] == '}') {
+            ++cursor_;
+            return destination_.end_object();
+        }
+        for (;;) {
+            std::string key;
+            if (!ParseString(key) ||
+                !destination_.key(key) ||
+                !Consume(':') ||
+                !ParseValue(depth + 1))
+                return false;
+            SkipWhitespace();
+            if (cursor_ < input_.size() &&
+                input_[cursor_] == '}') {
+                ++cursor_;
+                return destination_.end_object();
+            }
+            if (!Consume(',')) return false;
+        }
+    }
+
+    bool ParseArray(std::size_t depth) {
+        if (!destination_.start_array(
+                json::size_type(-1)))
+            return false;
+        ++cursor_;
+        SkipWhitespace();
+        if (cursor_ < input_.size() &&
+            input_[cursor_] == ']') {
+            ++cursor_;
+            return destination_.end_array();
+        }
+        for (;;) {
+            if (!ParseValue(depth + 1)) return false;
+            SkipWhitespace();
+            if (cursor_ < input_.size() &&
+                input_[cursor_] == ']') {
+                ++cursor_;
+                return destination_.end_array();
+            }
+            if (!Consume(',')) return false;
+        }
+    }
+
+    bool ParseLiteral(
+        std::string_view literal, bool value,
+        bool is_null) {
+        if (input_.substr(cursor_, literal.size()) !=
+            literal)
+            return false;
+        cursor_ += literal.size();
+        return is_null ? destination_.null()
+                       : destination_.boolean(value);
+    }
+
+    bool ParseNumber() {
+        const std::size_t start = cursor_;
+        bool negative = false;
+        if (input_[cursor_] == '-') {
+            negative = true;
+            if (++cursor_ == input_.size()) return false;
+        }
+        if (input_[cursor_] == '0') {
+            ++cursor_;
+            if (cursor_ < input_.size() &&
+                input_[cursor_] >= '0' &&
+                input_[cursor_] <= '9')
+                return false;
+        } else {
+            if (input_[cursor_] < '1' ||
+                input_[cursor_] > '9')
+                return false;
+            while (cursor_ < input_.size() &&
+                   input_[cursor_] >= '0' &&
+                   input_[cursor_] <= '9')
+                ++cursor_;
+        }
+        bool floating = false;
+        if (cursor_ < input_.size() &&
+            input_[cursor_] == '.') {
+            floating = true;
+            ++cursor_;
+            const std::size_t fraction = cursor_;
+            while (cursor_ < input_.size() &&
+                   input_[cursor_] >= '0' &&
+                   input_[cursor_] <= '9')
+                ++cursor_;
+            if (cursor_ == fraction) return false;
+        }
+        if (cursor_ < input_.size() &&
+            (input_[cursor_] == 'e' ||
+             input_[cursor_] == 'E')) {
+            floating = true;
+            ++cursor_;
+            if (cursor_ < input_.size() &&
+                (input_[cursor_] == '+' ||
+                 input_[cursor_] == '-'))
+                ++cursor_;
+            const std::size_t exponent = cursor_;
+            while (cursor_ < input_.size() &&
+                   input_[cursor_] >= '0' &&
+                   input_[cursor_] <= '9')
+                ++cursor_;
+            if (cursor_ == exponent) return false;
+        }
+        const std::string_view token =
+            input_.substr(start, cursor_ - start);
+        if (floating) {
+            double parsed = 0;
+            const auto converted = std::from_chars(
+                token.data(), token.data() + token.size(),
+                parsed, std::chars_format::general);
+            if (converted.ec != std::errc{} ||
+                converted.ptr !=
+                    token.data() + token.size())
+                return false;
+            const std::string token_text(token);
+            return destination_.number_float(
+                parsed, token_text);
+        }
+        if (negative) {
+            std::int64_t parsed = 0;
+            const auto converted = std::from_chars(
+                token.data(), token.data() + token.size(),
+                parsed);
+            return converted.ec == std::errc{} &&
+                   converted.ptr ==
+                       token.data() + token.size() &&
+                   destination_.number_integer(parsed);
+        }
+        std::uint64_t parsed = 0;
+        const auto converted = std::from_chars(
+            token.data(), token.data() + token.size(),
+            parsed);
+        return converted.ec == std::errc{} &&
+               converted.ptr ==
+                   token.data() + token.size() &&
+               destination_.number_unsigned(parsed);
+    }
+
+    bool ParseValue(std::size_t depth) {
+        constexpr std::size_t kMaximumDepth = 64;
+        if (depth > kMaximumDepth) return false;
+        SkipWhitespace();
+        if (cursor_ >= input_.size()) return false;
+        switch (input_[cursor_]) {
+            case '{':
+                return ParseObject(depth);
+            case '[':
+                return ParseArray(depth);
+            case '"': {
+                std::string value;
+                return ParseString(value) &&
+                       destination_.string(value);
+            }
+            case 'n':
+                return ParseLiteral("null", false, true);
+            case 't':
+                return ParseLiteral("true", true, false);
+            case 'f':
+                return ParseLiteral("false", false, false);
+            default:
+                if (input_[cursor_] == '-' ||
+                    (input_[cursor_] >= '0' &&
+                     input_[cursor_] <= '9'))
+                    return ParseNumber();
+                return false;
+        }
+    }
+
+    std::string_view input_;
+    MarketFrameSax& destination_;
+    std::size_t cursor_ = 0;
+};
+
+}  // namespace
+
+DecodedMarketFrame DecodeMarketFrame(
+    std::string_view raw_frame, std::int64_t received_at_ms,
+    const InstrumentResolver& resolve_instrument) {
+    MarketFrameSax direct_decoder(
+        received_at_ms, resolve_instrument);
+    if (DirectJsonReader(raw_frame, direct_decoder).Parse())
+        return direct_decoder.TakeResult();
+
+    MarketFrameSax decoder(received_at_ms, resolve_instrument);
+    const bool parsed = json::sax_parse(
+        raw_frame.begin(), raw_frame.end(), &decoder);
+    if (!parsed || !decoder.Complete()) {
+        if (!decoder.Error().empty())
+            throw std::runtime_error(
+                "market stream JSON is invalid: " +
+                decoder.Error());
+        throw std::runtime_error(
+            "market stream packet is not an array");
+    }
+    return decoder.TakeResult();
 }
 
 }  // namespace tradebox::broker::alpaca

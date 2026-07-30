@@ -2369,11 +2369,25 @@ bool AlpacaService::RunMarketStreamSession() {
             receive_error = rc;
             break;
         }
-        if (!tradebox::broker::alpaca::AppendInboundPayload(
-                message,
-                std::string_view(buffer.data(), bytes),
-                tradebox::broker::alpaca::
-                    kMaximumMarketStreamMessageBytes)) {
+        if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) break;
+        const bool fragmented =
+            type ==
+                WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE ||
+            type ==
+                WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE;
+        const std::string_view received(
+            buffer.data(), bytes);
+        const bool direct_frame =
+            message.empty() && !fragmented;
+        if ((!direct_frame &&
+             !tradebox::broker::alpaca::AppendInboundPayload(
+                 message, received,
+                 tradebox::broker::alpaca::
+                     kMaximumMarketStreamMessageBytes)) ||
+            (direct_frame &&
+             received.size() >
+                 tradebox::broker::alpaca::
+                     kMaximumMarketStreamMessageBytes)) {
             const std::string failure_message =
                 "Market stream message exceeded " +
                 std::to_string(
@@ -2397,13 +2411,13 @@ bool AlpacaService::RunMarketStreamSession() {
             protocol_failed = true;
             break;
         }
-        if (type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE ||
-            type == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE)
-            continue;
-        if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) break;
+        if (fragmented) continue;
+        const std::string_view frame_payload =
+            direct_frame ? received
+                         : std::string_view(message);
         try {
             auto frame = tradebox::broker::alpaca::DecodeMarketFrame(
-                message, WallClockNowMs(),
+                frame_payload, WallClockNowMs(),
                 [this](std::string_view symbol) {
                     return InstrumentIdForSymbol(
                         std::string(symbol));
@@ -2584,23 +2598,22 @@ bool AlpacaService::RunMarketStreamSession() {
                     }
                 }
             }
+            std::vector<QueuedMarketDataEvent>
+                persistence_events;
+            std::vector<tradebox::core::MarketDataEventPtr>
+                projection_events;
+            persistence_events.reserve(frame.items.size());
+            projection_events.reserve(frame.items.size());
             for (auto& decoded : frame.items) {
                 if (decoded.market_tick) {
-                    if (!database_.QueueMarketDataEvent(
-                            sip ? "sip" : "iex",
+                    persistence_events.push_back({
+                        .source_event_id =
                             std::move(decoded.source_event_id),
-                            decoded.market_event) &&
-                        !persistence_queue_warning_emitted_.exchange(true))
-                        events_.Push(OperationalEvent(
-                            OperationalComponent::Persistence,
-                            OperationalState::Degraded,
-                            OperationalSeverity::Critical,
-                            "Market-data persistence queue rejected an "
-                            "event",
-                            OperationalReason::QueueOverload));
+                        .event = decoded.market_event,
+                    });
                 }
                 if (decoded.market_event)
-                    market_data_.Ingest(
+                    projection_events.push_back(
                         std::move(decoded.market_event));
                 if (decoded.bar) {
                     const auto& bar = *decoded.bar;
@@ -2671,6 +2684,19 @@ bool AlpacaService::RunMarketStreamSession() {
                     events_.Push(std::move(event));
                 }
             }
+            if (!database_.QueueMarketDataEvents(
+                    sip ? "sip" : "iex",
+                    std::move(persistence_events)) &&
+                !persistence_queue_warning_emitted_.exchange(true))
+                events_.Push(OperationalEvent(
+                    OperationalComponent::Persistence,
+                    OperationalState::Degraded,
+                    OperationalSeverity::Critical,
+                    "Market-data persistence queue rejected a "
+                    "complete frame",
+                    OperationalReason::QueueOverload));
+            market_data_.IngestBatch(
+                std::move(projection_events));
             if (protocol_failed) break;
         } catch (const std::exception& error) {
             events_.Push({UiEventType::Status, {},
