@@ -87,6 +87,6 @@ GUI / CLI / LLM
  order / position / account reducers
 ```
 
-Strategy execution remains disabled until command journaling, idempotent
-client-order IDs, gateway contract tests, replay recovery, and paper-account
-safety gates are complete.
+Strategy execution remains outside the V1 product boundary and disabled.
+Broker-native order execution uses the command journal, idempotent client-order
+IDs, replay recovery, gateway contract tests, and paper/live safety gates.

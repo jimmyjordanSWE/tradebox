@@ -28,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--events-per-instrument", type=int, default=100_000)
     parser.add_argument("--frame-size", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0x7A6D3)
+    parser.add_argument(
+        "--sip-shaped",
+        action="store_true",
+        help="Use CTA/UTP exchange and tape values instead of IEX values",
+    )
     return parser.parse_args()
 
 
@@ -44,6 +49,8 @@ def main() -> None:
         symbol: round(25.0 + index * 37.5, 4)
         for index, symbol in enumerate(symbols)
     }
+    sip_venues = ("N", "P", "Q", "K", "D")
+    sip_tapes = ("A", "B", "C")
     trade_ids = {symbol: 0 for symbol in symbols}
     live_trade_ids: dict[str, list[int]] = {symbol: [] for symbol in symbols}
     remaining = {
@@ -86,6 +93,7 @@ def main() -> None:
                     "T": "subscription",
                     "trades": symbols,
                     "quotes": symbols,
+                    "statuses": ["*"],
                     "bars": [],
                 }],
                 separators=(",", ":"),
@@ -109,20 +117,34 @@ def main() -> None:
 
             if event_type < 0.42:
                 spread = random_source.choice((0.01, 0.01, 0.02, 0.03))
+                bid_exchange = (
+                    random_source.choice(sip_venues)
+                    if args.sip_shaped
+                    else "V"
+                )
+                ask_exchange = (
+                    random_source.choice(sip_venues)
+                    if args.sip_shaped
+                    else "V"
+                )
                 event = {
                     "T": "q",
                     "S": symbol,
-                    "bx": "V",
+                    "bx": bid_exchange,
                     "bp": round(price - spread / 2, 4),
                     "bs": random_source.choice((1, 2, 5, 10, 20, 50)),
-                    "ax": "V",
+                    "ax": ask_exchange,
                     "ap": round(price + spread / 2, 4),
                     "as": random_source.choice((1, 2, 5, 10, 20, 50)),
                     "c": ["R"],
-                    "z": "C",
+                    "z": (
+                        random_source.choice(sip_tapes)
+                        if args.sip_shaped
+                        else "C"
+                    ),
                     "t": timestamp_ns(event_ns),
                 }
-            elif event_type < 0.995 or not live_trade_ids[symbol]:
+            elif event_type < 0.96 or not live_trade_ids[symbol]:
                 trade_ids[symbol] += 1
                 trade_id = trade_ids[symbol]
                 live_trade_ids[symbol].append(trade_id)
@@ -132,23 +154,39 @@ def main() -> None:
                     "T": "t",
                     "S": symbol,
                     "i": trade_id,
-                    "x": "V",
+                    "x": (
+                        random_source.choice(sip_venues)
+                        if args.sip_shaped
+                        else "V"
+                    ),
                     "p": price,
                     "s": random_source.choice(
                         (1, 5, 10, 20, 50, 100, 200, 500)
                     ),
                     "c": ["@"],
-                    "z": "C",
+                    "z": (
+                        random_source.choice(sip_tapes)
+                        if args.sip_shaped
+                        else "C"
+                    ),
                     "t": timestamp_ns(event_ns),
                 }
-            elif event_type < 0.998:
+            elif event_type < 0.98:
                 canceled = random_source.choice(live_trade_ids[symbol])
                 event = {
                     "T": "x",
                     "S": symbol,
                     "i": canceled,
-                    "x": "V",
-                    "z": "C",
+                    "x": (
+                        random_source.choice(sip_venues)
+                        if args.sip_shaped
+                        else "V"
+                    ),
+                    "z": (
+                        random_source.choice(sip_tapes)
+                        if args.sip_shaped
+                        else "C"
+                    ),
                     "t": timestamp_ns(event_ns),
                 }
             else:
@@ -161,11 +199,19 @@ def main() -> None:
                     "S": symbol,
                     "oi": original,
                     "ci": corrected,
-                    "x": "V",
+                    "x": (
+                        random_source.choice(sip_venues)
+                        if args.sip_shaped
+                        else "V"
+                    ),
                     "cp": price,
                     "cs": random_source.choice((10, 50, 100, 200)),
                     "cc": ["@"],
-                    "z": "C",
+                    "z": (
+                        random_source.choice(sip_tapes)
+                        if args.sip_shaped
+                        else "C"
+                    ),
                     "t": timestamp_ns(event_ns),
                 }
 

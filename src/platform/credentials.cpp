@@ -4,6 +4,7 @@
 #include <wincred.h>
 
 #include <vector>
+#include <utility>
 
 namespace {
 
@@ -61,15 +62,17 @@ bool CredentialStore::Load(bool paper, AlpacaCredentials& credentials,
                 " Alpaca credentials";
         return false;
     }
-    credentials.paper = paper;
-    credentials.key = Narrow(value->UserName);
-    credentials.secret.assign(
+    AlpacaCredentials loaded;
+    loaded.paper = paper;
+    loaded.key = Narrow(value->UserName);
+    loaded.secret.assign(
         reinterpret_cast<const char*>(value->CredentialBlob),
         reinterpret_cast<const char*>(value->CredentialBlob) +
             value->CredentialBlobSize);
     if (value->CredentialBlob && value->CredentialBlobSize)
         SecureZeroMemory(value->CredentialBlob, value->CredentialBlobSize);
     CredFree(value);
+    credentials = std::move(loaded);
     return true;
 }
 

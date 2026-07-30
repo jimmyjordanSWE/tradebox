@@ -22,6 +22,21 @@ public:
         return database_.CompleteOrderCommand(result);
     }
 
+    std::expected<void, std::string> MarkDispatchStarted(
+        const std::string& request_id) override {
+        return database_.MarkOrderCommandDispatchStarted(request_id);
+    }
+
+    std::expected<std::vector<core::RecoverableOrderCommand>, std::string>
+    Recoverable() override {
+        return database_.LoadRecoverableOrderCommands();
+    }
+
+    std::expected<void, std::string> ResolveRecovery(
+        const core::OrderCommandResult& result) override {
+        return database_.ResolveOrderCommandRecovery(result);
+    }
+
     std::expected<core::OrderCommandLookup, std::string>
     Lookup(const std::string& request_id) override {
         return database_.LookupOrderCommand(request_id);

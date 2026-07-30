@@ -84,6 +84,7 @@ endfunction()
 add_library(tradebox_core STATIC
   src/core/decimal.cpp
   src/core/asset_catalog.cpp
+  src/core/bar_series.cpp
   src/core/bar_store.cpp
   src/core/market_data_store.cpp
   src/core/order_request.cpp
@@ -105,6 +106,7 @@ target_link_libraries(tradebox_persistence
   PRIVATE shell32 nlohmann_json::nlohmann_json
 )
 tradebox_enable_windows_api(tradebox_persistence)
+tradebox_enable_strict_warnings(tradebox_persistence)
 
 add_library(tradebox_platform STATIC
   src/platform/credentials.cpp
@@ -113,10 +115,17 @@ target_include_directories(tradebox_platform PUBLIC include)
 target_compile_features(tradebox_platform PUBLIC cxx_std_23)
 target_link_libraries(tradebox_platform PRIVATE crypt32 advapi32)
 tradebox_enable_windows_api(tradebox_platform)
+tradebox_enable_strict_warnings(tradebox_platform)
 
 add_library(tradebox_broker_alpaca STATIC
+  src/broker/alpaca/alpaca_account_activity.cpp
+  src/broker/alpaca/alpaca_auth.cpp
+  src/broker/alpaca/alpaca_bar_request.cpp
   src/broker/alpaca/alpaca_market_stream_decoder.cpp
   src/broker/alpaca/alpaca_order_codec.cpp
+  src/broker/alpaca/alpaca_page_validation.cpp
+  src/broker/alpaca/alpaca_rest_transport.cpp
+  src/broker/alpaca/alpaca_stream_supervision.cpp
   src/broker/alpaca/alpaca_service.cpp
 )
 target_include_directories(tradebox_broker_alpaca PUBLIC include)
@@ -130,6 +139,7 @@ target_link_libraries(tradebox_broker_alpaca
     winhttp
 )
 tradebox_enable_windows_api(tradebox_broker_alpaca)
+tradebox_enable_strict_warnings(tradebox_broker_alpaca)
 
 add_library(tradebox_application STATIC
   src/application/order_execution_service.cpp
@@ -169,6 +179,12 @@ target_link_libraries(tradebox_gui PRIVATE
 )
 
 include(CTest)
+option(
+  TRADEBOX_ENABLE_ALPACA_PAPER_CONTRACT_TESTS
+  "Register credentialed tests that create Alpaca Paper orders"
+  OFF
+)
+tradebox_enable_strict_warnings(tradebox_gui)
 if(BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
   set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
@@ -198,8 +214,13 @@ if(BUILD_TESTING)
   gtest_discover_tests(tradebox_core_tests)
 
   add_executable(tradebox_order_pipeline_tests
+    tests/unit/alpaca_account_activity_tests.cpp
+    tests/unit/alpaca_bar_request_tests.cpp
     tests/unit/alpaca_market_stream_decoder_tests.cpp
     tests/unit/alpaca_order_codec_tests.cpp
+    tests/unit/alpaca_polling_policy_tests.cpp
+    tests/unit/alpaca_rest_transport_tests.cpp
+    tests/unit/alpaca_stream_supervision_tests.cpp
     tests/unit/database_order_command_journal_tests.cpp
     tests/unit/order_execution_service_tests.cpp
   )
@@ -224,6 +245,9 @@ if(BUILD_TESTING)
   set(TRADEBOX_REPLAY_CORPUS
     ${CMAKE_CURRENT_BINARY_DIR}/testdata/alpaca_market_stream_10x10000.jsonl
   )
+  set(TRADEBOX_SIP_SOAK_CORPUS
+    ${CMAKE_CURRENT_BINARY_DIR}/testdata/alpaca_sip_stream_20x25000.jsonl
+  )
   add_custom_command(
     OUTPUT
       ${TRADEBOX_REPLAY_CORPUS}
@@ -245,11 +269,35 @@ if(BUILD_TESTING)
       ${TRADEBOX_REPLAY_CORPUS}
       ${TRADEBOX_REPLAY_CORPUS}.assets.json
   )
+  add_custom_command(
+    OUTPUT
+      ${TRADEBOX_SIP_SOAK_CORPUS}
+      ${TRADEBOX_SIP_SOAK_CORPUS}.assets.json
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+      ${CMAKE_CURRENT_BINARY_DIR}/testdata
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_synthetic_market_stream.py
+      --output ${TRADEBOX_SIP_SOAK_CORPUS}
+      --instruments 20
+      --events-per-instrument 25000
+      --frame-size 100
+      --sip-shaped
+    DEPENDS
+      ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_synthetic_market_stream.py
+    VERBATIM
+  )
+  add_custom_target(tradebox_sip_soak_corpus
+    DEPENDS
+      ${TRADEBOX_SIP_SOAK_CORPUS}
+      ${TRADEBOX_SIP_SOAK_CORPUS}.assets.json
+  )
   add_executable(tradebox_market_replay_benchmark
     tests/performance/market_stream_replay_benchmark.cpp
   )
   add_dependencies(
-    tradebox_market_replay_benchmark tradebox_replay_corpus
+    tradebox_market_replay_benchmark
+      tradebox_replay_corpus
+      tradebox_sip_soak_corpus
   )
   target_compile_features(
     tradebox_market_replay_benchmark PRIVATE cxx_std_23
@@ -280,6 +328,52 @@ if(BUILD_TESTING)
       LABELS performance
       TIMEOUT 60
   )
+  add_test(
+    NAME Soak.SipShapedMarketStream
+    COMMAND tradebox_market_replay_benchmark
+      ${TRADEBOX_SIP_SOAK_CORPUS}
+      500000
+      ${CMAKE_CURRENT_BINARY_DIR}/benchmark-results/sip_soak_latest.json
+      sip
+      20
+  )
+  set_tests_properties(
+    Soak.SipShapedMarketStream PROPERTIES
+      LABELS "performance;soak"
+      TIMEOUT 120
+  )
+
+  add_executable(tradebox_alpaca_paper_contract
+    tests/contract/alpaca_paper_contract.cpp
+  )
+  target_compile_features(
+    tradebox_alpaca_paper_contract PRIVATE cxx_std_23
+  )
+  target_link_libraries(
+    tradebox_alpaca_paper_contract PRIVATE
+      tradebox_application
+      tradebox_persistence
+      tradebox_platform
+  )
+  tradebox_enable_strict_warnings(
+    tradebox_alpaca_paper_contract
+  )
+  tradebox_enable_windows_api(
+    tradebox_alpaca_paper_contract
+  )
+  if(TRADEBOX_ENABLE_ALPACA_PAPER_CONTRACT_TESTS)
+    add_test(
+      NAME Contract.AlpacaPaperOrderLifecycle
+      COMMAND tradebox_alpaca_paper_contract
+    )
+    set_tests_properties(
+      Contract.AlpacaPaperOrderLifecycle PROPERTIES
+        LABELS "contract;paper;credentialed"
+        TIMEOUT 300
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+    )
+  endif()
 
   add_test(
     NAME Architecture.CoreHasNoAdapterDependencies
@@ -292,5 +386,11 @@ if(BUILD_TESTING)
     COMMAND ${CMAKE_COMMAND}
       -DSOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/architecture/gui_application_boundary_check.cmake
+  )
+  add_test(
+    NAME Architecture.NetworkSecurityPolicy
+    COMMAND ${CMAKE_COMMAND}
+      -DSOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/architecture/network_security_check.cmake
   )
 endif()

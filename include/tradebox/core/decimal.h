@@ -27,6 +27,14 @@ public:
 
     std::strong_ordering operator<=>(const Decimal& other) const;
     bool operator==(const Decimal& other) const;
+    Decimal operator+(const Decimal& other) const;
+    Decimal& operator+=(const Decimal& other);
+    Decimal operator-(const Decimal& other) const;
+    Decimal& operator-=(const Decimal& other);
+    Decimal operator*(const Decimal& other) const;
+    std::expected<Decimal, DecimalError> Divide(
+        const Decimal& other,
+        std::uint32_t fractional_digits = 9) const;
 
 private:
     Decimal(bool negative, std::string digits, std::uint32_t scale,

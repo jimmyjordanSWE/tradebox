@@ -159,8 +159,9 @@ struct App {
     int frames_before_capture = 0;
     bool vsync_requested = false;
     bool vsync_enabled = false;
-    int swap_interval = 0;
     float display_refresh_hz = 0;
+    SDL_DisplayID presentation_display = 0;
+    int presentation_rearm_frames = 0;
     int maximum_frame_rate = 0;
     bool software_frame_pacing = false;
     Uint64 next_frame_deadline_ns = 0;
@@ -178,32 +179,36 @@ void AddMessage(App& app, std::string message) {
         app.messages.erase(app.messages.begin(), app.messages.begin() + 20);
 }
 
+void ClearCredentialInputs(App& app) {
+    SecureZeroMemory(app.key.data(), app.key.size());
+    SecureZeroMemory(app.secret.data(), app.secret.size());
+}
+
 void ApplyPresentationSettings(App& app, SDL_Window* window, bool announce) {
     app.software_frame_pacing = app.maximum_frame_rate > 0;
     app.next_frame_deadline_ns = 0;
     app.vsync_enabled = false;
+    // Reapplying an unchanged WGL swap interval after a window crosses onto a
+    // different-refresh display can leave the driver synchronized to the old
+    // presentation path. Explicitly release it before binding standard VSync
+    // to the window's current display.
+    SDL_GL_SetSwapInterval(0);
     if (app.vsync_requested) {
-        app.vsync_enabled = SDL_GL_SetSwapInterval(-1);
-        if (!app.vsync_enabled)
-            app.vsync_enabled = SDL_GL_SetSwapInterval(1);
-    } else {
-        SDL_GL_SetSwapInterval(0);
+        app.vsync_enabled = SDL_GL_SetSwapInterval(1);
     }
     int accepted_interval = 0;
     if (app.vsync_enabled &&
-        SDL_GL_GetSwapInterval(&accepted_interval))
-        app.swap_interval = accepted_interval;
-    else
-        app.swap_interval = 0;
+        (!SDL_GL_GetSwapInterval(&accepted_interval) ||
+         accepted_interval != 1))
+        app.vsync_enabled = false;
     const SDL_DisplayID display = SDL_GetDisplayForWindow(window);
+    app.presentation_display = display;
     const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display);
     app.display_refresh_hz = mode ? mode->refresh_rate : 0;
     if (announce) {
         std::ostringstream message;
         if (app.vsync_enabled) {
-            message << (app.swap_interval == -1
-                            ? "VSync active (adaptive)"
-                            : "VSync active (standard)");
+            message << "VSync active (standard)";
         } else if (app.vsync_requested) {
             message << "VSync requested but unavailable";
         } else {
@@ -628,29 +633,59 @@ void DrainEvents(App& app) {
             app.database.QueueTimelineEvent(
                 "tradebox.connection", "", "connection_status", "",
                 SystemNowMs(),
-                nlohmann::json({{"message", event.message}}).dump());
-            if (event.message == "Market stream authenticated") {
-                app.connection_state = ConnectionState::Streaming;
-            } else if (event.message.starts_with(
-                           "Market subscription active")) {
-                app.market_subscription_active = true;
-            } else if (event.message == "Market stream disconnected") {
-                app.connection_state = ConnectionState::Disconnected;
-                app.market_subscription_active = false;
-            } else if (event.message.starts_with("Account login failed") ||
-                       event.message.starts_with("Account JSON error") ||
-                       event.message.starts_with(
-                           "Market stream connection failed") ||
-                       event.message.starts_with("WebSocket upgrade failed") ||
-                       event.message.starts_with("Stream error")) {
-                app.connection_state = ConnectionState::Error;
+                nlohmann::json({
+                    {"message", event.message},
+                    {"component", OperationalComponentLabel(
+                                      event.operational_component)},
+                    {"state", OperationalStateLabel(
+                                  event.operational_state)},
+                    {"reason", OperationalReasonLabel(
+                                   event.operational_reason)},
+                    {"severity", OperationalSeverityLabel(
+                                     event.operational_severity)},
+                    {"retry_attempt", event.retry_attempt},
+                    {"retry_in_ms", event.retry_in_ms},
+                }).dump());
+            switch (event.operational_component) {
+            case OperationalComponent::Account:
+                if (event.operational_state == OperationalState::Failed)
+                    app.connection_state = ConnectionState::Error;
+                break;
+            case OperationalComponent::AccountStream:
+                if (event.operational_state == OperationalState::Subscribed)
+                    app.account_stream_failed = false;
+                else if (
+                    event.operational_state == OperationalState::Disconnected ||
+                    event.operational_state == OperationalState::Failed ||
+                    event.operational_state == OperationalState::Degraded)
+                    app.account_stream_failed = true;
+                break;
+            case OperationalComponent::MarketDataStream:
+                if (event.operational_state == OperationalState::Connecting)
+                    app.connection_state = ConnectionState::Connecting;
+                else if (event.operational_state ==
+                    OperationalState::Authenticated)
+                    app.connection_state = ConnectionState::Streaming;
+                else if (
+                    event.operational_state == OperationalState::Reconnecting)
+                    app.connection_state = ConnectionState::Connecting;
+                else if (
+                    event.operational_state == OperationalState::Subscribed)
+                    app.market_subscription_active = true;
+                else if (
+                    event.operational_state == OperationalState::Disconnected) {
+                    app.connection_state = ConnectionState::Disconnected;
+                    app.market_subscription_active = false;
+                } else if (
+                    event.operational_state == OperationalState::Failed ||
+                    event.operational_state == OperationalState::Degraded) {
+                    app.connection_state = ConnectionState::Error;
+                    app.market_subscription_active = false;
+                }
+                break;
+            case OperationalComponent::None:
+                break;
             }
-            if (event.message.starts_with("Account stream connection failed") ||
-                event.message.starts_with("Account WebSocket upgrade failed") ||
-                event.message.starts_with(
-                    "Account stream authorization failed") ||
-                event.message == "Account stream disconnected")
-                app.account_stream_failed = true;
             AddMessage(app, std::move(event.message));
             continue;
         }
@@ -664,6 +699,21 @@ void DrainEvents(App& app) {
         if (event.type == UiEventType::AccountStreamConnected) {
             app.account_stream_latency_ms = event.latency_ms;
             app.account_stream_failed = false;
+            app.database.QueueTimelineEvent(
+                "tradebox.connection", "", "connection_status", "",
+                SystemNowMs(),
+                nlohmann::json({
+                    {"message",
+                     "Account trade_updates subscription active"},
+                    {"component", OperationalComponentLabel(
+                                      event.operational_component)},
+                    {"state", OperationalStateLabel(
+                                  event.operational_state)},
+                    {"reason", OperationalReasonLabel(
+                                   event.operational_reason)},
+                    {"severity", OperationalSeverityLabel(
+                                     event.operational_severity)},
+                }).dump());
             AddMessage(app, "Account trade_updates subscription active");
             continue;
         }
@@ -1072,8 +1122,8 @@ void ConnectSavedAccount(App& app, bool paper) {
             .environment =
                 paper ? tradebox::core::AccountEnvironment::Paper
                       : tradebox::core::AccountEnvironment::Live,
-            .api_key = std::move(credentials.key),
-            .api_secret = std::move(credentials.secret),
+            .api_key = credentials.key,
+            .api_secret = credentials.secret,
             .market_symbols = app.watchlist,
         });
         if (!core_result || !core_result->accepted) {
@@ -1413,7 +1463,7 @@ void DrawPerformanceOverlay(const App& app) {
     char performance_label[160];
     const char* sync_label =
         app.vsync_enabled
-            ? (app.swap_interval == -1 ? "VSYNC ADAPTIVE" : "VSYNC ON")
+            ? "VSYNC ON"
             : (app.maximum_frame_rate > 0
                    ? "FPS CAPPED"
                    : (app.vsync_requested ? "VSYNC FAILED" : "UNCAPPED"));
@@ -1816,8 +1866,7 @@ void ForgetSavedCredentials(App& app, bool paper) {
     }
     app.database.ClearLastConnectedAccount(paper);
     if (app.active_paper == paper) DisconnectAccount(app);
-    app.key.fill('\0');
-    app.secret.fill('\0');
+    ClearCredentialInputs(app);
     AddMessage(app, std::string("Forgot saved ") +
                         (paper ? "paper" : "live") +
                         " credentials from Windows Credential Manager");
@@ -1873,7 +1922,7 @@ void DrawCredentials(App& app, SDL_Window* window) {
             } else if (!CredentialStore::Save(credentials, error)) {
                 AddMessage(app, error);
             } else {
-                std::fill(app.secret.begin(), app.secret.end(), '\0');
+                ClearCredentialInputs(app);
                 app.has_account = false;
                 app.positions.clear();
                 app.orders.clear();
@@ -1893,8 +1942,8 @@ void DrawCredentials(App& app, SDL_Window* window) {
                         credentials.paper
                             ? tradebox::core::AccountEnvironment::Paper
                             : tradebox::core::AccountEnvironment::Live,
-                    .api_key = std::move(credentials.key),
-                    .api_secret = std::move(credentials.secret),
+                    .api_key = credentials.key,
+                    .api_secret = credentials.secret,
                     .market_symbols = app.watchlist,
                 });
                 if (!core_result || !core_result->accepted) {
@@ -1910,7 +1959,7 @@ void DrawCredentials(App& app, SDL_Window* window) {
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) {
-            std::fill(app.secret.begin(), app.secret.end(), '\0');
+            ClearCredentialInputs(app);
             app.credentials_open = false;
             ImGui::CloseCurrentPopup();
         }
@@ -1949,6 +1998,7 @@ void DrawCredentials(App& app, SDL_Window* window) {
         }
         ImGui::EndPopup();
     }
+    if (!app.credentials_open) ClearCredentialInputs(app);
 }
 
 void AddSymbol(App& app, const std::string& symbol) {
@@ -2328,29 +2378,46 @@ void DrawPositions(App& app) {
             ImGui::TextUnformatted(
                 position.avg_entry_price.ToString().c_str());
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(
-                position.current_price.ToString().c_str());
+            if (position.valuation_current)
+                ImGui::TextUnformatted(
+                    position.current_price.ToString().c_str());
+            else
+                ImGui::TextDisabled("-- stale");
             ImGui::TableNextColumn();
-            ImGui::Text("$%s", position.market_value.ToString().c_str());
+            if (position.valuation_current)
+                ImGui::Text(
+                    "$%s",
+                    position.market_value.ToString().c_str());
+            else
+                ImGui::TextDisabled("--");
             ImGui::TableNextColumn();
-            ImGui::TextColored(
-                position.unrealized_pl >=
-                        tradebox::core::Decimal::Zero()
-                    ? ImVec4(0.25f, 0.9f, 0.58f, 1)
-                    : ImVec4(0.96f, 0.38f, 0.43f, 1),
-                "%+.2f  (%+.2f%%)",
-                position.unrealized_pl.ToDisplayDouble(),
-                position.unrealized_plpc.ToDisplayDouble() * 100.0);
+            if (position.valuation_current)
+                ImGui::TextColored(
+                    position.unrealized_pl >=
+                            tradebox::core::Decimal::Zero()
+                        ? ImVec4(0.25f, 0.9f, 0.58f, 1)
+                        : ImVec4(0.96f, 0.38f, 0.43f, 1),
+                    "%+.2f  (%+.2f%%)",
+                    position.unrealized_pl.ToDisplayDouble(),
+                    position.unrealized_plpc.ToDisplayDouble() *
+                        100.0);
+            else
+                ImGui::TextDisabled("--");
             ImGui::TableNextColumn();
-            ImGui::TextColored(
-                position.unrealized_intraday_pl >=
-                        tradebox::core::Decimal::Zero()
-                    ? ImVec4(0.25f, 0.9f, 0.58f, 1)
-                    : ImVec4(0.96f, 0.38f, 0.43f, 1),
-                "%+.2f  (%+.2f%%)",
-                position.unrealized_intraday_pl.ToDisplayDouble(),
-                position.unrealized_intraday_plpc.ToDisplayDouble() *
-                    100.0);
+            if (position.valuation_current)
+                ImGui::TextColored(
+                    position.unrealized_intraday_pl >=
+                            tradebox::core::Decimal::Zero()
+                        ? ImVec4(0.25f, 0.9f, 0.58f, 1)
+                        : ImVec4(0.96f, 0.38f, 0.43f, 1),
+                    "%+.2f  (%+.2f%%)",
+                    position.unrealized_intraday_pl
+                        .ToDisplayDouble(),
+                    position.unrealized_intraday_plpc
+                            .ToDisplayDouble() *
+                        100.0);
+            else
+                ImGui::TextDisabled("--");
         }
         ImGui::EndTable();
     }
@@ -2655,8 +2722,13 @@ int RunApplication(const LaunchOptions& options) {
                 event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
                 done = true;
             }
-            if (event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED)
+            if (event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED) {
                 ApplyPresentationSettings(app, window, true);
+                // Re-arm after the new display has presented real frames. On
+                // Windows the display-change event can arrive before OpenGL's
+                // presentation path has completed its monitor transition.
+                app.presentation_rearm_frames = 2;
+            }
             if (event.type == SDL_EVENT_WINDOW_MAXIMIZED) {
                 remember_maximized = true;
                 placement_dirty = true;
@@ -2668,6 +2740,13 @@ int RunApplication(const LaunchOptions& options) {
             } else if (event.type == SDL_EVENT_WINDOW_MOVED ||
                        event.type == SDL_EVENT_WINDOW_RESIZED ||
                        event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
+                const SDL_DisplayID current_display =
+                    SDL_GetDisplayForWindow(window);
+                if (current_display != 0 &&
+                    current_display != app.presentation_display) {
+                    ApplyPresentationSettings(app, window, true);
+                    app.presentation_rearm_frames = 2;
+                }
                 const SDL_WindowFlags flags = SDL_GetWindowFlags(window);
                 if ((flags & (SDL_WINDOW_MAXIMIZED | SDL_WINDOW_MINIMIZED)) ==
                     0) {
@@ -2771,6 +2850,10 @@ int RunApplication(const LaunchOptions& options) {
             }
         }
         SDL_GL_SwapWindow(window);
+        if (app.presentation_rearm_frames > 0 &&
+            --app.presentation_rearm_frames == 0) {
+            ApplyPresentationSettings(app, window, false);
+        }
         PaceSoftwareFrame(app);
     }
 
@@ -2796,7 +2879,10 @@ LaunchOptions ParseLaunchOptions(int argc, char* argv[]) {
         if (std::string_view(argv[index]) == "--capture-framebuffer" &&
             index + 1 < argc) {
             options.capture_and_exit = true;
-            options.capture_path = std::filesystem::u8path(argv[++index]);
+            const char* utf8_path = argv[++index];
+            options.capture_path = std::filesystem::path(
+                std::u8string(
+                    reinterpret_cast<const char8_t*>(utf8_path)));
         } else if (std::string_view(argv[index]) == "--connect-paper") {
             options.connect_paper = true;
         } else if (std::string_view(argv[index]) == "--run-for-ms" &&

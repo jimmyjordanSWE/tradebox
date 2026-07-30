@@ -1,11 +1,45 @@
 #pragma once
 
 #include <string>
+#include <utility>
 
 struct AlpacaCredentials {
     std::string key;
     std::string secret;
     bool paper = true;
+
+    AlpacaCredentials() = default;
+    AlpacaCredentials(std::string api_key, std::string api_secret,
+                      bool paper_environment)
+        : key(api_key),
+          secret(api_secret),
+          paper(paper_environment) {
+        Wipe(api_key);
+        Wipe(api_secret);
+    }
+
+    AlpacaCredentials(const AlpacaCredentials&) = delete;
+    AlpacaCredentials& operator=(const AlpacaCredentials&) = delete;
+
+    AlpacaCredentials(AlpacaCredentials&& other)
+        : key(other.key),
+          secret(other.secret),
+          paper(other.paper) {
+        Wipe(other.key);
+        Wipe(other.secret);
+    }
+
+    AlpacaCredentials& operator=(AlpacaCredentials&& other) {
+        if (this == &other) return *this;
+        Wipe(key);
+        Wipe(secret);
+        key = other.key;
+        secret = other.secret;
+        paper = other.paper;
+        Wipe(other.key);
+        Wipe(other.secret);
+        return *this;
+    }
 
     ~AlpacaCredentials() {
         Wipe(key);
@@ -17,6 +51,7 @@ private:
         volatile char* bytes = value.data();
         for (std::size_t index = 0; index < value.size(); ++index)
             bytes[index] = '\0';
+        value.clear();
     }
 };
 

@@ -28,8 +28,17 @@ core::OrderCommandKind Kind(const core::NativeOrderCommand& command) {
             } else if constexpr (
                 std::is_same_v<T, core::CancelOrderCommand>) {
                 return core::OrderCommandKind::Cancel;
-            } else {
+            } else if constexpr (
+                std::is_same_v<T, core::ReplaceOrderCommand>) {
                 return core::OrderCommandKind::Replace;
+            } else if constexpr (
+                std::is_same_v<T, core::ClosePositionCommand>) {
+                return core::OrderCommandKind::ClosePosition;
+            } else if constexpr (
+                std::is_same_v<T, core::CloseAllPositionsCommand>) {
+                return core::OrderCommandKind::CloseAllPositions;
+            } else {
+                return core::OrderCommandKind::CancelAllOrders;
             }
         },
         command);
@@ -75,7 +84,14 @@ core::OrderCommandResult Rejected(
 }
 
 bool RequiresLiveSafety(const core::NativeOrderCommand& command) {
-    return !std::holds_alternative<core::CancelOrderCommand>(command);
+    return !std::holds_alternative<core::CancelOrderCommand>(command) &&
+           !std::holds_alternative<core::CancelAllOrdersCommand>(command);
+}
+
+core::Decimal Absolute(const core::Decimal& value) {
+    std::string text = value.ToString();
+    if (!text.empty() && text.front() == '-') text.erase(text.begin());
+    return *core::Decimal::Parse(text);
 }
 
 std::int64_t ToMilliseconds(
@@ -85,16 +101,33 @@ std::int64_t ToMilliseconds(
         .count();
 }
 
+bool TerminalOrderStatus(std::string_view status) {
+    return status == "filled" || status == "canceled" ||
+           status == "cancelled" || status == "expired" ||
+           status == "rejected" || status == "done_for_day" ||
+           status == "stopped";
+}
+
+bool CanceledOrderStatus(std::string_view status) {
+    return status == "canceled" || status == "cancelled";
+}
+
 }  // namespace
 
 OrderExecutionService::OrderExecutionService(
     core::ITradingCore& core, broker::IOrderGateway& gateway,
-    core::IOrderCommandJournal& journal, core::IClock& clock)
+    core::IOrderCommandJournal& journal, core::IClock& clock,
+    const core::IMarketDataView* market_data)
     : core_(core),
       gateway_(gateway),
       journal_(journal),
       clock_(clock),
-      worker_(&OrderExecutionService::WorkerLoop, this) {}
+      market_data_(market_data) {
+    const auto recoverable = journal_.Recoverable();
+    recovery_pending_ = recoverable && !recoverable->empty();
+    worker_ =
+        std::thread(&OrderExecutionService::WorkerLoop, this);
+}
 
 OrderExecutionService::~OrderExecutionService() {
     {
@@ -111,6 +144,15 @@ std::future<core::OrderCommandResult> OrderExecutionService::Submit(
     pending->command = std::move(command);
     std::future<core::OrderCommandResult> result =
         pending->completion.get_future();
+    if (core_.Snapshot().safety_status ==
+        core::SafetyStatus::Disconnected) {
+        pending->completion.set_value(Rejected(
+            RequestId(pending->command),
+            core::OrderCommandOutcome::SafetyRejected,
+            "Order was not sent because the broker session is "
+            "disconnected"));
+        return result;
+    }
     {
         std::scoped_lock lock(mutex_);
         if (stopping_) {
@@ -138,15 +180,238 @@ void OrderExecutionService::WorkerLoop() {
         std::unique_ptr<PendingCommand> command;
         {
             std::unique_lock lock(mutex_);
-            ready_.wait(lock,
-                        [this] { return stopping_ || !pending_.empty(); });
+            if (recovery_pending_)
+                ready_.wait_for(
+                    lock, std::chrono::milliseconds(250),
+                    [this] {
+                        return stopping_ || !pending_.empty();
+                    });
+            else
+                ready_.wait(
+                    lock,
+                    [this] {
+                        return stopping_ || !pending_.empty();
+                    });
             if (pending_.empty() && stopping_) return;
-            command = std::move(pending_.front());
-            pending_.pop();
+            if (!pending_.empty()) {
+                command = std::move(pending_.front());
+                pending_.pop();
+            }
         }
-        command->completion.set_value(
-            Execute(std::move(command->command)));
+        if (command) {
+            core::OrderCommandResult result =
+                Execute(std::move(command->command));
+            if (result.recovery_state ==
+                core::CommandRecoveryState::Pending)
+                recovery_pending_ = true;
+            command->completion.set_value(std::move(result));
+        }
+        RecoverCommands();
     }
+}
+
+void OrderExecutionService::RecoverCommands() {
+    if (!recovery_pending_) return;
+    const auto recoverable = journal_.Recoverable();
+    if (!recoverable) return;
+    if (recoverable->empty()) {
+        recovery_pending_ = false;
+        return;
+    }
+    const core::CoreSnapshot snapshot = core_.Snapshot();
+    for (const auto& command : *recoverable) {
+        const auto resolution = ResolveRecovery(command, snapshot);
+        if (!resolution) continue;
+        static_cast<void>(journal_.ResolveRecovery(*resolution));
+    }
+}
+
+std::optional<core::OrderCommandResult>
+OrderExecutionService::ResolveRecovery(
+    const core::RecoverableOrderCommand& command,
+    const core::CoreSnapshot& snapshot) const {
+    const auto result = [&command](
+                            core::OrderCommandOutcome outcome,
+                            core::CommandRecoveryState recovery_state,
+                            std::string message,
+                            std::string broker_order_id = {}) {
+        return core::OrderCommandResult{
+            .request_id = command.record.request_id,
+            .outcome = outcome,
+            .broker_order_id = std::move(broker_order_id),
+            .message = message,
+            .reconciliation_required = false,
+            .recovery_state = recovery_state,
+            .recovery_message = std::move(message),
+        };
+    };
+
+    if (!command.dispatch_started)
+        return result(
+            core::OrderCommandOutcome::NotDispatched,
+            core::CommandRecoveryState::Rejected,
+            "Recovered reservation ended before broker dispatch began");
+
+    if (!snapshot.account || !snapshot.initial_snapshot_loaded ||
+        !snapshot.reconciled)
+        return std::nullopt;
+    if (snapshot.account->id != command.record.account_id ||
+        snapshot.environment != command.record.environment)
+        return result(
+            core::OrderCommandOutcome::Indeterminate,
+            core::CommandRecoveryState::OperatorAttention,
+            "Recoverable command belongs to a different account or "
+            "paper/live environment");
+
+    constexpr std::int64_t grace_ms = 30'000;
+    const bool grace_elapsed =
+        ToMilliseconds(clock_.Now()) - command.record.created_at_ms >=
+        grace_ms;
+    const auto find_order_by_id = [&snapshot](std::string_view id) {
+        return std::ranges::find_if(
+            snapshot.orders, [id](const core::OrderState& order) {
+                return order.id == id;
+            });
+    };
+    const auto find_order_by_client_id =
+        [&snapshot](std::string_view client_order_id) {
+            return std::ranges::find_if(
+                snapshot.orders,
+                [client_order_id](const core::OrderState& order) {
+                    return order.client_order_id == client_order_id;
+                });
+        };
+
+    switch (command.record.kind) {
+    case core::OrderCommandKind::Place: {
+        if (command.record.client_order_id.empty())
+            return result(
+                core::OrderCommandOutcome::Indeterminate,
+                core::CommandRecoveryState::OperatorAttention,
+                "Placed order has no durable client_order_id");
+        const auto order =
+            find_order_by_client_id(command.record.client_order_id);
+        if (order != snapshot.orders.end())
+            return result(
+                core::OrderCommandOutcome::BrokerAccepted,
+                core::CommandRecoveryState::Resolved,
+                "Recovered placed order by client_order_id",
+                order->id);
+        if (!grace_elapsed) return std::nullopt;
+        return result(
+            core::OrderCommandOutcome::RecoveryRejected,
+            core::CommandRecoveryState::Rejected,
+            "No authoritative broker order matches client_order_id");
+    }
+    case core::OrderCommandKind::Replace: {
+        if (!command.record.client_order_id.empty()) {
+            const auto replacement =
+                find_order_by_client_id(
+                    command.record.client_order_id);
+            if (replacement != snapshot.orders.end())
+                return result(
+                    core::OrderCommandOutcome::BrokerAccepted,
+                    core::CommandRecoveryState::Resolved,
+                    "Recovered replacement by client_order_id",
+                    replacement->id);
+        }
+        const auto target =
+            find_order_by_id(command.target_order_id);
+        if (!grace_elapsed) return std::nullopt;
+        if (target != snapshot.orders.end() &&
+            !TerminalOrderStatus(target->status) &&
+            target->replaced_by.empty())
+            return result(
+                core::OrderCommandOutcome::RecoveryRejected,
+                core::CommandRecoveryState::Rejected,
+                "Authoritative target order was not replaced");
+        return result(
+            core::OrderCommandOutcome::Indeterminate,
+            core::CommandRecoveryState::OperatorAttention,
+            "Replacement could not be attributed from authoritative "
+            "order state");
+    }
+    case core::OrderCommandKind::Cancel: {
+        const auto target =
+            find_order_by_id(command.target_order_id);
+        if (target != snapshot.orders.end() &&
+            CanceledOrderStatus(target->status))
+            return result(
+                core::OrderCommandOutcome::BrokerAccepted,
+                core::CommandRecoveryState::Resolved,
+                "Authoritative order state confirms cancellation",
+                target->id);
+        if (!grace_elapsed) return std::nullopt;
+        if (target == snapshot.orders.end())
+            return result(
+                core::OrderCommandOutcome::Indeterminate,
+                core::CommandRecoveryState::OperatorAttention,
+                "Cancellation target is absent from authoritative "
+                "order history");
+        return result(
+            core::OrderCommandOutcome::RecoveryRejected,
+            core::CommandRecoveryState::Rejected,
+            "Authoritative order state does not confirm cancellation",
+            target->id);
+    }
+    case core::OrderCommandKind::ClosePosition: {
+        const auto position = std::ranges::find_if(
+            snapshot.positions,
+            [&command](const core::PositionState& candidate) {
+                return candidate.symbol ==
+                           command.symbol_or_asset_id ||
+                       candidate.asset_id ==
+                           command.symbol_or_asset_id;
+            });
+        const bool full_close =
+            !command.qty &&
+            (!command.percentage ||
+             *command.percentage == *core::Decimal::Parse("100"));
+        if (full_close && position == snapshot.positions.end())
+            return result(
+                core::OrderCommandOutcome::BrokerAccepted,
+                core::CommandRecoveryState::Resolved,
+                "Authoritative position state confirms full close");
+        if (!grace_elapsed) return std::nullopt;
+        if (full_close)
+            return result(
+                core::OrderCommandOutcome::RecoveryRejected,
+                core::CommandRecoveryState::Rejected,
+                "Authoritative position remains open");
+        return result(
+            core::OrderCommandOutcome::Indeterminate,
+            core::CommandRecoveryState::OperatorAttention,
+            "Partial close requires operator review because the "
+            "pre-dispatch quantity is unavailable");
+    }
+    case core::OrderCommandKind::CloseAllPositions:
+        if (snapshot.positions.empty())
+            return result(
+                core::OrderCommandOutcome::BrokerAccepted,
+                core::CommandRecoveryState::Resolved,
+                "Authoritative state confirms all positions closed");
+        if (!grace_elapsed) return std::nullopt;
+        return result(
+            core::OrderCommandOutcome::Indeterminate,
+            core::CommandRecoveryState::OperatorAttention,
+            "Some positions remain after close-all recovery");
+    case core::OrderCommandKind::CancelAllOrders:
+        if (std::ranges::none_of(
+                snapshot.orders,
+                [](const core::OrderState& order) {
+                    return !TerminalOrderStatus(order.status);
+                }))
+            return result(
+                core::OrderCommandOutcome::BrokerAccepted,
+                core::CommandRecoveryState::Resolved,
+                "Authoritative state confirms no open orders");
+        if (!grace_elapsed) return std::nullopt;
+        return result(
+            core::OrderCommandOutcome::Indeterminate,
+            core::CommandRecoveryState::OperatorAttention,
+            "Open orders remain after cancel-all recovery");
+    }
+    return std::nullopt;
 }
 
 core::OrderCommandResult OrderExecutionService::Execute(
@@ -206,11 +471,41 @@ core::OrderCommandResult OrderExecutionService::Execute(
             result.message =
                 "Broker outcome could not be durably recorded: " +
                 persisted.error();
+            result.recovery_state =
+                core::CommandRecoveryState::Pending;
+            result.recovery_message =
+                "Durable completion failed; authoritative recovery "
+                "required";
         }
         return result;
     };
+    auto mark_dispatch = [this, &context]()
+        -> std::optional<core::OrderCommandResult> {
+        if (auto marked =
+                journal_.MarkDispatchStarted(context.request_id);
+            !marked) {
+            core::OrderCommandResult result = Rejected(
+                context.request_id,
+                core::OrderCommandOutcome::NotDispatched,
+                "Broker was not called because the durable dispatch "
+                "marker failed: " +
+                    marked.error());
+            result.recovery_state =
+                core::CommandRecoveryState::Rejected;
+            result.recovery_message = result.message;
+            return result;
+        }
+        return std::nullopt;
+    };
 
     const core::CoreSnapshot snapshot = core_.Snapshot();
+    if (snapshot.safety_status ==
+        core::SafetyStatus::Disconnected)
+        return complete(Rejected(
+            context.request_id,
+            core::OrderCommandOutcome::SafetyRejected,
+            "Order was not sent because the broker session is "
+            "disconnected"));
     if (!snapshot.account || context.account_id.empty() ||
         snapshot.account->id != context.account_id)
         return complete(Rejected(
@@ -231,7 +526,7 @@ core::OrderCommandResult OrderExecutionService::Execute(
             return complete(Rejected(
                 context.request_id,
                 core::OrderCommandOutcome::SafetyRejected,
-                "Place and replace require LIVE, reconciled, trading-permitted "
+                "This command requires LIVE, reconciled, trading-permitted "
                 "state"));
         if (context.environment == core::AccountEnvironment::Live &&
             !context.live_trading_confirmed)
@@ -245,18 +540,37 @@ core::OrderCommandResult OrderExecutionService::Execute(
                snapshot.safety_status == core::SafetyStatus::Error) {
         return complete(Rejected(
             context.request_id, core::OrderCommandOutcome::SafetyRejected,
-            "Cancel requires an identified broker session"));
+            "Cancellation requires an identified broker session"));
     }
 
     broker::BrokerCommandResult broker_result;
     if (const auto* place =
             std::get_if<core::PlaceOrderCommand>(&command)) {
+        if (market_data_) {
+            const auto market =
+                market_data_->Snapshot(place->order.symbol);
+            if (market.trading_status &&
+                market.trading_status->BlocksNewOrders())
+                return complete(Rejected(
+                    context.request_id,
+                    core::OrderCommandOutcome::SafetyRejected,
+                    "New order blocked by market trading status: " +
+                        market.trading_status->status_message +
+                        (market.trading_status
+                                 ->reason_message.empty()
+                             ? std::string{}
+                             : " - " +
+                                   market.trading_status
+                                       ->reason_message)));
+        }
         const auto errors = core::ValidateOrder(place->order);
         if (!errors.empty())
             return complete(Rejected(
                 context.request_id,
                 core::OrderCommandOutcome::ValidationRejected,
                 ValidationMessage(errors)));
+        if (auto failed = mark_dispatch())
+            return complete(std::move(*failed));
         broker_result = gateway_.PlaceOrder(place->order);
     } else if (const auto* cancel =
                    std::get_if<core::CancelOrderCommand>(&command)) {
@@ -265,12 +579,14 @@ core::OrderCommandResult OrderExecutionService::Execute(
                 context.request_id,
                 core::OrderCommandOutcome::ValidationRejected,
                 "order_id is required"));
+        if (auto failed = mark_dispatch())
+            return complete(std::move(*failed));
         broker_result = gateway_.CancelOrder(cancel->order_id);
-    } else {
-        const auto& replace = std::get<core::ReplaceOrderCommand>(command);
+    } else if (const auto* replace =
+                   std::get_if<core::ReplaceOrderCommand>(&command)) {
         const auto order = std::ranges::find_if(
-            snapshot.orders, [&replace](const core::OrderState& candidate) {
-                return candidate.id == replace.order_id;
+            snapshot.orders, [replace](const core::OrderState& candidate) {
+                return candidate.id == replace->order_id;
             });
         if (order == snapshot.orders.end())
             return complete(Rejected(
@@ -278,14 +594,86 @@ core::OrderCommandResult OrderExecutionService::Execute(
                 core::OrderCommandOutcome::ValidationRejected,
                 "Replacement target is absent from authoritative order state"));
         const auto errors =
-            core::ValidateReplacement(*order, replace.replacement);
+            core::ValidateReplacement(*order, replace->replacement);
         if (!errors.empty())
             return complete(Rejected(
                 context.request_id,
                 core::OrderCommandOutcome::ValidationRejected,
                 ValidationMessage(errors)));
+        if (auto failed = mark_dispatch())
+            return complete(std::move(*failed));
         broker_result =
-            gateway_.ReplaceOrder(replace.order_id, replace.replacement);
+            gateway_.ReplaceOrder(replace->order_id, replace->replacement);
+    } else if (const auto* close =
+                   std::get_if<core::ClosePositionCommand>(&command)) {
+        if (close->symbol_or_asset_id.empty())
+            return complete(Rejected(
+                context.request_id,
+                core::OrderCommandOutcome::ValidationRejected,
+                "symbol_or_asset_id is required"));
+        if (close->qty && close->percentage)
+            return complete(Rejected(
+                context.request_id,
+                core::OrderCommandOutcome::ValidationRejected,
+                "qty and percentage are mutually exclusive"));
+        const auto zero = core::Decimal::Zero();
+        const auto hundred = *core::Decimal::Parse("100");
+        if (close->qty && *close->qty <= zero)
+            return complete(Rejected(
+                context.request_id,
+                core::OrderCommandOutcome::ValidationRejected,
+                "qty must be greater than zero"));
+        if (close->percentage &&
+            (*close->percentage <= zero ||
+             *close->percentage > hundred))
+            return complete(Rejected(
+                context.request_id,
+                core::OrderCommandOutcome::ValidationRejected,
+                "percentage must be greater than zero and at most 100"));
+        const auto position = std::ranges::find_if(
+            snapshot.positions,
+            [close](const core::PositionState& candidate) {
+                return candidate.symbol == close->symbol_or_asset_id ||
+                       candidate.asset_id == close->symbol_or_asset_id;
+            });
+        if (position == snapshot.positions.end())
+            return complete(Rejected(
+                context.request_id,
+                core::OrderCommandOutcome::ValidationRejected,
+                "Close target is absent from authoritative position state"));
+        if (position->asset_class != "us_equity")
+            return complete(Rejected(
+                context.request_id,
+                core::OrderCommandOutcome::ValidationRejected,
+                "V1.0 close position supports US equities only"));
+        if (close->qty &&
+            *close->qty > Absolute(position->qty_available))
+            return complete(Rejected(
+                context.request_id,
+                core::OrderCommandOutcome::ValidationRejected,
+                "qty exceeds authoritative available position quantity"));
+        if (auto failed = mark_dispatch())
+            return complete(std::move(*failed));
+        broker_result = gateway_.ClosePosition(
+            close->symbol_or_asset_id, close->qty, close->percentage);
+    } else if (const auto* close_all =
+                   std::get_if<core::CloseAllPositionsCommand>(&command)) {
+        if (std::ranges::any_of(
+                snapshot.positions, [](const core::PositionState& position) {
+                    return position.asset_class != "us_equity";
+                }))
+            return complete(Rejected(
+                context.request_id,
+                core::OrderCommandOutcome::ValidationRejected,
+                "V1.0 close all is blocked while non-equity positions exist"));
+        if (auto failed = mark_dispatch())
+            return complete(std::move(*failed));
+        broker_result =
+            gateway_.CloseAllPositions(close_all->cancel_open_orders);
+    } else {
+        if (auto failed = mark_dispatch())
+            return complete(std::move(*failed));
+        broker_result = gateway_.CancelAllOrders();
     }
 
     core::OrderCommandOutcome outcome =
@@ -296,7 +684,12 @@ core::OrderCommandResult OrderExecutionService::Execute(
     else if (broker_result.disposition ==
              broker::BrokerCommandDisposition::Rejected)
         outcome = core::OrderCommandOutcome::BrokerRejected;
+    else if (broker_result.disposition ==
+             broker::BrokerCommandDisposition::PartiallyAccepted)
+        outcome = core::OrderCommandOutcome::PartiallyAccepted;
 
+    const bool recovery_required =
+        outcome == core::OrderCommandOutcome::Indeterminate;
     return complete({
         .request_id = context.request_id,
         .outcome = outcome,
@@ -304,6 +697,17 @@ core::OrderCommandResult OrderExecutionService::Execute(
         .http_status = broker_result.http_status,
         .message = std::move(broker_result.message),
         .raw_response = std::move(broker_result.raw_response),
+        .items = std::move(broker_result.items),
+        .reconciliation_required =
+            broker_result.reconciliation_required,
+        .recovery_state =
+            recovery_required
+                ? core::CommandRecoveryState::Pending
+                : core::CommandRecoveryState::NotRequired,
+        .recovery_message =
+            recovery_required
+                ? "Awaiting authoritative broker-state recovery"
+                : std::string{},
     });
 }
 

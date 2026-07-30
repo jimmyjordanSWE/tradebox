@@ -22,6 +22,7 @@ public:
 
 enum class BrokerCommandDisposition {
     Accepted,
+    PartiallyAccepted,
     Rejected,
     Indeterminate,
 };
@@ -33,6 +34,8 @@ struct BrokerCommandResult {
     std::string broker_order_id;
     std::string message;
     std::string raw_response;
+    std::vector<tradebox::core::CommandItemResult> items;
+    bool reconciliation_required = false;
 };
 
 class IOrderGateway {
@@ -46,6 +49,13 @@ public:
     virtual BrokerCommandResult ReplaceOrder(
         const std::string& order_id,
         const tradebox::core::ReplaceOrderRequest& request) = 0;
+    virtual BrokerCommandResult ClosePosition(
+        const std::string& symbol_or_asset_id,
+        const std::optional<tradebox::core::Decimal>& qty,
+        const std::optional<tradebox::core::Decimal>& percentage) = 0;
+    virtual BrokerCommandResult CloseAllPositions(
+        bool cancel_open_orders) = 0;
+    virtual BrokerCommandResult CancelAllOrders() = 0;
 };
 
 }  // namespace tradebox::broker

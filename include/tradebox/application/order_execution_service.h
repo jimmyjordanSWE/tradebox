@@ -2,6 +2,7 @@
 
 #include "tradebox/broker/gateway.h"
 #include "tradebox/core/interfaces.h"
+#include "tradebox/core/market_data.h"
 #include "tradebox/core/order_command.h"
 
 #include <condition_variable>
@@ -20,7 +21,9 @@ public:
     OrderExecutionService(core::ITradingCore& core,
                           broker::IOrderGateway& gateway,
                           core::IOrderCommandJournal& journal,
-                          core::IClock& clock);
+                          core::IClock& clock,
+                          const core::IMarketDataView*
+                              market_data = nullptr);
     ~OrderExecutionService();
 
     OrderExecutionService(const OrderExecutionService&) = delete;
@@ -38,16 +41,23 @@ private:
     };
 
     void WorkerLoop();
+    void RecoverCommands();
+    [[nodiscard]] std::optional<core::OrderCommandResult>
+    ResolveRecovery(
+        const core::RecoverableOrderCommand& command,
+        const core::CoreSnapshot& snapshot) const;
     core::OrderCommandResult Execute(core::NativeOrderCommand command);
 
     core::ITradingCore& core_;
     broker::IOrderGateway& gateway_;
     core::IOrderCommandJournal& journal_;
     core::IClock& clock_;
+    const core::IMarketDataView* market_data_;
     std::mutex mutex_;
     std::condition_variable ready_;
     std::queue<std::unique_ptr<PendingCommand>> pending_;
     bool stopping_ = false;
+    bool recovery_pending_ = false;
     std::thread worker_;
 };
 

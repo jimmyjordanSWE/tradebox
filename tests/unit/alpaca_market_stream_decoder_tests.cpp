@@ -55,6 +55,40 @@ TEST(AlpacaMarketStreamDecoder,
 }
 
 TEST(AlpacaMarketStreamDecoder,
+     DecodesTradingHaltsAndResumeStates) {
+    constexpr std::string_view frame = R"([
+      {"T":"s","S":"AAPL","sc":"H","sm":"Trading Halt",
+       "rc":"T12","rm":"Information requested by NASDAQ",
+       "z":"C","t":"2026-07-28T13:30:00Z"},
+      {"T":"s","S":"AAPL","sc":"T","sm":"Trading Resumption",
+       "rc":"","rm":"","z":"C",
+       "t":"2026-07-28T13:31:00Z"}
+    ])";
+
+    const auto decoded =
+        broker::alpaca::DecodeMarketFrame(
+            frame, 1234,
+            [](std::string_view) {
+                return std::string("asset-aapl");
+            });
+
+    ASSERT_EQ(decoded.items.size(), 2U);
+    const auto& halt =
+        std::get<core::TradingStatusReceived>(
+            *decoded.items[0].market_event);
+    EXPECT_EQ(halt.status.state,
+              core::SecurityTradingState::Halted);
+    EXPECT_TRUE(halt.status.BlocksNewOrders());
+    EXPECT_EQ(halt.status.reason_code, "T12");
+    const auto& resume =
+        std::get<core::TradingStatusReceived>(
+            *decoded.items[1].market_event);
+    EXPECT_EQ(resume.status.state,
+              core::SecurityTradingState::Trading);
+    EXPECT_FALSE(resume.status.BlocksNewOrders());
+}
+
+TEST(AlpacaMarketStreamDecoder,
      TreatsNullOptionalFeedMetadataAsEmpty) {
     constexpr std::string_view frame = R"([
       {"T":"t","S":"QQQ","i":"trade-1","x":null,

@@ -8,6 +8,72 @@ namespace {
 
 constexpr std::int64_t kDayNs =
     24LL * 60 * 60 * 1'000'000'000;
+constexpr std::int64_t kMinuteNs = 60LL * 1'000'000'000;
+
+struct MinuteUpdateRules {
+    bool price = false;
+    bool volume = false;
+};
+
+MinuteUpdateRules RulesFor(const MarketTrade& trade) {
+    const auto applies_to_tape =
+        [&](std::string_view tapes) {
+            return trade.tape.size() == 1 &&
+                   tapes.contains(trade.tape.front());
+        };
+    if (trade.conditions.empty())
+        return {.price = applies_to_tape("AB"),
+                .volume = applies_to_tape("AB")};
+
+    MinuteUpdateRules combined{
+        .price = true,
+        .volume = true,
+    };
+    for (const std::string& condition : trade.conditions) {
+        MinuteUpdateRules rule;
+        if (condition == "@") {
+            rule = {.price = applies_to_tape("CO"),
+                    .volume = applies_to_tape("CO")};
+        } else if (condition == "A" || condition == "D") {
+            rule = {.price = applies_to_tape("C"),
+                    .volume = applies_to_tape("C")};
+        } else if (condition == "B") {
+            rule = {.price = applies_to_tape("C"),
+                    .volume = applies_to_tape("ABC")};
+        } else if (condition == "E") {
+            rule = {.price = applies_to_tape("AB"),
+                    .volume = applies_to_tape("AB")};
+        } else if (condition == "F" || condition == "K" ||
+                   condition == "L" || condition == "O" ||
+                   condition == "X" || condition == "5" ||
+                   condition == "6") {
+            rule = {.price = applies_to_tape("ABC"),
+                    .volume = applies_to_tape("ABC")};
+        } else if (condition == "Y") {
+            rule = {.price = applies_to_tape("C"),
+                    .volume = applies_to_tape("C")};
+        } else if (condition == "T") {
+            rule = {.price = applies_to_tape("ABCO"),
+                    .volume = applies_to_tape("ABCO")};
+        } else if (condition == "C" || condition == "G" ||
+                   condition == "H" || condition == "I" ||
+                   condition == "N" || condition == "P" ||
+                   condition == "R" || condition == "U" ||
+                   condition == "V" || condition == "W" ||
+                   condition == "Z" || condition == "4" ||
+                   condition == "7") {
+            rule = {.price = false,
+                    .volume = applies_to_tape("ABCO")};
+        } else {
+            // M, Q, 9, and unknown conditions cannot safely
+            // contribute to an Alpaca-compatible minute projection.
+            rule = {};
+        }
+        combined.price = combined.price && rule.price;
+        combined.volume = combined.volume && rule.volume;
+    }
+    return combined;
+}
 
 std::string TradeIdentity(std::string_view trade_id,
                           std::int64_t event_time_ns) {
@@ -53,6 +119,9 @@ MarketDataSnapshot MarketDataStore::Snapshot(
         .stream_status = stream_status_,
         .trades_subscribed = trade_subscriptions_.contains(symbol),
         .quotes_subscribed = quote_subscriptions_.contains(symbol),
+        .statuses_subscribed =
+            status_subscriptions_.contains("*") ||
+            status_subscriptions_.contains(symbol),
         .status_message = status_message_,
     };
     const SymbolState* state = FindState(symbol);
@@ -63,7 +132,27 @@ MarketDataSnapshot MarketDataStore::Snapshot(
         trade_subscriptions_.contains(state->symbol);
     result.quotes_subscribed =
         quote_subscriptions_.contains(state->symbol);
+    result.statuses_subscribed =
+        status_subscriptions_.contains("*") ||
+        status_subscriptions_.contains(state->symbol);
+    if (const auto started =
+            trade_subscription_started_at_ns_.find(
+                state->symbol);
+        started !=
+        trade_subscription_started_at_ns_.end())
+        result.projection_started_at_ns = started->second;
     if (state->quote) result.latest_quote = *state->quote;
+    result.latest_price = state->latest_price;
+    if (state->trading_status)
+        result.trading_status = *state->trading_status;
+    for (const auto& minute : state->live_minutes) {
+        const auto& bar = minute.bar;
+        if (bar.start_ns == state->newest_minute_start_ns &&
+            !bar.open.IsZero() && !bar.high.IsZero() &&
+            !bar.low.IsZero() && !bar.close.IsZero() &&
+            !bar.volume.IsZero())
+            result.provisional_minute_bars.push_back(bar);
+    }
 
     std::vector<const TradeSlot*> retained;
     retained.reserve(state->retained_trade_count);
@@ -97,6 +186,9 @@ MarketDataDelta MarketDataStore::Delta(
         .stream_status = stream_status_,
         .trades_subscribed = trade_subscriptions_.contains(symbol),
         .quotes_subscribed = quote_subscriptions_.contains(symbol),
+        .statuses_subscribed =
+            status_subscriptions_.contains("*") ||
+            status_subscriptions_.contains(symbol),
         .status_message = status_message_,
     };
     const SymbolState* found = FindState(symbol);
@@ -108,6 +200,26 @@ MarketDataDelta MarketDataStore::Delta(
         trade_subscriptions_.contains(state.symbol);
     result.quotes_subscribed =
         quote_subscriptions_.contains(state.symbol);
+    result.statuses_subscribed =
+        status_subscriptions_.contains("*") ||
+        status_subscriptions_.contains(state.symbol);
+    if (const auto started =
+            trade_subscription_started_at_ns_.find(
+                state.symbol);
+        started !=
+        trade_subscription_started_at_ns_.end())
+        result.projection_started_at_ns = started->second;
+    result.latest_price = state.latest_price;
+    if (state.trading_status)
+        result.trading_status = *state.trading_status;
+    for (const auto& minute : state.live_minutes) {
+        const auto& bar = minute.bar;
+        if (bar.start_ns == state.newest_minute_start_ns &&
+            !bar.open.IsZero() && !bar.high.IsZero() &&
+            !bar.low.IsZero() && !bar.close.IsZero() &&
+            !bar.volume.IsZero())
+            result.provisional_minute_bars.push_back(bar);
+    }
     result.next_sequence = state.next_sequence - 1;
     result.last_received_at_ms = state.last_received_at_ms;
     if (state.events.Empty() || maximum_events == 0) return result;
@@ -206,9 +318,13 @@ void MarketDataStore::Apply(
     const TradeReceived& event) {
     SymbolState& state =
         StateFor(event.trade.instrument_id, event.trade.symbol);
+    const std::uint64_t receive_sequence =
+        next_receive_sequence_;
     const bool inserted =
         InsertTrade(state, owner, &event.trade);
     if (!inserted) return;
+    InsertLiveTrade(state, owner, event.trade,
+                    receive_sequence);
     state.last_received_at_ms =
         std::max(state.last_received_at_ms,
                  event.trade.received_at_ms);
@@ -222,8 +338,11 @@ void MarketDataStore::Apply(
     const TradeCanceled& event) {
     SymbolState& state =
         StateFor(event.instrument_id, event.symbol);
-    if (EraseTrade(
-            state, event.trade_id, event.event_time_ns))
+    const bool erased = EraseTrade(
+        state, event.trade_id, event.event_time_ns);
+    const bool erased_live = EraseLiveTrade(
+        state, event.trade_id, event.event_time_ns);
+    if (erased || erased_live)
         ++state.revision;
     AppendEvent(state, owner);
     RecordChange(state);
@@ -236,7 +355,13 @@ void MarketDataStore::Apply(
         StateFor(event.instrument_id, event.symbol);
     EraseTrade(state, event.original_trade_id,
                event.corrected_trade.event_time_ns);
+    EraseLiveTrade(state, event.original_trade_id,
+                   event.corrected_trade.event_time_ns);
+    const std::uint64_t receive_sequence =
+        next_receive_sequence_;
     InsertTrade(state, owner, &event.corrected_trade, true);
+    InsertLiveTrade(state, owner, event.corrected_trade,
+                    receive_sequence);
     state.last_received_at_ms =
         std::max(state.last_received_at_ms,
                  event.corrected_trade.received_at_ms);
@@ -246,19 +371,83 @@ void MarketDataStore::Apply(
 }
 
 void MarketDataStore::Apply(
+    const MarketDataEventPtr& owner,
+    const TradingStatusReceived& event) {
+    SymbolState& state =
+        StateFor(event.status.instrument_id,
+                 event.status.symbol);
+    if (state.trading_status &&
+        event.status.event_time_ns > 0 &&
+        state.trading_status->event_time_ns > 0 &&
+        event.status.event_time_ns <
+            state.trading_status->event_time_ns)
+        return;
+    state.trading_status_owner = owner;
+    state.trading_status = &event.status;
+    state.last_received_at_ms =
+        std::max(state.last_received_at_ms,
+                 event.status.received_at_ms);
+    ++state.revision;
+    AppendEvent(state, owner);
+    RecordChange(state);
+}
+
+void MarketDataStore::Apply(
     const MarketDataEventPtr&,
     const MarketStreamChanged& event) {
-    feed_ = event.feed;
+    const MarketDataFeed next_feed =
+        event.feed == MarketDataFeed::Unknown
+            ? feed_
+            : event.feed;
+    const bool feed_changed =
+        feed_ != MarketDataFeed::Unknown &&
+        next_feed != MarketDataFeed::Unknown &&
+        feed_ != next_feed;
+    const bool connection_boundary =
+        event.status == MarketStreamStatus::Connecting;
+    feed_ = next_feed;
     stream_status_ = event.status;
     status_message_ = event.message;
+    const auto previous_trade_subscriptions =
+        trade_subscriptions_;
     trade_subscriptions_.clear();
     quote_subscriptions_.clear();
+    status_subscriptions_.clear();
     trade_subscriptions_.insert(event.trade_symbols.begin(),
                                 event.trade_symbols.end());
     quote_subscriptions_.insert(event.quote_symbols.begin(),
                                 event.quote_symbols.end());
+    status_subscriptions_.insert(
+        event.status_symbols.begin(),
+        event.status_symbols.end());
+    std::erase_if(
+        trade_subscription_started_at_ns_,
+        [&](const auto& entry) {
+            return !trade_subscriptions_.contains(entry.first);
+        });
+    if (event.status == MarketStreamStatus::Subscribed) {
+        const std::int64_t started_at_ns =
+            event.received_at_ms > 0
+                ? event.received_at_ms * 1'000'000
+                : 0;
+        for (const std::string& symbol :
+             trade_subscriptions_) {
+            if (!previous_trade_subscriptions.contains(symbol) ||
+                feed_changed || connection_boundary)
+                trade_subscription_started_at_ns_
+                    .insert_or_assign(symbol, started_at_ns);
+        }
+    }
     for (auto& [symbol, state] : symbols_) {
         static_cast<void>(symbol);
+        if (feed_changed || connection_boundary) {
+            state->live_trades.clear();
+            state->live_trade_by_id.clear();
+            state->live_minutes.clear();
+            state->latest_price.reset();
+            state->newest_minute_start_ns = 0;
+            ++state->live_revision;
+        }
         ++state->revision;
         RecordChange(*state);
     }
@@ -400,6 +589,232 @@ bool MarketDataStore::EraseTrade(
     slot = {};
     --state.retained_trade_count;
     return true;
+}
+
+void MarketDataStore::InsertLiveTrade(
+    SymbolState& state, const MarketDataEventPtr& owner,
+    const MarketTrade& trade,
+    std::uint64_t receive_sequence) {
+    if (trade.event_time_ns <= 0) return;
+    const std::int64_t minute_start =
+        (trade.event_time_ns / kMinuteNs) * kMinuteNs;
+    if (minute_start > state.newest_minute_start_ns) {
+        state.newest_minute_start_ns = minute_start;
+        const std::int64_t oldest_retained =
+            minute_start - kMinuteNs;
+        std::erase_if(
+            state.live_trades,
+            [oldest_retained](const SymbolState::LiveTrade& item) {
+                return !item.active || !item.trade ||
+                       item.trade->event_time_ns < oldest_retained;
+            });
+        state.live_trade_by_id.clear();
+        for (std::size_t index = 0;
+             index < state.live_trades.size(); ++index) {
+            const auto& item = state.live_trades[index];
+            if (item.active && item.trade &&
+                !item.trade->trade_id.empty())
+                state.live_trade_by_id.emplace(
+                    item.trade->trade_id, index);
+        }
+        std::erase_if(
+            state.live_minutes,
+            [oldest_retained](const SymbolState::LiveMinute& item) {
+                return item.bar.start_ns < oldest_retained;
+            });
+    }
+    if (state.newest_minute_start_ns != 0 &&
+        minute_start < state.newest_minute_start_ns - kMinuteNs)
+        return;
+
+    if (!trade.trade_id.empty() &&
+        state.live_trade_by_id.contains(trade.trade_id))
+        return;
+    const std::size_t index = state.live_trades.size();
+    state.live_trades.push_back({
+        .owner = owner,
+        .trade = &trade,
+        .receive_sequence = receive_sequence,
+    });
+    if (!trade.trade_id.empty())
+        state.live_trade_by_id.emplace(trade.trade_id, index);
+    ApplyLiveContribution(state, trade, receive_sequence);
+    ++state.live_revision;
+    for (auto& minute : state.live_minutes)
+        minute.bar.revision = state.live_revision;
+}
+
+bool MarketDataStore::EraseLiveTrade(
+    SymbolState& state, std::string_view trade_id,
+    std::int64_t event_time_ns) {
+    if (trade_id.empty()) return false;
+    const auto indexed = state.live_trade_by_id.find(trade_id);
+    if (indexed == state.live_trade_by_id.end())
+        return false;
+    SymbolState::LiveTrade& item =
+        state.live_trades[indexed->second];
+    if (!item.active || !item.trade) return false;
+    const MarketTrade& trade = *item.trade;
+    if (event_time_ns > 0 && trade.event_time_ns > 0 &&
+        trade.event_time_ns / kDayNs !=
+            event_time_ns / kDayNs)
+        return false;
+
+    const MinuteUpdateRules rules = RulesFor(trade);
+    const std::int64_t minute_start =
+        (trade.event_time_ns / kMinuteNs) * kMinuteNs;
+    auto minute = std::ranges::find(
+        state.live_minutes, minute_start,
+        [](const SymbolState::LiveMinute& value) {
+            return value.bar.start_ns;
+        });
+    const bool rebuild_minute =
+        rules.price && minute != state.live_minutes.end() &&
+        (trade.price == minute->bar.high ||
+         trade.price == minute->bar.low ||
+         (trade.event_time_ns == minute->open_time_ns &&
+          item.receive_sequence == minute->open_sequence) ||
+         (trade.event_time_ns == minute->close_time_ns &&
+          item.receive_sequence == minute->close_sequence));
+    const bool rebuild_latest =
+        state.latest_price &&
+        state.latest_price->trade_id == trade_id;
+
+    item.active = false;
+    state.live_trade_by_id.erase(indexed);
+    if (rebuild_minute) {
+        RebuildLiveMinute(state, minute_start);
+    } else if (rules.volume &&
+               minute != state.live_minutes.end()) {
+        minute->bar.volume -= trade.size;
+        if (minute->bar.trade_count > 0)
+            --minute->bar.trade_count;
+    }
+    if (rebuild_latest) RebuildLatestPrice(state);
+    ++state.live_revision;
+    for (auto& value : state.live_minutes)
+        value.bar.revision = state.live_revision;
+    return true;
+}
+
+void MarketDataStore::ApplyLiveContribution(
+    SymbolState& state, const MarketTrade& trade,
+    std::uint64_t receive_sequence) {
+    const MinuteUpdateRules rules = RulesFor(trade);
+    if (rules.price) {
+        const bool newer =
+            !state.latest_price ||
+            trade.event_time_ns >
+                state.latest_price->event_time_ns ||
+            (trade.event_time_ns ==
+                 state.latest_price->event_time_ns &&
+             receive_sequence >
+                 state.latest_price->receive_sequence);
+        if (newer)
+            state.latest_price = CanonicalMarketPrice{
+                .price = trade.price,
+                .trade_id = trade.trade_id,
+                .broker_timestamp = trade.broker_timestamp,
+                .event_time_ns = trade.event_time_ns,
+                .received_at_ms = trade.received_at_ms,
+                .receive_sequence = receive_sequence,
+            };
+    }
+    if (!rules.price && !rules.volume) return;
+
+    const std::int64_t start =
+        (trade.event_time_ns / kMinuteNs) * kMinuteNs;
+    auto found = std::ranges::find(
+        state.live_minutes, start,
+        [](const SymbolState::LiveMinute& minute) {
+            return minute.bar.start_ns;
+        });
+    if (found == state.live_minutes.end()) {
+        state.live_minutes.push_back({
+            .bar = {.start_ns = start},
+        });
+        found = std::prev(state.live_minutes.end());
+    }
+    if (rules.price) {
+        const bool first_price = found->bar.open.IsZero();
+        const bool earlier =
+            first_price ||
+            trade.event_time_ns < found->open_time_ns ||
+            (trade.event_time_ns == found->open_time_ns &&
+             receive_sequence < found->open_sequence);
+        const bool later =
+            first_price ||
+            trade.event_time_ns > found->close_time_ns ||
+            (trade.event_time_ns == found->close_time_ns &&
+             receive_sequence > found->close_sequence);
+        if (earlier) {
+            found->bar.open = trade.price;
+            found->open_time_ns = trade.event_time_ns;
+            found->open_sequence = receive_sequence;
+        }
+        if (first_price || trade.price > found->bar.high)
+            found->bar.high = trade.price;
+        if (first_price || trade.price < found->bar.low)
+            found->bar.low = trade.price;
+        if (later) {
+            found->bar.close = trade.price;
+            found->close_time_ns = trade.event_time_ns;
+            found->close_sequence = receive_sequence;
+        }
+    }
+    if (rules.volume) {
+        found->bar.volume += trade.size;
+        ++found->bar.trade_count;
+    }
+}
+
+void MarketDataStore::RebuildLiveMinute(
+    SymbolState& state, std::int64_t minute_start_ns) {
+    auto minute = std::ranges::find(
+        state.live_minutes, minute_start_ns,
+        [](const SymbolState::LiveMinute& value) {
+            return value.bar.start_ns;
+        });
+    if (minute == state.live_minutes.end()) return;
+    *minute = {
+        .bar = {.start_ns = minute_start_ns},
+    };
+    for (const SymbolState::LiveTrade& item :
+         state.live_trades) {
+        if (!item.active || !item.trade) continue;
+        const std::int64_t start =
+            (item.trade->event_time_ns / kMinuteNs) * kMinuteNs;
+        if (start == minute_start_ns)
+            ApplyLiveContribution(
+                state, *item.trade, item.receive_sequence);
+    }
+}
+
+void MarketDataStore::RebuildLatestPrice(SymbolState& state) {
+    state.latest_price.reset();
+    for (const SymbolState::LiveTrade& item :
+         state.live_trades) {
+        if (!item.active || !item.trade) continue;
+        const MarketTrade& trade = *item.trade;
+        if (!RulesFor(trade).price) continue;
+        const bool newer =
+            !state.latest_price ||
+            trade.event_time_ns >
+                state.latest_price->event_time_ns ||
+            (trade.event_time_ns ==
+                 state.latest_price->event_time_ns &&
+             item.receive_sequence >
+                 state.latest_price->receive_sequence);
+        if (newer)
+            state.latest_price = CanonicalMarketPrice{
+                .price = trade.price,
+                .trade_id = trade.trade_id,
+                .broker_timestamp = trade.broker_timestamp,
+                .event_time_ns = trade.event_time_ns,
+                .received_at_ms = trade.received_at_ms,
+                .receive_sequence = item.receive_sequence,
+            };
+    }
 }
 
 void MarketDataStore::AppendEvent(

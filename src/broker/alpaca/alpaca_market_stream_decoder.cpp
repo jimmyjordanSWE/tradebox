@@ -118,6 +118,17 @@ std::vector<std::string> StringArray(
     return result;
 }
 
+tradebox::core::SecurityTradingState TradingState(
+    std::string_view code) {
+    if (code == "2" || code == "H")
+        return tradebox::core::SecurityTradingState::Halted;
+    if (code == "P")
+        return tradebox::core::SecurityTradingState::Paused;
+    if (code == "3" || code == "Q" || code == "T")
+        return tradebox::core::SecurityTradingState::Trading;
+    return tradebox::core::SecurityTradingState::Unknown;
+}
+
 tradebox::core::Decimal Decimal(
     const json& object, const char* key) {
     if (!object.contains(key) || object[key].is_null())
@@ -175,12 +186,13 @@ DecodedMarketFrame DecodeMarketFrame(
                 .type = StreamControlType::Subscription,
                 .trade_symbols = StringArray(item, "trades"),
                 .quote_symbols = StringArray(item, "quotes"),
+                .status_symbols = StringArray(item, "statuses"),
             });
             continue;
         }
         if (kind != "t" && kind != "q" && kind != "x" &&
             kind != "c" && kind != "b" &&
-            kind != "d" && kind != "u") {
+            kind != "d" && kind != "u" && kind != "s") {
             ++result.ignored_items;
             continue;
         }
@@ -204,7 +216,32 @@ DecodedMarketFrame DecodeMarketFrame(
 
         const std::string instrument_id =
             resolve_instrument(decoded.symbol);
-        if (kind == "q") {
+        if (kind == "s") {
+            const std::string status_code =
+                String(item, "sc");
+            decoded.source_event_id =
+                decoded.symbol + ":s:" +
+                std::to_string(decoded.event_time_ns) + ":" +
+                status_code + ":" + String(item, "rc");
+            decoded.market_event =
+                tradebox::core::ShareMarketDataEvent(
+                    tradebox::core::TradingStatusReceived{
+                        .status = {
+                            .instrument_id = instrument_id,
+                            .symbol = decoded.symbol,
+                            .state = TradingState(status_code),
+                            .status_code = status_code,
+                            .status_message = String(item, "sm"),
+                            .reason_code = String(item, "rc"),
+                            .reason_message = String(item, "rm"),
+                            .tape = String(item, "z"),
+                            .broker_timestamp = broker_timestamp,
+                            .event_time_ns =
+                                decoded.event_time_ns,
+                            .received_at_ms = received_at_ms,
+                        },
+                    });
+        } else if (kind == "q") {
             decoded.market_event =
                 tradebox::core::ShareMarketDataEvent(
                     tradebox::core::QuoteReceived{

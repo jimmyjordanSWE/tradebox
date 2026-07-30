@@ -2,6 +2,48 @@
 
 #include <gtest/gtest.h>
 
+TEST(UiOperationalStatus, ExposesTypedMachineStateSeparatelyFromMessage) {
+    UiEvent event;
+    event.type = UiEventType::Status;
+    event.message = "Any human-readable wording";
+    event.operational_component =
+        OperationalComponent::AccountStream;
+    event.operational_state = OperationalState::Disconnected;
+    event.operational_reason =
+        OperationalReason::UnexpectedDisconnect;
+    event.operational_severity = OperationalSeverity::Critical;
+
+    EXPECT_STREQ(
+        OperationalComponentLabel(event.operational_component),
+        "account_stream");
+    EXPECT_STREQ(
+        OperationalStateLabel(event.operational_state),
+        "disconnected");
+    EXPECT_STREQ(
+        OperationalReasonLabel(event.operational_reason),
+        "unexpected_disconnect");
+    EXPECT_STREQ(
+        OperationalSeverityLabel(event.operational_severity),
+        "critical");
+    EXPECT_STREQ(
+        OperationalComponentLabel(OperationalComponent::Persistence),
+        "persistence");
+    EXPECT_STREQ(
+        OperationalReasonLabel(OperationalReason::QueueOverload),
+        "queue_overload");
+    EXPECT_STREQ(
+        OperationalReasonLabel(OperationalReason::PersistenceFailure),
+        "persistence_failure");
+    EXPECT_STREQ(
+        OperationalReasonLabel(
+            OperationalReason::SecurityPolicyFailure),
+        "security_policy_failure");
+    EXPECT_STREQ(
+        OperationalReasonLabel(
+            OperationalReason::PayloadLimitExceeded),
+        "payload_limit_exceeded");
+}
+
 TEST(UiOrderEntry, ValidatesRequiredPricesAndAmount) {
     OrderEntryDraft draft;
     draft.amount.clear();

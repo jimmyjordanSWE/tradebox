@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tradebox/core/interfaces.h"
+#include "tradebox/core/market_data.h"
 
 #include <mutex>
 #include <unordered_map>
@@ -18,6 +19,8 @@ public:
         std::uint64_t revision) const override;
     std::expected<CommandReceipt, CoreError> Submit(Command command) override;
     std::expected<void, CoreError> Ingest(BrokerEvent event) override;
+    void ApplyMarketData(
+        const MarketDataSnapshot& market) override;
 
 private:
     std::expected<void, CoreError> ApplyOrdersSnapshot(

@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace tradebox::core {
 
@@ -35,8 +36,26 @@ struct ReplaceOrderCommand {
     ReplaceOrderRequest replacement;
 };
 
+struct ClosePositionCommand {
+    OrderCommandContext context;
+    std::string symbol_or_asset_id;
+    std::optional<Decimal> qty;
+    std::optional<Decimal> percentage;
+};
+
+struct CloseAllPositionsCommand {
+    OrderCommandContext context;
+    bool cancel_open_orders = false;
+};
+
+struct CancelAllOrdersCommand {
+    OrderCommandContext context;
+};
+
 using NativeOrderCommand =
-    std::variant<PlaceOrderCommand, CancelOrderCommand, ReplaceOrderCommand>;
+    std::variant<PlaceOrderCommand, CancelOrderCommand,
+                 ReplaceOrderCommand, ClosePositionCommand,
+                 CloseAllPositionsCommand, CancelAllOrdersCommand>;
 
 enum class OrderCommandOutcome {
     ValidationRejected,
@@ -46,6 +65,26 @@ enum class OrderCommandOutcome {
     Indeterminate,
     Duplicate,
     ServiceStopped,
+    PartiallyAccepted,
+    NotDispatched,
+    RecoveryRejected,
+};
+
+enum class CommandRecoveryState {
+    NotRequired,
+    Pending,
+    Resolved,
+    Rejected,
+    OperatorAttention,
+};
+
+struct CommandItemResult {
+    std::string id;
+    std::string symbol;
+    std::uint32_t http_status = 0;
+    bool accepted = false;
+    std::string message;
+    std::string raw_response;
 };
 
 struct OrderCommandResult {
@@ -55,13 +94,25 @@ struct OrderCommandResult {
     std::uint32_t http_status = 0;
     std::string message;
     std::string raw_response;
+    std::vector<CommandItemResult> items;
+    bool reconciliation_required = false;
+    CommandRecoveryState recovery_state =
+        CommandRecoveryState::NotRequired;
+    std::string recovery_message;
 
     [[nodiscard]] bool AcceptedByBroker() const {
         return outcome == OrderCommandOutcome::BrokerAccepted;
     }
 };
 
-enum class OrderCommandKind { Place, Cancel, Replace };
+enum class OrderCommandKind {
+    Place,
+    Cancel,
+    Replace,
+    ClosePosition,
+    CloseAllPositions,
+    CancelAllOrders,
+};
 
 struct OrderCommandRecord {
     std::string request_id;
@@ -84,6 +135,22 @@ struct ReservationResult {
 struct OrderCommandLookup {
     bool exists = false;
     std::optional<OrderCommandResult> terminal_result;
+    CommandRecoveryState recovery_state =
+        CommandRecoveryState::NotRequired;
+    std::string recovery_message;
+};
+
+struct RecoverableOrderCommand {
+    OrderCommandRecord record;
+    std::string target_order_id;
+    std::string symbol_or_asset_id;
+    std::optional<Decimal> qty;
+    std::optional<Decimal> percentage;
+    bool cancel_open_orders = false;
+    bool dispatch_started = false;
+    CommandRecoveryState recovery_state =
+        CommandRecoveryState::Pending;
+    std::string recovery_message;
 };
 
 class IOrderCommandJournal {
@@ -94,6 +161,12 @@ public:
         const OrderCommandRecord& record,
         const NativeOrderCommand& command) = 0;
     virtual std::expected<void, std::string> Complete(
+        const OrderCommandResult& result) = 0;
+    virtual std::expected<void, std::string> MarkDispatchStarted(
+        const std::string& request_id) = 0;
+    virtual std::expected<std::vector<RecoverableOrderCommand>, std::string>
+    Recoverable() = 0;
+    virtual std::expected<void, std::string> ResolveRecovery(
         const OrderCommandResult& result) = 0;
     virtual std::expected<OrderCommandLookup, std::string>
     Lookup(const std::string& request_id) = 0;

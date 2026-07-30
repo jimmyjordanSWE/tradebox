@@ -121,12 +121,11 @@ NO_SNAPSHOT -> SNAPSHOT_CURRENT -> STREAM_DIRTY -> RECONCILING
 The fill event may update a provisional quantity immediately, but the UI must
 label average price, cost basis, buying power, and complete position data as
 `PENDING_RECONCILIATION` until `/v2/positions` and `/v2/account` succeed.
-There is no need to poll every two seconds. Use immediate reconciliation after
-fills/corrections/busts, after reconnect, and a one-second safety reconciliation
-while actively trading or while the stream is unavailable. When the account is
-idle, this can be relaxed to 30–60 seconds with backoff on errors. Market-data
-ticks update only mark-to-market fields; they do not change position quantity
-or cost basis.
+There is no need for continuous account polling. Use event-driven
+reconciliation after fills, corrections, busts, reconnects, command outcomes,
+and detected stream gaps. A disconnected or unhealthy account stream is itself
+a surfaced safety condition. Market-data ticks update only mark-to-market
+fields; they do not change position quantity or cost basis.
 
 An empty successful `/v2/positions` response is a valid current snapshot and
 must replace the prior set. A failed or partial response must never erase the
@@ -152,34 +151,9 @@ Broker decimal strings must not pass through `double` or `std::stod`.
   feed order, position, risk, or buying-power decisions without exact conversion
   and explicit rounding policy.
 
-## Current implementation findings
+## Regression test matrix
 
-The current app is a read-only monitoring scaffold, not yet an order execution
-system. It currently:
-
-- stores all account, position, order, and bar numerics as `double`;
-- reloads all orders through REST after a dirty flag instead of applying stream
-  deltas;
-- has no account-stream reconnect loop or generation fencing;
-- uses a one-second position safety check and a one-second full-order fallback
-  only while the trading stream is unavailable;
-- refreshes the account snapshot every five seconds for buying power, cash,
-  equity, and account restrictions;
-- does not carry the order/event payload through `UiEvent` to a state reducer;
-- has no fill idempotency ledger, position reconciliation barrier, durable order
-  command journal, or command/result correlation;
-- uses the initial REST load timestamp as the order snapshot age even after
-  stream updates, which is acceptable only when clearly labelled as snapshot
-  age and not stream freshness.
-
-Until the reducer, reconciliation barrier, exact numeric model, and reconnect
-logic are implemented and tested with replayed event sequences, the application
-must remain read-only. These are correctness prerequisites for adding order
-submission, cancel, or replace controls.
-
-## Required test matrix
-
-Replay tests must cover: duplicate fill; out-of-order partial fill; fill during
+Replay tests cover: duplicate fill; out-of-order partial fill; fill during
 cancel; cancel rejection; replace success; replace rejection; old order filled
 while replacement is pending; done-for-day followed by next-day new; rejected
 order; empty position snapshot; snapshot arriving before/after buffered fill;

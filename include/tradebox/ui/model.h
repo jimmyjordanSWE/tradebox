@@ -40,6 +40,52 @@ enum class UiEventType {
     AssetCatalogReady
 };
 
+enum class OperationalComponent {
+    None,
+    Account,
+    AccountStream,
+    MarketDataStream,
+    Persistence,
+};
+
+enum class OperationalState {
+    None,
+    Connecting,
+    Reconnecting,
+    Authenticated,
+    Subscribed,
+    Degraded,
+    Disconnected,
+    Failed,
+};
+
+enum class OperationalReason {
+    None,
+    TransportFailure,
+    UpgradeFailure,
+    AuthenticationFailure,
+    SubscriptionMismatch,
+    UnexpectedDisconnect,
+    SilenceTimeout,
+    QueueOverload,
+    PersistenceFailure,
+    SecurityPolicyFailure,
+    PayloadLimitExceeded,
+};
+
+enum class OperationalSeverity {
+    Informational,
+    Warning,
+    Critical,
+};
+
+[[nodiscard]] const char* OperationalComponentLabel(
+    OperationalComponent component);
+[[nodiscard]] const char* OperationalStateLabel(OperationalState state);
+[[nodiscard]] const char* OperationalReasonLabel(OperationalReason reason);
+[[nodiscard]] const char* OperationalSeverityLabel(
+    OperationalSeverity severity);
+
 struct OrderEntryDraft {
     std::string name = "Untitled order";
     std::string symbol = "AMD";
@@ -84,6 +130,14 @@ struct UiEvent {
     tradebox::core::OrderCommandResult command_result;
     std::string timeframe = "1Day";
     std::vector<tradebox::core::TradableAsset> assets;
+    OperationalComponent operational_component =
+        OperationalComponent::None;
+    OperationalState operational_state = OperationalState::None;
+    OperationalReason operational_reason = OperationalReason::None;
+    OperationalSeverity operational_severity =
+        OperationalSeverity::Informational;
+    std::uint32_t retry_attempt = 0;
+    std::int64_t retry_in_ms = 0;
 };
 
 class UiEventQueue {

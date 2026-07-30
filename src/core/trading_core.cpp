@@ -6,6 +6,16 @@
 #include <utility>
 
 namespace tradebox::core {
+namespace {
+
+Decimal Absolute(const Decimal& value) {
+    std::string text = value.ToString();
+    if (!text.empty() && text.front() == '-')
+        text.erase(text.begin());
+    return *Decimal::Parse(text);
+}
+
+}  // namespace
 
 TradingCore::TradingCore(IEventJournal& journal, IClock& clock)
     : journal_(journal), clock_(clock) {}
@@ -150,6 +160,14 @@ std::expected<void, CoreError> TradingCore::Ingest(BrokerEvent event) {
                     });
                 }
                 position.provisional = false;
+                position.valuation_current =
+                    snapshot->received_at_ms > 0;
+                position.valuation_from_market_stream = false;
+                position.valuation_feed =
+                    MarketDataFeed::Unknown;
+                position.valuation_event_time_ns = 0;
+                position.valuation_received_at_ms =
+                    snapshot->received_at_ms;
                 replacement.insert_or_assign(position.asset_id,
                                              std::move(position));
             }
@@ -240,6 +258,141 @@ std::expected<void, CoreError> TradingCore::Ingest(BrokerEvent event) {
     }
 
     return {};
+}
+
+void TradingCore::ApplyMarketData(
+    const MarketDataSnapshot& market) {
+    std::scoped_lock lock(mutex_);
+    PositionState* position = nullptr;
+    if (!market.instrument_id.empty()) {
+        const auto found =
+            positions_by_asset_id_.find(market.instrument_id);
+        if (found != positions_by_asset_id_.end())
+            position = &found->second;
+    } else if (!market.symbol.empty()) {
+        const auto found = std::ranges::find_if(
+            positions_by_asset_id_,
+            [&market](const auto& entry) {
+                return entry.second.symbol == market.symbol;
+            });
+        if (found != positions_by_asset_id_.end())
+            position = &found->second;
+    }
+    if (!position) return;
+
+    const bool eligible =
+        market.stream_status == MarketStreamStatus::Subscribed &&
+        market.trades_subscribed && market.latest_price &&
+        !market.latest_price->price.IsZero() &&
+        !position->qty.IsZero() &&
+        !position->avg_entry_price.IsZero();
+    const bool wrong_feed =
+        eligible && position->valuation_current &&
+        position->valuation_from_market_stream &&
+        position->valuation_feed !=
+            MarketDataFeed::Unknown &&
+        market.feed != MarketDataFeed::Unknown &&
+        position->valuation_feed != market.feed;
+    if (wrong_feed) {
+        position->valuation_current = false;
+        PublishPositions();
+        ++state_.revision;
+        return;
+    }
+    if (!eligible) {
+        bool changed = false;
+        const bool stream_not_current =
+            market.stream_status ==
+                MarketStreamStatus::Disconnected ||
+            market.stream_status ==
+                MarketStreamStatus::Connecting ||
+            market.stream_status ==
+                MarketStreamStatus::Authenticated ||
+            market.stream_status == MarketStreamStatus::Stale ||
+            market.stream_status == MarketStreamStatus::Error;
+        if (position->valuation_current &&
+            stream_not_current) {
+            position->valuation_current = false;
+            changed = true;
+        }
+        if (market.feed != MarketDataFeed::Unknown &&
+            (market.stream_status ==
+                 MarketStreamStatus::Connecting ||
+             market.stream_status ==
+                 MarketStreamStatus::Authenticated ||
+             market.stream_status ==
+                 MarketStreamStatus::Subscribed) &&
+            position->valuation_feed != market.feed) {
+            position->valuation_feed = market.feed;
+            changed = true;
+        }
+        if (changed) {
+            PublishPositions();
+            ++state_.revision;
+        }
+        return;
+    }
+
+    const CanonicalMarketPrice& latest = *market.latest_price;
+    if (position->valuation_current &&
+        !position->valuation_from_market_stream &&
+        position->valuation_received_at_ms >
+            latest.received_at_ms)
+        return;
+    if (position->valuation_from_market_stream &&
+        position->valuation_event_time_ns >
+            latest.event_time_ns)
+        return;
+    if (position->valuation_current &&
+        position->valuation_from_market_stream &&
+        position->valuation_event_time_ns ==
+            latest.event_time_ns &&
+        position->current_price == latest.price)
+        return;
+
+    const Decimal market_value =
+        position->qty * latest.price;
+    const Decimal unrealized =
+        (latest.price - position->avg_entry_price) *
+        position->qty;
+    const Decimal basis =
+        Absolute(position->avg_entry_price *
+                 position->qty);
+    const Decimal intraday =
+        position->lastday_price.IsZero()
+            ? Decimal::Zero()
+            : (latest.price - position->lastday_price) *
+                  position->qty;
+    const Decimal intraday_basis =
+        Absolute(position->lastday_price *
+                 position->qty);
+
+    position->current_price = latest.price;
+    position->market_value = market_value;
+    position->unrealized_pl = unrealized;
+    position->unrealized_plpc =
+        basis.IsZero()
+            ? Decimal::Zero()
+            : *unrealized.Divide(basis);
+    position->unrealized_intraday_pl = intraday;
+    position->unrealized_intraday_plpc =
+        intraday_basis.IsZero()
+            ? Decimal::Zero()
+            : *intraday.Divide(intraday_basis);
+    position->change_today =
+        position->lastday_price.IsZero()
+            ? Decimal::Zero()
+            : *(latest.price - position->lastday_price)
+                   .Divide(position->lastday_price);
+    position->valuation_current = true;
+    position->valuation_from_market_stream = true;
+    position->valuation_feed = market.feed;
+    position->valuation_event_time_ns =
+        latest.event_time_ns;
+    position->valuation_received_at_ms =
+        latest.received_at_ms;
+    PublishPositions();
+    ++state_.revision;
 }
 
 void TradingCore::RefreshSafetyStatus() {

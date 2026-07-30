@@ -16,6 +16,69 @@ std::optional<Decimal> Parse(const std::string& value) {
 }
 }
 
+const char* OperationalComponentLabel(OperationalComponent component) {
+    switch (component) {
+    case OperationalComponent::None: return "none";
+    case OperationalComponent::Account: return "account";
+    case OperationalComponent::AccountStream: return "account_stream";
+    case OperationalComponent::MarketDataStream:
+        return "market_data_stream";
+    case OperationalComponent::Persistence:
+        return "persistence";
+    }
+    return "none";
+}
+
+const char* OperationalStateLabel(OperationalState state) {
+    switch (state) {
+    case OperationalState::None: return "none";
+    case OperationalState::Connecting: return "connecting";
+    case OperationalState::Reconnecting: return "reconnecting";
+    case OperationalState::Authenticated: return "authenticated";
+    case OperationalState::Subscribed: return "subscribed";
+    case OperationalState::Degraded: return "degraded";
+    case OperationalState::Disconnected: return "disconnected";
+    case OperationalState::Failed: return "failed";
+    }
+    return "none";
+}
+
+const char* OperationalReasonLabel(OperationalReason reason) {
+    switch (reason) {
+    case OperationalReason::None: return "none";
+    case OperationalReason::TransportFailure:
+        return "transport_failure";
+    case OperationalReason::UpgradeFailure:
+        return "upgrade_failure";
+    case OperationalReason::AuthenticationFailure:
+        return "authentication_failure";
+    case OperationalReason::SubscriptionMismatch:
+        return "subscription_mismatch";
+    case OperationalReason::UnexpectedDisconnect:
+        return "unexpected_disconnect";
+    case OperationalReason::SilenceTimeout:
+        return "silence_timeout";
+    case OperationalReason::QueueOverload:
+        return "queue_overload";
+    case OperationalReason::PersistenceFailure:
+        return "persistence_failure";
+    case OperationalReason::SecurityPolicyFailure:
+        return "security_policy_failure";
+    case OperationalReason::PayloadLimitExceeded:
+        return "payload_limit_exceeded";
+    }
+    return "none";
+}
+
+const char* OperationalSeverityLabel(OperationalSeverity severity) {
+    switch (severity) {
+    case OperationalSeverity::Informational: return "informational";
+    case OperationalSeverity::Warning: return "warning";
+    case OperationalSeverity::Critical: return "critical";
+    }
+    return "informational";
+}
+
 std::vector<UiValidationMessage> ValidateOrderEntry(
     const OrderEntryDraft& draft) {
     std::vector<UiValidationMessage> result;

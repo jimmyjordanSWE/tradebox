@@ -8,6 +8,8 @@
 
 namespace tradebox::core {
 
+struct MarketDataSnapshot;
+
 class IClock {
 public:
     virtual ~IClock() = default;
@@ -31,6 +33,8 @@ public:
     virtual std::expected<CommandReceipt, CoreError> Submit(
         Command command) = 0;
     virtual std::expected<void, CoreError> Ingest(BrokerEvent event) = 0;
+    virtual void ApplyMarketData(
+        const MarketDataSnapshot& market) = 0;
 };
 
 }  // namespace tradebox::core

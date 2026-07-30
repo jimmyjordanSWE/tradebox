@@ -5,6 +5,7 @@
 #include <sqlite3.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <map>
@@ -33,6 +34,7 @@ std::string FeedName(tradebox::core::MarketDataFeed feed) {
 
 struct MarketEventMetadata {
     std::string kind;
+    std::string instrument_id;
     std::string symbol;
     std::int64_t event_time_ns = 0;
     std::int64_t received_at_ms = 0;
@@ -45,25 +47,27 @@ MarketEventMetadata Metadata(
             using T = std::decay_t<decltype(typed)>;
             if constexpr (std::is_same_v<
                               T, tradebox::core::QuoteReceived>) {
-                return {"q", typed.quote.symbol,
+                return {"q", typed.quote.instrument_id,
+                        typed.quote.symbol,
                         typed.quote.event_time_ns,
                         typed.quote.received_at_ms};
             } else if constexpr (std::is_same_v<
                                      T,
                                      tradebox::core::TradeReceived>) {
-                return {"t", typed.trade.symbol,
+                return {"t", typed.trade.instrument_id,
+                        typed.trade.symbol,
                         typed.trade.event_time_ns,
                         typed.trade.received_at_ms};
             } else if constexpr (std::is_same_v<
                                      T,
                                      tradebox::core::TradeCanceled>) {
-                return {"x", typed.symbol,
+                return {"x", typed.instrument_id, typed.symbol,
                         typed.event_time_ns,
                         typed.received_at_ms};
             } else if constexpr (std::is_same_v<
                                      T,
                                      tradebox::core::TradeCorrected>) {
-                return {"c", typed.symbol,
+                return {"c", typed.instrument_id, typed.symbol,
                         typed.corrected_trade.event_time_ns,
                         typed.corrected_trade.received_at_ms};
             } else {
@@ -254,16 +258,76 @@ std::string SerializeCommand(
                                             tradebox::core::CancelOrderCommand>) {
                        value["kind"] = "cancel";
                        value["order_id"] = typed.order_id;
-                   } else {
+                   } else if constexpr (std::is_same_v<
+                                            T,
+                                            tradebox::core::ReplaceOrderCommand>) {
                        value["kind"] = "replace";
                        value["order_id"] = typed.order_id;
                        value["replacement"] =
                            ReplacementJson(typed.replacement);
+                   } else if constexpr (std::is_same_v<
+                                            T,
+                                            tradebox::core::ClosePositionCommand>) {
+                       value["kind"] = "close_position";
+                       value["symbol_or_asset_id"] =
+                           typed.symbol_or_asset_id;
+                       if (typed.qty)
+                           value["qty"] = typed.qty->ToString();
+                       if (typed.percentage)
+                           value["percentage"] =
+                               typed.percentage->ToString();
+                   } else if constexpr (std::is_same_v<
+                                            T,
+                                            tradebox::core::CloseAllPositionsCommand>) {
+                       value["kind"] = "close_all_positions";
+                       value["cancel_open_orders"] =
+                           typed.cancel_open_orders;
+                   } else {
+                       value["kind"] = "cancel_all_orders";
                    }
                    return value;
                },
                command)
         .dump();
+}
+
+std::string SerializeCommandItems(
+    const std::vector<tradebox::core::CommandItemResult>& items) {
+    nlohmann::json value = nlohmann::json::array();
+    for (const auto& item : items) {
+        value.push_back({
+            {"id", item.id},
+            {"symbol", item.symbol},
+            {"http_status", item.http_status},
+            {"accepted", item.accepted},
+            {"message", item.message},
+            {"raw_response", item.raw_response},
+        });
+    }
+    return value.dump();
+}
+
+std::vector<tradebox::core::CommandItemResult> ParseCommandItems(
+    const std::string& text) {
+    std::vector<tradebox::core::CommandItemResult> items;
+    if (text.empty()) return items;
+    try {
+        const auto value = nlohmann::json::parse(text);
+        if (!value.is_array()) return items;
+        for (const auto& entry : value) {
+            if (!entry.is_object()) continue;
+            items.push_back({
+                .id = entry.value("id", ""),
+                .symbol = entry.value("symbol", ""),
+                .http_status = entry.value("http_status", 0U),
+                .accepted = entry.value("accepted", false),
+                .message = entry.value("message", ""),
+                .raw_response = entry.value("raw_response", ""),
+            });
+        }
+    } catch (const std::exception&) {
+    }
+    return items;
 }
 
 }  // namespace
@@ -406,17 +470,55 @@ CREATE TABLE IF NOT EXISTS order_commands (
   connection_generation INTEGER NOT NULL,
   client_order_id TEXT,
   created_at_ms INTEGER NOT NULL,
+  dispatch_started_at_ms INTEGER,
   completed_at_ms INTEGER,
   outcome INTEGER,
   broker_order_id TEXT,
   http_status INTEGER,
   message TEXT,
   raw_response TEXT,
+  items_json TEXT NOT NULL DEFAULT '[]',
+  reconciliation_required INTEGER NOT NULL DEFAULT 0,
+  recovery_state INTEGER NOT NULL DEFAULT 0,
+  recovery_message TEXT NOT NULL DEFAULT '',
   payload_json TEXT NOT NULL,
   schema_version INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS order_commands_account_time
   ON order_commands(account_id, created_at_ms);
+CREATE TABLE IF NOT EXISTS account_activities (
+  account_id TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  activity_type TEXT NOT NULL,
+  activity_subtype TEXT NOT NULL,
+  execution_type TEXT NOT NULL,
+  status TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  cusip TEXT NOT NULL,
+  side TEXT NOT NULL,
+  order_id TEXT NOT NULL,
+  currency TEXT NOT NULL,
+  occurred_at TEXT NOT NULL,
+  settlement_date TEXT NOT NULL,
+  occurred_at_ms INTEGER NOT NULL,
+  qty_text TEXT,
+  price_text TEXT,
+  cumulative_qty_text TEXT,
+  leaves_qty_text TEXT,
+  net_amount_text TEXT,
+  per_share_amount_text TEXT,
+  fill_reconciliation INTEGER NOT NULL,
+  raw_payload TEXT NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1,
+  recorded_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(account_id, provider_id)
+);
+CREATE INDEX IF NOT EXISTS account_activities_time
+  ON account_activities(account_id, occurred_at_ms DESC, provider_id DESC);
+CREATE INDEX IF NOT EXISTS account_activities_order
+  ON account_activities(account_id, order_id);
+CREATE INDEX IF NOT EXISTS account_activities_symbol
+  ON account_activities(account_id, symbol, occurred_at_ms DESC);
 CREATE TABLE IF NOT EXISTS tags (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   namespace TEXT NOT NULL DEFAULT 'user',
@@ -443,6 +545,26 @@ SELECT
 FROM market_events;
 )SQL";
     if (!Execute(schema, &error)) return false;
+    Execute(
+        "ALTER TABLE order_commands ADD COLUMN items_json TEXT NOT NULL "
+        "DEFAULT '[]'",
+        nullptr);
+    Execute(
+        "ALTER TABLE order_commands ADD COLUMN reconciliation_required "
+        "INTEGER NOT NULL DEFAULT 0",
+        nullptr);
+    Execute(
+        "ALTER TABLE order_commands ADD COLUMN dispatch_started_at_ms "
+        "INTEGER",
+        nullptr);
+    Execute(
+        "ALTER TABLE order_commands ADD COLUMN recovery_state "
+        "INTEGER NOT NULL DEFAULT 0",
+        nullptr);
+    Execute(
+        "ALTER TABLE order_commands ADD COLUMN recovery_message "
+        "TEXT NOT NULL DEFAULT ''",
+        nullptr);
     const int market_rc = sqlite3_open_v2(
         (data_directory_ / L"market_data.db").string().c_str(), &market_db_,
         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
@@ -476,6 +598,7 @@ CREATE TABLE IF NOT EXISTS market_tick_events (
   feed TEXT NOT NULL,
   source_event_id TEXT,
   kind TEXT NOT NULL,
+  instrument_id TEXT NOT NULL DEFAULT '',
   symbol TEXT NOT NULL,
   event_time_ns INTEGER NOT NULL,
   received_at_ms INTEGER NOT NULL,
@@ -483,13 +606,13 @@ CREATE TABLE IF NOT EXISTS market_tick_events (
   UNIQUE(feed, source_event_id, kind)
 );
 CREATE INDEX IF NOT EXISTS market_tick_events_series
-  ON market_tick_events(symbol, event_time_ns, feed, kind);
+  ON market_tick_events(instrument_id, event_time_ns, feed, kind);
 CREATE TABLE IF NOT EXISTS typed_market_ticks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   feed TEXT NOT NULL,
   source_event_id TEXT,
   kind TEXT NOT NULL,
-  instrument_id TEXT,
+  instrument_id TEXT NOT NULL DEFAULT '',
   symbol TEXT NOT NULL,
   event_time_ns INTEGER NOT NULL,
   received_at_ms INTEGER NOT NULL,
@@ -511,7 +634,7 @@ CREATE TABLE IF NOT EXISTS typed_market_ticks (
   UNIQUE(feed, source_event_id, kind)
 );
 CREATE INDEX IF NOT EXISTS typed_market_ticks_series
-  ON typed_market_ticks(symbol, event_time_ns, feed, kind);
+  ON typed_market_ticks(instrument_id, event_time_ns, feed, kind);
 CREATE TABLE IF NOT EXISTS market_tick_coverage (
   symbol TEXT NOT NULL,
   feed TEXT NOT NULL,
@@ -523,6 +646,19 @@ CREATE TABLE IF NOT EXISTS market_tick_coverage (
 );
 CREATE INDEX IF NOT EXISTS market_tick_coverage_lookup
   ON market_tick_coverage(symbol, feed, kind, start_ns, end_ns);
+CREATE TABLE IF NOT EXISTS market_tick_coverage_v2 (
+  instrument_id TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  feed TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  start_ns INTEGER NOT NULL,
+  end_ns INTEGER NOT NULL,
+  completed_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(instrument_id, feed, kind, start_ns, end_ns)
+);
+CREATE INDEX IF NOT EXISTS market_tick_coverage_v2_lookup
+  ON market_tick_coverage_v2(
+    instrument_id, feed, kind, start_ns, end_ns);
 CREATE TABLE IF NOT EXISTS provider_bars (
   instrument_id TEXT NOT NULL,
   symbol TEXT NOT NULL,
@@ -555,6 +691,22 @@ CREATE TABLE IF NOT EXISTS provider_bar_coverage (
 );
 )SQL";
     if (!ExecuteMarket(market_schema, &error)) return false;
+    ExecuteMarket(
+        "ALTER TABLE market_tick_events ADD COLUMN instrument_id "
+        "TEXT NOT NULL DEFAULT ''",
+        nullptr);
+    ExecuteMarket(
+        "DROP INDEX IF EXISTS market_tick_events_series;"
+        "CREATE INDEX IF NOT EXISTS market_tick_events_series "
+        "ON market_tick_events("
+        "instrument_id,event_time_ns,feed,kind);",
+        nullptr);
+    ExecuteMarket(
+        "DROP INDEX IF EXISTS typed_market_ticks_series;"
+        "CREATE INDEX IF NOT EXISTS typed_market_ticks_series "
+        "ON typed_market_ticks("
+        "instrument_id,event_time_ns,feed,kind);",
+        nullptr);
     writer_ = std::thread(&Database::WriterLoop, this);
     return true;
 }
@@ -661,7 +813,8 @@ Database::ReserveOrderCommand(
         return std::unexpected(std::string(sqlite3_errmsg(db_)));
 
     const char* select_sql =
-        "SELECT outcome,broker_order_id,http_status,message,raw_response "
+        "SELECT outcome,broker_order_id,http_status,message,raw_response,"
+        "items_json,reconciliation_required,recovery_state,recovery_message "
         "FROM order_commands WHERE request_id=?";
     if (sqlite3_prepare_v2(db_, select_sql, -1, &statement, nullptr) !=
         SQLITE_OK)
@@ -690,6 +843,13 @@ Database::ReserveOrderCommand(
             sqlite3_column_int(statement, 2));
         existing.message = text(3);
         existing.raw_response = text(4);
+        existing.items = ParseCommandItems(text(5));
+        existing.reconciliation_required =
+            sqlite3_column_int(statement, 6) != 0;
+        existing.recovery_state =
+            static_cast<tradebox::core::CommandRecoveryState>(
+                sqlite3_column_int(statement, 7));
+        existing.recovery_message = text(8);
         duplicate.existing_result = std::move(existing);
     }
     sqlite3_finalize(statement);
@@ -702,7 +862,9 @@ std::expected<void, std::string> Database::CompleteOrderCommand(
     sqlite3_stmt* statement = nullptr;
     const char* sql =
         "UPDATE order_commands SET completed_at_ms=?,outcome=?,"
-        "broker_order_id=?,http_status=?,message=?,raw_response=? "
+        "broker_order_id=?,http_status=?,message=?,raw_response=?,"
+        "items_json=?,reconciliation_required=?,recovery_state=?,"
+        "recovery_message=? "
         "WHERE request_id=? AND outcome IS NULL";
     if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) !=
         SQLITE_OK)
@@ -717,7 +879,16 @@ std::expected<void, std::string> Database::CompleteOrderCommand(
                       SQLITE_TRANSIENT);
     sqlite3_bind_text(statement, 6, result.raw_response.c_str(), -1,
                       SQLITE_TRANSIENT);
-    sqlite3_bind_text(statement, 7, result.request_id.c_str(), -1,
+    const std::string items = SerializeCommandItems(result.items);
+    sqlite3_bind_text(statement, 7, items.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(statement, 8,
+                     result.reconciliation_required ? 1 : 0);
+    sqlite3_bind_int(
+        statement, 9, static_cast<int>(result.recovery_state));
+    sqlite3_bind_text(
+        statement, 10, result.recovery_message.c_str(), -1,
+        SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 11, result.request_id.c_str(), -1,
                       SQLITE_TRANSIENT);
     const int rc = sqlite3_step(statement);
     const int changed = sqlite3_changes(db_);
@@ -731,12 +902,185 @@ std::expected<void, std::string> Database::CompleteOrderCommand(
     return {};
 }
 
+std::expected<void, std::string>
+Database::MarkOrderCommandDispatchStarted(
+    const std::string& request_id) {
+    std::scoped_lock lock(db_mutex_);
+    sqlite3_stmt* statement = nullptr;
+    const char* sql =
+        "UPDATE order_commands SET dispatch_started_at_ms=? "
+        "WHERE request_id=? AND outcome IS NULL "
+        "AND dispatch_started_at_ms IS NULL";
+    if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) !=
+        SQLITE_OK)
+        return std::unexpected(std::string(sqlite3_errmsg(db_)));
+    sqlite3_bind_int64(statement, 1, NowMs());
+    sqlite3_bind_text(statement, 2, request_id.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(statement);
+    const int changed = sqlite3_changes(db_);
+    const std::string error =
+        rc == SQLITE_DONE ? std::string{} : sqlite3_errmsg(db_);
+    sqlite3_finalize(statement);
+    if (rc != SQLITE_DONE) return std::unexpected(error);
+    if (changed != 1)
+        return std::unexpected(
+            "Order command dispatch marker did not update one "
+            "reserved command");
+    return {};
+}
+
+std::expected<
+    std::vector<tradebox::core::RecoverableOrderCommand>,
+    std::string>
+Database::LoadRecoverableOrderCommands() {
+    std::scoped_lock lock(db_mutex_);
+    sqlite3_stmt* statement = nullptr;
+    const char* sql =
+        "SELECT request_id,source,command_kind,account_id,environment,"
+        "connection_generation,client_order_id,created_at_ms,"
+        "dispatch_started_at_ms,outcome,recovery_state,recovery_message,"
+        "payload_json FROM order_commands "
+        "WHERE outcome IS NULL OR recovery_state=? OR "
+        "(outcome=? AND recovery_state=0)";
+    if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) !=
+        SQLITE_OK)
+        return std::unexpected(std::string(sqlite3_errmsg(db_)));
+    sqlite3_bind_int(
+        statement, 1,
+        static_cast<int>(
+            tradebox::core::CommandRecoveryState::Pending));
+    sqlite3_bind_int(
+        statement, 2,
+        static_cast<int>(
+            tradebox::core::OrderCommandOutcome::Indeterminate));
+    std::vector<tradebox::core::RecoverableOrderCommand> result;
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        const auto text = [statement](int column) {
+            const unsigned char* value =
+                sqlite3_column_text(statement, column);
+            return value
+                       ? std::string(
+                             reinterpret_cast<const char*>(value))
+                       : std::string{};
+        };
+        tradebox::core::RecoverableOrderCommand command{
+            .record = {
+                .request_id = text(0),
+                .source = text(1),
+                .kind =
+                    static_cast<tradebox::core::OrderCommandKind>(
+                        sqlite3_column_int(statement, 2)),
+                .account_id = text(3),
+                .environment =
+                    static_cast<tradebox::core::AccountEnvironment>(
+                        sqlite3_column_int(statement, 4)),
+                .generation = tradebox::core::ConnectionGeneration{
+                    static_cast<std::uint64_t>(
+                        sqlite3_column_int64(statement, 5))},
+                .client_order_id = text(6),
+                .created_at_ms = sqlite3_column_int64(statement, 7),
+            },
+            .dispatch_started =
+                sqlite3_column_type(statement, 8) != SQLITE_NULL ||
+                sqlite3_column_type(statement, 9) != SQLITE_NULL,
+            .recovery_state =
+                static_cast<tradebox::core::CommandRecoveryState>(
+                    sqlite3_column_int(statement, 10)),
+            .recovery_message = text(11),
+        };
+        try {
+            const nlohmann::json payload =
+                nlohmann::json::parse(text(12));
+            command.target_order_id =
+                JsonString(payload, "order_id");
+            command.symbol_or_asset_id =
+                JsonString(payload, "symbol_or_asset_id");
+            if (payload.contains("qty") &&
+                !payload["qty"].is_null())
+                command.qty = JsonDecimal(payload, "qty");
+            if (payload.contains("percentage") &&
+                !payload["percentage"].is_null())
+                command.percentage =
+                    JsonDecimal(payload, "percentage");
+            command.cancel_open_orders =
+                payload.value("cancel_open_orders", false);
+        } catch (const std::exception& error) {
+            sqlite3_finalize(statement);
+            return std::unexpected(
+                "Could not parse recoverable command " +
+                command.record.request_id + ": " + error.what());
+        }
+        result.push_back(std::move(command));
+    }
+    sqlite3_finalize(statement);
+    return result;
+}
+
+std::expected<void, std::string>
+Database::ResolveOrderCommandRecovery(
+    const tradebox::core::OrderCommandResult& result) {
+    std::scoped_lock lock(db_mutex_);
+    sqlite3_stmt* statement = nullptr;
+    const char* sql =
+        "UPDATE order_commands SET completed_at_ms=?,outcome=?,"
+        "broker_order_id=?,http_status=?,message=?,raw_response=?,"
+        "items_json=?,reconciliation_required=?,recovery_state=?,"
+        "recovery_message=? WHERE request_id=? AND "
+        "(outcome IS NULL OR recovery_state=? OR "
+        "(outcome=? AND recovery_state=0))";
+    if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) !=
+        SQLITE_OK)
+        return std::unexpected(std::string(sqlite3_errmsg(db_)));
+    sqlite3_bind_int64(statement, 1, NowMs());
+    sqlite3_bind_int(statement, 2, static_cast<int>(result.outcome));
+    sqlite3_bind_text(statement, 3, result.broker_order_id.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_int(statement, 4,
+                     static_cast<int>(result.http_status));
+    sqlite3_bind_text(statement, 5, result.message.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 6, result.raw_response.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    const std::string items = SerializeCommandItems(result.items);
+    sqlite3_bind_text(statement, 7, items.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(statement, 8,
+                     result.reconciliation_required ? 1 : 0);
+    sqlite3_bind_int(
+        statement, 9, static_cast<int>(result.recovery_state));
+    sqlite3_bind_text(
+        statement, 10, result.recovery_message.c_str(), -1,
+        SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 11, result.request_id.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_int(
+        statement, 12,
+        static_cast<int>(
+            tradebox::core::CommandRecoveryState::Pending));
+    sqlite3_bind_int(
+        statement, 13,
+        static_cast<int>(
+            tradebox::core::OrderCommandOutcome::Indeterminate));
+    const int rc = sqlite3_step(statement);
+    const int changed = sqlite3_changes(db_);
+    const std::string error =
+        rc == SQLITE_DONE ? std::string{} : sqlite3_errmsg(db_);
+    sqlite3_finalize(statement);
+    if (rc != SQLITE_DONE) return std::unexpected(error);
+    if (changed != 1)
+        return std::unexpected(
+            "Order command recovery did not update one recoverable "
+            "command");
+    return {};
+}
+
 std::expected<tradebox::core::OrderCommandLookup, std::string>
 Database::LookupOrderCommand(const std::string& request_id) {
     std::scoped_lock lock(db_mutex_);
     sqlite3_stmt* statement = nullptr;
     const char* sql =
-        "SELECT outcome,broker_order_id,http_status,message,raw_response "
+        "SELECT outcome,broker_order_id,http_status,message,raw_response,"
+        "items_json,reconciliation_required,recovery_state,recovery_message "
         "FROM order_commands WHERE request_id=?";
     if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) !=
         SQLITE_OK)
@@ -746,7 +1090,6 @@ Database::LookupOrderCommand(const std::string& request_id) {
     tradebox::core::OrderCommandLookup result;
     if (sqlite3_step(statement) == SQLITE_ROW) {
         result.exists = true;
-        if (sqlite3_column_type(statement, 0) != SQLITE_NULL) {
         const auto text = [statement](int column) {
             const unsigned char* value =
                 sqlite3_column_text(statement, column);
@@ -754,6 +1097,7 @@ Database::LookupOrderCommand(const std::string& request_id) {
                                reinterpret_cast<const char*>(value))
                          : std::string{};
         };
+        if (sqlite3_column_type(statement, 0) != SQLITE_NULL) {
         result.terminal_result = tradebox::core::OrderCommandResult{
             .request_id = request_id,
             .outcome =
@@ -764,11 +1108,268 @@ Database::LookupOrderCommand(const std::string& request_id) {
                 sqlite3_column_int(statement, 2)),
             .message = text(3),
             .raw_response = text(4),
+            .items = ParseCommandItems(text(5)),
+            .reconciliation_required =
+                sqlite3_column_int(statement, 6) != 0,
+            .recovery_state =
+                static_cast<tradebox::core::CommandRecoveryState>(
+                    sqlite3_column_int(statement, 7)),
+            .recovery_message = text(8),
         };
+        result.recovery_state =
+            result.terminal_result->recovery_state;
+        result.recovery_message =
+            result.terminal_result->recovery_message;
+        } else {
+            result.recovery_state =
+                static_cast<tradebox::core::CommandRecoveryState>(
+                    sqlite3_column_int(statement, 7));
+            result.recovery_message = text(8);
         }
     }
     sqlite3_finalize(statement);
     return result;
+}
+
+std::expected<tradebox::core::AccountActivityWriteResult, std::string>
+Database::StoreAccountActivities(
+    const std::vector<tradebox::core::AccountActivity>& activities) {
+    tradebox::core::AccountActivityWriteResult result;
+    if (activities.empty()) return result;
+    std::scoped_lock lock(db_mutex_);
+    if (sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) !=
+        SQLITE_OK)
+        return std::unexpected(std::string(sqlite3_errmsg(db_)));
+    sqlite3_stmt* existing = nullptr;
+    sqlite3_stmt* upsert = nullptr;
+    const char* select_sql =
+        "SELECT raw_payload,fill_reconciliation FROM account_activities "
+        "WHERE account_id=? AND provider_id=?";
+    const char* upsert_sql =
+        "INSERT INTO account_activities("
+        "account_id,provider_id,activity_type,activity_subtype,"
+        "execution_type,status,symbol,cusip,side,order_id,currency,"
+        "occurred_at,settlement_date,occurred_at_ms,qty_text,price_text,"
+        "cumulative_qty_text,leaves_qty_text,net_amount_text,"
+        "per_share_amount_text,fill_reconciliation,raw_payload,revision,"
+        "recorded_at_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?) "
+        "ON CONFLICT(account_id,provider_id) DO UPDATE SET "
+        "activity_type=excluded.activity_type,"
+        "activity_subtype=excluded.activity_subtype,"
+        "execution_type=excluded.execution_type,status=excluded.status,"
+        "symbol=excluded.symbol,cusip=excluded.cusip,side=excluded.side,"
+        "order_id=excluded.order_id,currency=excluded.currency,"
+        "occurred_at=excluded.occurred_at,"
+        "settlement_date=excluded.settlement_date,"
+        "occurred_at_ms=excluded.occurred_at_ms,qty_text=excluded.qty_text,"
+        "price_text=excluded.price_text,"
+        "cumulative_qty_text=excluded.cumulative_qty_text,"
+        "leaves_qty_text=excluded.leaves_qty_text,"
+        "net_amount_text=excluded.net_amount_text,"
+        "per_share_amount_text=excluded.per_share_amount_text,"
+        "fill_reconciliation=excluded.fill_reconciliation,"
+        "raw_payload=excluded.raw_payload,"
+        "revision=account_activities.revision + "
+        "CASE WHEN account_activities.raw_payload<>excluded.raw_payload "
+        "THEN 1 ELSE 0 END,recorded_at_ms=excluded.recorded_at_ms";
+    if (sqlite3_prepare_v2(db_, select_sql, -1, &existing, nullptr) !=
+            SQLITE_OK ||
+        sqlite3_prepare_v2(db_, upsert_sql, -1, &upsert, nullptr) !=
+            SQLITE_OK) {
+        if (existing) sqlite3_finalize(existing);
+        if (upsert) sqlite3_finalize(upsert);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return std::unexpected(std::string(sqlite3_errmsg(db_)));
+    }
+    const auto bind_text = [](sqlite3_stmt* statement, int column,
+                              const std::string& text) {
+        sqlite3_bind_text(statement, column, text.c_str(), -1,
+                          SQLITE_TRANSIENT);
+    };
+    const auto bind_decimal =
+        [&bind_text](sqlite3_stmt* statement, int column,
+                     const std::optional<tradebox::core::Decimal>& value) {
+            if (value)
+                bind_text(statement, column, value->ToString());
+            else
+                sqlite3_bind_null(statement, column);
+    };
+    bool failed = false;
+    std::string failure_error;
+    for (const auto& activity : activities) {
+        if (activity.account_id.empty() ||
+            activity.provider_id.empty()) {
+            failed = true;
+            failure_error =
+                "Account activity account_id and provider_id are required";
+            break;
+        }
+        sqlite3_reset(existing);
+        sqlite3_clear_bindings(existing);
+        bind_text(existing, 1, activity.account_id);
+        bind_text(existing, 2, activity.provider_id);
+        const int found = sqlite3_step(existing);
+        if (found == SQLITE_ROW) {
+            const unsigned char* raw = sqlite3_column_text(existing, 0);
+            const std::string previous =
+                raw ? reinterpret_cast<const char*>(raw) : "";
+            if (previous == activity.raw_payload)
+                ++result.unchanged;
+            else
+                ++result.revised;
+        } else if (found == SQLITE_DONE) {
+            ++result.inserted;
+        } else {
+            failed = true;
+            failure_error = sqlite3_errmsg(db_);
+            break;
+        }
+
+        sqlite3_reset(upsert);
+        sqlite3_clear_bindings(upsert);
+        int column = 1;
+        bind_text(upsert, column++, activity.account_id);
+        bind_text(upsert, column++, activity.provider_id);
+        bind_text(upsert, column++, activity.activity_type);
+        bind_text(upsert, column++, activity.activity_subtype);
+        bind_text(upsert, column++, activity.execution_type);
+        bind_text(upsert, column++, activity.status);
+        bind_text(upsert, column++, activity.symbol);
+        bind_text(upsert, column++, activity.cusip);
+        bind_text(upsert, column++, activity.side);
+        bind_text(upsert, column++, activity.order_id);
+        bind_text(upsert, column++, activity.currency);
+        bind_text(upsert, column++, activity.occurred_at);
+        bind_text(upsert, column++, activity.settlement_date);
+        sqlite3_bind_int64(upsert, column++, activity.occurred_at_ms);
+        bind_decimal(upsert, column++, activity.qty);
+        bind_decimal(upsert, column++, activity.price);
+        bind_decimal(upsert, column++, activity.cumulative_qty);
+        bind_decimal(upsert, column++, activity.leaves_qty);
+        bind_decimal(upsert, column++, activity.net_amount);
+        bind_decimal(upsert, column++, activity.per_share_amount);
+        sqlite3_bind_int(
+            upsert, column++,
+            static_cast<int>(activity.fill_reconciliation));
+        bind_text(upsert, column++, activity.raw_payload);
+        sqlite3_bind_int64(upsert, column++, NowMs());
+        if (sqlite3_step(upsert) != SQLITE_DONE) {
+            failed = true;
+            failure_error = sqlite3_errmsg(db_);
+            break;
+        }
+    }
+    sqlite3_finalize(existing);
+    sqlite3_finalize(upsert);
+    if (failed) {
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return std::unexpected(failure_error);
+    }
+    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr) !=
+        SQLITE_OK) {
+        const std::string error = sqlite3_errmsg(db_);
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return std::unexpected(error);
+    }
+    return result;
+}
+
+tradebox::core::AccountActivityPage Database::LoadAccountActivities(
+    const tradebox::core::AccountActivityQuery& query) {
+    tradebox::core::AccountActivityPage page;
+    std::scoped_lock lock(db_mutex_);
+    sqlite3_stmt* statement = nullptr;
+    const char* sql =
+        "SELECT account_id,provider_id,activity_type,activity_subtype,"
+        "execution_type,status,symbol,cusip,side,order_id,currency,"
+        "occurred_at,settlement_date,occurred_at_ms,qty_text,price_text,"
+        "cumulative_qty_text,leaves_qty_text,net_amount_text,"
+        "per_share_amount_text,fill_reconciliation,raw_payload,revision "
+        "FROM account_activities WHERE (?='' OR account_id=?) "
+        "AND (?='' OR activity_type=?) AND (?='' OR symbol=?) "
+        "AND (?=0 OR occurred_at_ms>?) AND (?=0 OR occurred_at_ms<?) "
+        "AND (?=0 OR occurred_at_ms<? OR "
+        "(occurred_at_ms=? AND provider_id<?)) "
+        "ORDER BY occurred_at_ms DESC,provider_id DESC LIMIT ?";
+    if (sqlite3_prepare_v2(db_, sql, -1, &statement, nullptr) !=
+        SQLITE_OK)
+        return page;
+    int binding = 1;
+    const auto bind_twice = [&statement, &binding](
+                                const std::string& value) {
+        sqlite3_bind_text(statement, binding++, value.c_str(), -1,
+                          SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, binding++, value.c_str(), -1,
+                          SQLITE_TRANSIENT);
+    };
+    bind_twice(query.account_id);
+    bind_twice(query.activity_type);
+    bind_twice(query.symbol);
+    sqlite3_bind_int64(statement, binding++, query.after_ms);
+    sqlite3_bind_int64(statement, binding++, query.after_ms);
+    sqlite3_bind_int64(statement, binding++, query.before_ms);
+    sqlite3_bind_int64(statement, binding++, query.before_ms);
+    sqlite3_bind_int64(statement, binding++, query.cursor_time_ms);
+    sqlite3_bind_int64(statement, binding++, query.cursor_time_ms);
+    sqlite3_bind_int64(statement, binding++, query.cursor_time_ms);
+    sqlite3_bind_text(
+        statement, binding++, query.cursor_provider_id.c_str(), -1,
+        SQLITE_TRANSIENT);
+    const std::size_t maximum =
+        std::clamp<std::size_t>(query.maximum, 1, 1000);
+    sqlite3_bind_int(statement, binding, static_cast<int>(maximum));
+    const auto text = [statement](int column) {
+        const unsigned char* value =
+            sqlite3_column_text(statement, column);
+        return value
+                   ? std::string(reinterpret_cast<const char*>(value))
+                   : std::string{};
+    };
+    const auto decimal = [&text, statement](int column)
+        -> std::optional<tradebox::core::Decimal> {
+        if (sqlite3_column_type(statement, column) == SQLITE_NULL)
+            return std::nullopt;
+        auto parsed = tradebox::core::Decimal::Parse(text(column));
+        return parsed ? std::optional(*parsed) : std::nullopt;
+    };
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        page.activities.push_back({
+            .account_id = text(0),
+            .provider_id = text(1),
+            .activity_type = text(2),
+            .activity_subtype = text(3),
+            .execution_type = text(4),
+            .status = text(5),
+            .symbol = text(6),
+            .cusip = text(7),
+            .side = text(8),
+            .order_id = text(9),
+            .currency = text(10),
+            .occurred_at = text(11),
+            .settlement_date = text(12),
+            .occurred_at_ms = sqlite3_column_int64(statement, 13),
+            .qty = decimal(14),
+            .price = decimal(15),
+            .cumulative_qty = decimal(16),
+            .leaves_qty = decimal(17),
+            .net_amount = decimal(18),
+            .per_share_amount = decimal(19),
+            .fill_reconciliation =
+                static_cast<tradebox::core::ActivityFillReconciliation>(
+                    sqlite3_column_int(statement, 20)),
+            .raw_payload = text(21),
+            .revision = static_cast<std::uint32_t>(
+                sqlite3_column_int(statement, 22)),
+        });
+    }
+    sqlite3_finalize(statement);
+    if (page.activities.size() == maximum) {
+        page.next_cursor_time_ms =
+            page.activities.back().occurred_at_ms;
+        page.next_cursor_provider_id =
+            page.activities.back().provider_id;
+    }
+    return page;
 }
 
 std::vector<std::string> Database::LoadWatchlist() {
@@ -1067,11 +1668,13 @@ void Database::StoreBars(const std::string& symbol, const std::vector<Bar>& bars
     ExecuteMarket("COMMIT;");
 }
 
-void Database::StoreProviderBars(
+std::expected<void, std::string> Database::StoreProviderBars(
     const tradebox::core::BarUpsertBatch& batch) {
-    if (batch.key.instrument_id.empty()) return;
+    if (batch.key.instrument_id.empty())
+        return std::unexpected(
+            "Provider-bar persistence requires instrument identity");
     std::scoped_lock lock(db_mutex_);
-    StoreProviderBarBatchesLocked({batch});
+    return StoreProviderBarBatchesLocked({batch});
 }
 
 bool Database::QueueProviderBars(
@@ -1098,12 +1701,20 @@ bool Database::QueueProviderBars(
     return true;
 }
 
-void Database::StoreProviderBarBatchesLocked(
+std::expected<void, std::string>
+Database::StoreProviderBarBatchesLocked(
     const std::vector<tradebox::core::BarUpsertBatch>& batches) {
-    if (batches.empty()) return;
-    ExecuteMarket("BEGIN IMMEDIATE;");
+    if (batches.empty()) return {};
+    std::string error;
+    if (!ExecuteMarket("BEGIN IMMEDIATE;", &error))
+        return std::unexpected(error);
+    const auto rollback = [this](std::string message)
+        -> std::expected<void, std::string> {
+        ExecuteMarket("ROLLBACK;");
+        return std::unexpected(std::move(message));
+    };
     sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(
+    if (sqlite3_prepare_v2(
         market_db_,
         "INSERT INTO provider_bars("
         "instrument_id,symbol,feed,timeframe,adjustment,start_ns,"
@@ -1116,9 +1727,13 @@ void Database::StoreProviderBarBatchesLocked(
         "low_text=excluded.low_text,close_text=excluded.close_text,"
         "volume_text=excluded.volume_text,vwap_text=excluded.vwap_text,"
         "trade_count=excluded.trade_count,source=excluded.source,"
-        "state=CASE WHEN provider_bars.state IN (1,2) THEN 2 "
+        "state=CASE WHEN excluded.state=0 THEN 0 "
+        "WHEN provider_bars.state IN (1,2) THEN 2 "
         "ELSE excluded.state END,revision=provider_bars.revision+1"
-        " WHERE provider_bars.symbol<>excluded.symbol"
+        " WHERE NOT (provider_bars.source=1"
+        " AND provider_bars.state=2"
+        " AND excluded.source=1 AND excluded.state=1)"
+        " AND (provider_bars.symbol<>excluded.symbol"
         " OR provider_bars.open_text<>excluded.open_text"
         " OR provider_bars.high_text<>excluded.high_text"
         " OR provider_bars.low_text<>excluded.low_text"
@@ -1127,8 +1742,9 @@ void Database::StoreProviderBarBatchesLocked(
         " OR provider_bars.vwap_text IS NOT excluded.vwap_text"
         " OR provider_bars.trade_count<>excluded.trade_count"
         " OR provider_bars.source<>excluded.source"
-        " OR provider_bars.state<>excluded.state",
-        -1, &statement, nullptr);
+        " OR provider_bars.state<>excluded.state)",
+        -1, &statement, nullptr) != SQLITE_OK)
+        return rollback(sqlite3_errmsg(market_db_));
     for (const auto& batch : batches) {
         for (const auto& bar : batch.bars) {
             const std::string open = bar.open.ToString();
@@ -1180,19 +1796,24 @@ void Database::StoreProviderBarBatchesLocked(
                 statement, 16,
                 static_cast<sqlite3_int64>(
                     std::max<std::uint64_t>(bar.revision, 1)));
-            sqlite3_step(statement);
+            if (sqlite3_step(statement) != SQLITE_DONE) {
+                error = sqlite3_errmsg(market_db_);
+                sqlite3_finalize(statement);
+                return rollback(error);
+            }
             sqlite3_reset(statement);
             sqlite3_clear_bindings(statement);
         }
     }
     sqlite3_finalize(statement);
 
-    sqlite3_prepare_v2(
+    if (sqlite3_prepare_v2(
         market_db_,
         "INSERT OR IGNORE INTO provider_bar_coverage("
         "instrument_id,feed,timeframe,adjustment,start_ns,end_ns)"
         " VALUES(?,?,?,?,?,?)",
-        -1, &statement, nullptr);
+        -1, &statement, nullptr) != SQLITE_OK)
+        return rollback(sqlite3_errmsg(market_db_));
     for (const auto& batch : batches) {
         if (!batch.covered_range ||
             batch.covered_range->start_ns >=
@@ -1213,12 +1834,18 @@ void Database::StoreProviderBarBatchesLocked(
             statement, 5, batch.covered_range->start_ns);
         sqlite3_bind_int64(
             statement, 6, batch.covered_range->end_ns);
-        sqlite3_step(statement);
+        if (sqlite3_step(statement) != SQLITE_DONE) {
+            error = sqlite3_errmsg(market_db_);
+            sqlite3_finalize(statement);
+            return rollback(error);
+        }
         sqlite3_reset(statement);
         sqlite3_clear_bindings(statement);
     }
     sqlite3_finalize(statement);
-    ExecuteMarket("COMMIT;");
+    if (!ExecuteMarket("COMMIT;", &error))
+        return rollback(error);
+    return {};
 }
 
 StoredBarSeries Database::LoadProviderBars(
@@ -1315,9 +1942,14 @@ void Database::QueueTimelineEvent(std::string source,
             return;
         }
         pending_.push_back(
-            {false, std::move(source), std::move(source_event_id),
-             std::move(kind), std::move(symbol), event_time_ms, NowMs(),
-             std::move(payload)});
+            {.market_tick = false,
+             .source = std::move(source),
+             .source_event_id = std::move(source_event_id),
+             .kind = std::move(kind),
+             .symbol = std::move(symbol),
+             .event_time = event_time_ms,
+             .available_at_ms = NowMs(),
+             .payload = std::move(payload)});
         ++accepted_events_;
         queue_high_water_ =
             std::max<std::uint64_t>(queue_high_water_,
@@ -1326,47 +1958,60 @@ void Database::QueueTimelineEvent(std::string source,
     queue_cv_.notify_one();
 }
 
-void Database::QueueMarketTickEvent(
+bool Database::QueueMarketTickEvent(
     std::string feed, std::string source_event_id, std::string kind,
-    std::string symbol, std::int64_t event_time_ns,
+    std::string instrument_id, std::string symbol,
+    std::int64_t event_time_ns,
     std::int64_t received_at_ms, std::string payload) {
+    if (instrument_id.empty() || symbol.empty()) return false;
     {
         std::scoped_lock lock(queue_mutex_);
         constexpr std::size_t kMaximumQueuedEvents = 250'000;
         if (pending_.size() >= kMaximumQueuedEvents) {
             ++dropped_market_events_;
-            return;
+            return false;
         }
-        pending_.push_back(
-            {true, std::move(feed), std::move(source_event_id),
-             std::move(kind), std::move(symbol), event_time_ns,
-             received_at_ms, std::move(payload)});
+        pending_.push_back({
+            .market_tick = true,
+            .source = std::move(feed),
+            .source_event_id = std::move(source_event_id),
+            .kind = std::move(kind),
+            .instrument_id = std::move(instrument_id),
+            .symbol = std::move(symbol),
+            .event_time = event_time_ns,
+            .available_at_ms = received_at_ms,
+            .payload = std::move(payload),
+        });
         ++accepted_events_;
         queue_high_water_ =
             std::max<std::uint64_t>(queue_high_water_,
                                     pending_.size());
     }
     queue_cv_.notify_one();
+    return true;
 }
 
-void Database::QueueMarketDataEvent(
+bool Database::QueueMarketDataEvent(
     std::string feed, std::string source_event_id,
     tradebox::core::MarketDataEventPtr event) {
-    if (!event) return;
+    if (!event) return false;
     const MarketEventMetadata metadata = Metadata(*event);
-    if (metadata.kind.empty() || metadata.symbol.empty()) return;
+    if (metadata.kind.empty() || metadata.instrument_id.empty() ||
+        metadata.symbol.empty())
+        return false;
     {
         std::scoped_lock lock(queue_mutex_);
         constexpr std::size_t kMaximumQueuedEvents = 250'000;
         if (pending_.size() >= kMaximumQueuedEvents) {
             ++dropped_market_events_;
-            return;
+            return false;
         }
         pending_.push_back({
             .market_tick = true,
             .source = std::move(feed),
             .source_event_id = std::move(source_event_id),
             .kind = metadata.kind,
+            .instrument_id = metadata.instrument_id,
             .symbol = metadata.symbol,
             .event_time = metadata.event_time_ns,
             .available_at_ms = metadata.received_at_ms,
@@ -1378,31 +2023,53 @@ void Database::QueueMarketDataEvent(
                                     pending_.size());
     }
     queue_cv_.notify_one();
+    return true;
 }
 
-void Database::FlushQueuedWrites() {
+std::expected<void, std::string> Database::FlushQueuedWrites() {
     std::unique_lock lock(queue_mutex_);
-    if (!writer_.joinable() || stopping_) return;
+    if (!writer_.joinable())
+        return std::unexpected("Market-data persistence writer is not running");
+    if (stopping_)
+        return std::unexpected("Market-data persistence writer is stopping");
     const std::uint64_t requested = ++flush_requested_;
     queue_cv_.notify_one();
     flush_cv_.wait(lock, [&] {
         return flush_completed_ >= requested || stopping_;
     });
+    if (stopping_)
+        return std::unexpected("Market-data persistence writer stopped");
+    if (!last_write_error_.empty())
+        return std::unexpected(last_write_error_);
+    return {};
 }
 
-void Database::StoreMarketTickEvents(
+std::expected<void, std::string> Database::StoreMarketTickEvents(
     const std::vector<StoredMarketTick>& events) {
-    if (events.empty()) return;
+    if (events.empty()) return {};
     std::scoped_lock lock(db_mutex_);
-    ExecuteMarket("BEGIN IMMEDIATE;");
+    std::string error;
+    if (!ExecuteMarket("BEGIN IMMEDIATE;", &error))
+        return std::unexpected(error);
     sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(
+    if (sqlite3_prepare_v2(
         market_db_,
         "INSERT OR IGNORE INTO market_tick_events("
-        "feed,source_event_id,kind,symbol,event_time_ns,received_at_ms,"
-        "raw_payload) VALUES(?,?,?,?,?,?,?)",
-        -1, &statement, nullptr);
+        "feed,source_event_id,kind,instrument_id,symbol,event_time_ns,"
+        "received_at_ms,raw_payload) VALUES(?,?,?,?,?,?,?,?)",
+        -1, &statement, nullptr) != SQLITE_OK) {
+        error = sqlite3_errmsg(market_db_);
+        ExecuteMarket("ROLLBACK;");
+        return std::unexpected(error);
+    }
     for (const StoredMarketTick& event : events) {
+        if (event.instrument_id.empty() || event.symbol.empty()) {
+            sqlite3_finalize(statement);
+            ExecuteMarket("ROLLBACK;");
+            return std::unexpected(
+                "Market tick persistence requires instrument identity "
+                "and symbol");
+        }
         sqlite3_bind_text(statement, 1, event.feed.c_str(), -1,
                           SQLITE_TRANSIENT);
         if (event.source_event_id.empty())
@@ -1413,36 +2080,55 @@ void Database::StoreMarketTickEvents(
                               SQLITE_TRANSIENT);
         sqlite3_bind_text(statement, 3, event.kind.c_str(), -1,
                           SQLITE_TRANSIENT);
-        sqlite3_bind_text(statement, 4, event.symbol.c_str(), -1,
+        sqlite3_bind_text(statement, 4, event.instrument_id.c_str(), -1,
                           SQLITE_TRANSIENT);
-        sqlite3_bind_int64(statement, 5, event.event_time_ns);
-        sqlite3_bind_int64(statement, 6, event.received_at_ms);
-        sqlite3_bind_text(statement, 7, event.raw_payload.c_str(), -1,
+        sqlite3_bind_text(statement, 5, event.symbol.c_str(), -1,
                           SQLITE_TRANSIENT);
-        sqlite3_step(statement);
+        sqlite3_bind_int64(statement, 6, event.event_time_ns);
+        sqlite3_bind_int64(statement, 7, event.received_at_ms);
+        sqlite3_bind_text(statement, 8, event.raw_payload.c_str(), -1,
+                          SQLITE_TRANSIENT);
+        if (sqlite3_step(statement) != SQLITE_DONE) {
+            error = sqlite3_errmsg(market_db_);
+            sqlite3_finalize(statement);
+            ExecuteMarket("ROLLBACK;");
+            return std::unexpected(error);
+        }
         sqlite3_reset(statement);
         sqlite3_clear_bindings(statement);
     }
     sqlite3_finalize(statement);
-    ExecuteMarket("COMMIT;");
+    if (!ExecuteMarket("COMMIT;", &error)) {
+        ExecuteMarket("ROLLBACK;");
+        return std::unexpected(error);
+    }
+    return {};
 }
 
 tradebox::core::TickSeries Database::LoadMarketTicks(
     const tradebox::core::TickQuery& query) {
     tradebox::core::TickSeries result{.query = query};
+    if (query.instrument_id.empty()) {
+        result.error =
+            "Tick cache lookup requires stable instrument identity";
+        return result;
+    }
     std::map<std::string, tradebox::core::MarketTrade> trades;
     std::scoped_lock lock(db_mutex_);
     sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(
+    if (sqlite3_prepare_v2(
         market_db_,
         "SELECT kind,event_time_ns,received_at_ms,raw_payload,id "
-        "FROM market_tick_events WHERE symbol=? AND feed=? "
-        "AND ((event_time_ns>=? AND event_time_ns<=?) "
+        "FROM market_tick_events WHERE instrument_id=? AND feed=? "
+        "AND ((event_time_ns>=? AND event_time_ns<?) "
         "OR kind IN ('x','c')) "
         "ORDER BY event_time_ns,id",
-        -1, &statement, nullptr);
+        -1, &statement, nullptr) != SQLITE_OK) {
+        result.error = sqlite3_errmsg(market_db_);
+        return result;
+    }
     const std::string feed = FeedName(query.feed);
-    sqlite3_bind_text(statement, 1, query.symbol.c_str(), -1,
+    sqlite3_bind_text(statement, 1, query.instrument_id.c_str(), -1,
                       SQLITE_TRANSIENT);
     sqlite3_bind_text(statement, 2, feed.c_str(), -1,
                       SQLITE_TRANSIENT);
@@ -1462,6 +2148,7 @@ tradebox::core::TickSeries Database::LoadMarketTicks(
                 reinterpret_cast<const char*>(payload_text));
             if (kind == "q" && query.include_quotes) {
                 result.quotes.push_back({
+                    .instrument_id = query.instrument_id,
                     .symbol = query.symbol,
                     .bid_price = JsonDecimal(payload, "bp"),
                     .bid_size = JsonDecimal(payload, "bs"),
@@ -1477,6 +2164,7 @@ tradebox::core::TickSeries Database::LoadMarketTicks(
                 });
             } else if (kind == "t" && query.include_trades) {
                 tradebox::core::MarketTrade trade{
+                    .instrument_id = query.instrument_id,
                     .symbol = query.symbol,
                     .trade_id = JsonIdentifier(payload, "i"),
                     .price = JsonDecimal(payload, "p"),
@@ -1504,15 +2192,7 @@ tradebox::core::TickSeries Database::LoadMarketTicks(
                                entry.second.event_time_ns / kDayNs ==
                                    event_time_ns / kDayNs;
                     });
-                if (erased == 0) {
-                    const auto fallback = std::ranges::find_if(
-                        trades, [&](const auto& entry) {
-                            return entry.second.trade_id ==
-                                   canceled_id;
-                        });
-                    if (fallback != trades.end())
-                        trades.erase(fallback);
-                }
+                static_cast<void>(erased);
             } else if (kind == "c" && query.include_trades) {
                 const std::string original_id =
                     JsonIdentifier(payload, "oi");
@@ -1522,17 +2202,12 @@ tradebox::core::TickSeries Database::LoadMarketTicks(
                                entry.second.event_time_ns / kDayNs ==
                                    event_time_ns / kDayNs;
                     });
-                if (original == trades.end())
-                    original = std::ranges::find_if(
-                        trades, [&](const auto& entry) {
-                            return entry.second.trade_id ==
-                                   original_id;
-                        });
                 if (original == trades.end()) continue;
                 const std::int64_t original_event_time_ns =
                     original->second.event_time_ns;
                 trades.erase(original);
                 tradebox::core::MarketTrade corrected{
+                    .instrument_id = query.instrument_id,
                     .symbol = query.symbol,
                     .trade_id = JsonIdentifier(payload, "ci"),
                     .price = JsonDecimal(payload, "cp"),
@@ -1550,23 +2225,30 @@ tradebox::core::TickSeries Database::LoadMarketTicks(
                                  original_event_time_ns),
                     std::move(corrected));
             }
-        } catch (const std::exception&) {
+        } catch (const std::exception& error) {
+            if (result.error.empty())
+                result.error =
+                    "Stored raw market tick is invalid: " +
+                    std::string(error.what());
         }
     }
     sqlite3_finalize(statement);
 
-    sqlite3_prepare_v2(
+    if (sqlite3_prepare_v2(
         market_db_,
         "SELECT kind,instrument_id,event_time_ns,received_at_ms,"
         "broker_timestamp,trade_id,original_trade_id,price_text,"
         "size_text,exchange,conditions_text,tape,bid_price_text,"
         "bid_size_text,bid_exchange,ask_price_text,ask_size_text,"
         "ask_exchange,corrected,id "
-        "FROM typed_market_ticks WHERE symbol=? AND feed=? "
-        "AND ((event_time_ns>=? AND event_time_ns<=?) "
+        "FROM typed_market_ticks WHERE instrument_id=? AND feed=? "
+        "AND ((event_time_ns>=? AND event_time_ns<?) "
         "OR kind IN ('x','c')) ORDER BY event_time_ns,id",
-        -1, &statement, nullptr);
-    sqlite3_bind_text(statement, 1, query.symbol.c_str(), -1,
+        -1, &statement, nullptr) != SQLITE_OK) {
+        result.error = sqlite3_errmsg(market_db_);
+        return result;
+    }
+    sqlite3_bind_text(statement, 1, query.instrument_id.c_str(), -1,
                       SQLITE_TRANSIENT);
     sqlite3_bind_text(statement, 2, feed.c_str(), -1,
                       SQLITE_TRANSIENT);
@@ -1584,6 +2266,10 @@ tradebox::core::TickSeries Database::LoadMarketTicks(
         const auto decimal = [&](int column) {
             const auto parsed =
                 tradebox::core::Decimal::Parse(text(column));
+            if (!parsed && result.error.empty())
+                result.error =
+                    "Stored typed market tick contains an invalid "
+                    "decimal";
             return parsed ? *parsed
                           : tradebox::core::Decimal::Zero();
         };
@@ -1642,15 +2328,7 @@ tradebox::core::TickSeries Database::LoadMarketTicks(
                            entry.second.event_time_ns / kDayNs ==
                                event_time_ns / kDayNs;
                 });
-            if (erased == 0) {
-                const auto fallback = std::ranges::find_if(
-                    trades, [&](const auto& entry) {
-                        return entry.second.trade_id ==
-                               canceled_id;
-                    });
-                if (fallback != trades.end())
-                    trades.erase(fallback);
-            }
+            static_cast<void>(erased);
         } else if (kind == "c" && query.include_trades) {
             const std::string original_id = text(6);
             auto original = std::ranges::find_if(
@@ -1659,12 +2337,6 @@ tradebox::core::TickSeries Database::LoadMarketTicks(
                            entry.second.event_time_ns / kDayNs ==
                                event_time_ns / kDayNs;
                 });
-            if (original == trades.end())
-                original = std::ranges::find_if(
-                    trades, [&](const auto& entry) {
-                        return entry.second.trade_id ==
-                               original_id;
-                    });
             if (original == trades.end()) continue;
             const std::int64_t original_event_time_ns =
                 original->second.event_time_ns;
@@ -1703,18 +2375,21 @@ tradebox::core::TickSeries Database::LoadMarketTicks(
 std::vector<tradebox::core::TickCoverage>
 Database::MissingMarketTickCoverage(
     const tradebox::core::TickQuery& query, std::string_view kind) {
+    if (query.instrument_id.empty())
+        return {{query.start_ns, query.end_ns}};
     std::vector<tradebox::core::TickCoverage> covered;
     {
         std::scoped_lock lock(db_mutex_);
         sqlite3_stmt* statement = nullptr;
-        sqlite3_prepare_v2(
+        if (sqlite3_prepare_v2(
             market_db_,
-            "SELECT start_ns,end_ns FROM market_tick_coverage "
-            "WHERE symbol=? AND feed=? AND kind=? AND end_ns>=? "
+            "SELECT start_ns,end_ns FROM market_tick_coverage_v2 "
+            "WHERE instrument_id=? AND feed=? AND kind=? AND end_ns>=? "
             "AND start_ns<=? ORDER BY start_ns,end_ns",
-            -1, &statement, nullptr);
+            -1, &statement, nullptr) != SQLITE_OK)
+            return {{query.start_ns, query.end_ns}};
         const std::string feed = FeedName(query.feed);
-        sqlite3_bind_text(statement, 1, query.symbol.c_str(), -1,
+        sqlite3_bind_text(statement, 1, query.instrument_id.c_str(), -1,
                           SQLITE_TRANSIENT);
         sqlite3_bind_text(statement, 2, feed.c_str(), -1,
                           SQLITE_TRANSIENT);
@@ -1744,29 +2419,41 @@ Database::MissingMarketTickCoverage(
     return missing;
 }
 
-void Database::MarkMarketTickCoverage(
+std::expected<void, std::string> Database::MarkMarketTickCoverage(
     const tradebox::core::TickQuery& query, std::string_view kind,
     tradebox::core::TickCoverage coverage) {
+    if (query.instrument_id.empty())
+        return std::unexpected(
+            "Tick coverage requires stable instrument identity");
+    if (coverage.start_ns >= coverage.end_ns)
+        return std::unexpected("Tick coverage range is invalid");
     std::scoped_lock lock(db_mutex_);
     sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(
+    if (sqlite3_prepare_v2(
         market_db_,
-        "INSERT OR IGNORE INTO market_tick_coverage("
-        "symbol,feed,kind,start_ns,end_ns,completed_at_ms)"
-        " VALUES(?,?,?,?,?,?)",
-        -1, &statement, nullptr);
+        "INSERT OR IGNORE INTO market_tick_coverage_v2("
+        "instrument_id,symbol,feed,kind,start_ns,end_ns,completed_at_ms)"
+        " VALUES(?,?,?,?,?,?,?)",
+        -1, &statement, nullptr) != SQLITE_OK)
+        return std::unexpected(std::string(sqlite3_errmsg(market_db_)));
     const std::string feed = FeedName(query.feed);
-    sqlite3_bind_text(statement, 1, query.symbol.c_str(), -1,
+    sqlite3_bind_text(statement, 1, query.instrument_id.c_str(), -1,
                       SQLITE_TRANSIENT);
-    sqlite3_bind_text(statement, 2, feed.c_str(), -1,
+    sqlite3_bind_text(statement, 2, query.symbol.c_str(), -1,
                       SQLITE_TRANSIENT);
-    sqlite3_bind_text(statement, 3, kind.data(),
+    sqlite3_bind_text(statement, 3, feed.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 4, kind.data(),
                       static_cast<int>(kind.size()), SQLITE_TRANSIENT);
-    sqlite3_bind_int64(statement, 4, coverage.start_ns);
-    sqlite3_bind_int64(statement, 5, coverage.end_ns);
-    sqlite3_bind_int64(statement, 6, NowMs());
-    sqlite3_step(statement);
+    sqlite3_bind_int64(statement, 5, coverage.start_ns);
+    sqlite3_bind_int64(statement, 6, coverage.end_ns);
+    sqlite3_bind_int64(statement, 7, NowMs());
+    const int rc = sqlite3_step(statement);
+    const std::string error =
+        rc == SQLITE_DONE ? std::string{} : sqlite3_errmsg(market_db_);
     sqlite3_finalize(statement);
+    if (rc != SQLITE_DONE) return std::unexpected(error);
+    return {};
 }
 
 MarketDataStorageUsage Database::LoadMarketDataStorageUsage() {
@@ -1808,7 +2495,10 @@ MarketDataStorageUsage Database::LoadMarketDataStorageUsage() {
         "'typed_market_ticks_series',"
         "'market_tick_coverage',"
         "'sqlite_autoindex_market_tick_coverage_1',"
-        "'market_tick_coverage_lookup')");
+        "'market_tick_coverage_lookup',"
+        "'market_tick_coverage_v2',"
+        "'sqlite_autoindex_market_tick_coverage_v2_1',"
+        "'market_tick_coverage_v2_lookup')");
 
     std::error_code error;
     for (const std::filesystem::path path : {
@@ -1841,6 +2531,8 @@ DatabaseWriterTelemetry Database::WriterTelemetry() const {
         .accepted_bars = accepted_bars_,
         .dequeued_bars = dequeued_bars_,
         .dropped_bars = dropped_bars_,
+        .write_failures = write_failures_,
+        .last_write_error = last_write_error_,
     };
 }
 
@@ -1903,8 +2595,15 @@ void Database::WriterLoop() {
                 stopping_)
                 break;
         }
-        FlushEvents(batch);
-        FlushProviderBars(bar_batches);
+        const auto event_write = FlushEvents(batch);
+        const auto bar_write = FlushProviderBars(bar_batches);
+        if (!event_write || !bar_write) {
+            std::scoped_lock lock(queue_mutex_);
+            ++write_failures_;
+            last_write_error_ =
+                !event_write ? event_write.error()
+                             : bar_write.error();
+        }
         if (flush_target != 0) {
             {
                 std::scoped_lock lock(queue_mutex_);
@@ -1932,36 +2631,55 @@ void Database::WriterLoop() {
         }
         pending_bar_count_ = 0;
     }
-    FlushEvents(remaining);
-    FlushProviderBars(remaining_bar_batches);
+    const auto event_write = FlushEvents(remaining);
+    const auto bar_write = FlushProviderBars(remaining_bar_batches);
     {
         std::scoped_lock lock(queue_mutex_);
+        if (!event_write || !bar_write) {
+            ++write_failures_;
+            last_write_error_ =
+                !event_write ? event_write.error()
+                             : bar_write.error();
+        }
         flush_completed_ = flush_requested_;
     }
     flush_cv_.notify_all();
 }
 
-void Database::FlushEvents(std::vector<PendingEvent>& events) {
-    if (events.empty()) return;
+std::expected<void, std::string> Database::FlushEvents(
+    std::vector<PendingEvent>& events) {
+    if (events.empty()) return {};
     std::scoped_lock lock(db_mutex_);
     const auto flush_destination =
-        [&](bool market_tick) {
-            if (market_tick)
-                ExecuteMarket("BEGIN IMMEDIATE;");
-            else
-                Execute("BEGIN IMMEDIATE;");
+        [&](bool market_tick) -> std::expected<void, std::string> {
+            std::string error;
+            const bool began =
+                market_tick
+                    ? ExecuteMarket("BEGIN IMMEDIATE;", &error)
+                    : Execute("BEGIN IMMEDIATE;", &error);
+            if (!began) return std::unexpected(error);
             sqlite3_stmt* statement = nullptr;
             const char* sql =
                 market_tick
                     ? "INSERT OR IGNORE INTO market_tick_events("
-                      "feed,source_event_id,kind,symbol,event_time_ns,"
-                      "received_at_ms,raw_payload) VALUES(?,?,?,?,?,?,?)"
+                      "feed,source_event_id,kind,instrument_id,symbol,"
+                      "event_time_ns,received_at_ms,raw_payload)"
+                      " VALUES(?,?,?,?,?,?,?,?)"
                     : "INSERT OR IGNORE INTO timeline_events("
                       "source,source_event_id,kind,symbol,event_time_ms,"
                       "available_at_ms,recorded_at_ms,payload_json,"
                       "schema_version) VALUES(?,?,?,?,?,?,?,?,1)";
             sqlite3* connection = market_tick ? market_db_ : db_;
-            sqlite3_prepare_v2(connection, sql, -1, &statement, nullptr);
+            if (sqlite3_prepare_v2(
+                    connection, sql, -1, &statement, nullptr) !=
+                SQLITE_OK) {
+                error = sqlite3_errmsg(connection);
+                if (market_tick)
+                    ExecuteMarket("ROLLBACK;");
+                else
+                    Execute("ROLLBACK;");
+                return std::unexpected(error);
+            }
             for (const PendingEvent& event : events) {
                 if (event.market_tick != market_tick) continue;
                 if (market_tick && event.market_data_event)
@@ -1976,27 +2694,53 @@ void Database::FlushEvents(std::vector<PendingEvent>& events) {
                                       SQLITE_TRANSIENT);
                 sqlite3_bind_text(statement, 3, event.kind.c_str(), -1,
                                   SQLITE_TRANSIENT);
-                sqlite3_bind_text(statement, 4, event.symbol.c_str(), -1,
-                                  SQLITE_TRANSIENT);
-                sqlite3_bind_int64(statement, 5, event.event_time);
-                sqlite3_bind_int64(statement, 6, event.available_at_ms);
                 if (market_tick) {
-                    sqlite3_bind_text(statement, 7, event.payload.c_str(), -1,
+                    sqlite3_bind_text(
+                        statement, 4, event.instrument_id.c_str(), -1,
+                        SQLITE_TRANSIENT);
+                    sqlite3_bind_text(
+                        statement, 5, event.symbol.c_str(), -1,
+                        SQLITE_TRANSIENT);
+                    sqlite3_bind_int64(statement, 6, event.event_time);
+                    sqlite3_bind_int64(
+                        statement, 7, event.available_at_ms);
+                    sqlite3_bind_text(statement, 8, event.payload.c_str(), -1,
                                       SQLITE_TRANSIENT);
                 } else {
+                    sqlite3_bind_text(
+                        statement, 4, event.symbol.c_str(), -1,
+                        SQLITE_TRANSIENT);
+                    sqlite3_bind_int64(statement, 5, event.event_time);
+                    sqlite3_bind_int64(
+                        statement, 6, event.available_at_ms);
                     sqlite3_bind_int64(statement, 7, NowMs());
                     sqlite3_bind_text(statement, 8, event.payload.c_str(), -1,
                                       SQLITE_TRANSIENT);
                 }
-                sqlite3_step(statement);
+                if (sqlite3_step(statement) != SQLITE_DONE) {
+                    error = sqlite3_errmsg(connection);
+                    sqlite3_finalize(statement);
+                    if (market_tick)
+                        ExecuteMarket("ROLLBACK;");
+                    else
+                        Execute("ROLLBACK;");
+                    return std::unexpected(error);
+                }
                 sqlite3_reset(statement);
                 sqlite3_clear_bindings(statement);
             }
             sqlite3_finalize(statement);
-            if (market_tick)
-                ExecuteMarket("COMMIT;");
-            else
-                Execute("COMMIT;");
+            const bool committed =
+                market_tick ? ExecuteMarket("COMMIT;", &error)
+                            : Execute("COMMIT;", &error);
+            if (!committed) {
+                if (market_tick)
+                    ExecuteMarket("ROLLBACK;");
+                else
+                    Execute("ROLLBACK;");
+                return std::unexpected(error);
+            }
+            return {};
         };
     bool has_timeline = false;
     bool has_raw_ticks = false;
@@ -2011,13 +2755,21 @@ void Database::FlushEvents(std::vector<PendingEvent>& events) {
              static_cast<bool>(event.market_data_event));
         has_timeline = has_timeline || !event.market_tick;
     }
-    if (has_timeline) flush_destination(false);
-    if (has_raw_ticks) flush_destination(true);
-    if (!has_typed_ticks) return;
+    if (has_timeline) {
+        const auto written = flush_destination(false);
+        if (!written) return written;
+    }
+    if (has_raw_ticks) {
+        const auto written = flush_destination(true);
+        if (!written) return written;
+    }
+    if (!has_typed_ticks) return {};
 
-    ExecuteMarket("BEGIN IMMEDIATE;");
+    std::string error;
+    if (!ExecuteMarket("BEGIN IMMEDIATE;", &error))
+        return std::unexpected(error);
     sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(
+    if (sqlite3_prepare_v2(
         market_db_,
         "INSERT OR IGNORE INTO typed_market_ticks("
         "feed,source_event_id,kind,instrument_id,symbol,event_time_ns,"
@@ -2026,7 +2778,11 @@ void Database::FlushEvents(std::vector<PendingEvent>& events) {
         "bid_price_text,bid_size_text,bid_exchange,ask_price_text,"
         "ask_size_text,ask_exchange,corrected)"
         " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        -1, &statement, nullptr);
+        -1, &statement, nullptr) != SQLITE_OK) {
+        error = sqlite3_errmsg(market_db_);
+        ExecuteMarket("ROLLBACK;");
+        return std::unexpected(error);
+    }
     const auto bind_text =
         [statement](int column, const std::string* value) {
             if (!value || value->empty())
@@ -2130,17 +2886,26 @@ void Database::FlushEvents(std::vector<PendingEvent>& events) {
         bind_text(21, quote ? &quote->ask_exchange : nullptr);
         sqlite3_bind_int(statement, 22,
                          corrected || (trade && trade->corrected));
-        sqlite3_step(statement);
+        if (sqlite3_step(statement) != SQLITE_DONE) {
+            error = sqlite3_errmsg(market_db_);
+            sqlite3_finalize(statement);
+            ExecuteMarket("ROLLBACK;");
+            return std::unexpected(error);
+        }
         sqlite3_reset(statement);
         sqlite3_clear_bindings(statement);
     }
     sqlite3_finalize(statement);
-    ExecuteMarket("COMMIT;");
+    if (!ExecuteMarket("COMMIT;", &error)) {
+        ExecuteMarket("ROLLBACK;");
+        return std::unexpected(error);
+    }
+    return {};
 }
 
-void Database::FlushProviderBars(
+std::expected<void, std::string> Database::FlushProviderBars(
     const std::vector<tradebox::core::BarUpsertBatch>& batches) {
-    if (batches.empty()) return;
+    if (batches.empty()) return {};
     std::scoped_lock lock(db_mutex_);
-    StoreProviderBarBatchesLocked(batches);
+    return StoreProviderBarBatchesLocked(batches);
 }

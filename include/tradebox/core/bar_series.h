@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace tradebox::core {
@@ -46,6 +47,21 @@ struct BarRange {
     bool operator==(const BarRange&) const = default;
 };
 
+struct HistoricalBarQuery {
+    BarSeriesKey key;
+    std::string symbol;
+    BarRange range;
+};
+
+void MergeBarRange(std::vector<BarRange>& ranges,
+                   BarRange added);
+[[nodiscard]] std::vector<BarRange> MissingBarRanges(
+    const std::vector<BarRange>& covered,
+    BarRange requested);
+[[nodiscard]] std::vector<BarRange> SubtractBarRanges(
+    const std::vector<BarRange>& requested,
+    const std::vector<BarRange>& excluded);
+
 struct MarketBar {
     std::int64_t start_ns = 0;
     Decimal open;
@@ -74,9 +90,27 @@ struct BarSeriesSnapshot {
     std::string symbol;
     BarRange requested_range;
     std::vector<MarketBar> bars;
+    // The one still-forming candle for key.timeframe. It is separate
+    // from finalized/revised bars and is not specific to one minute.
+    std::optional<MarketBar> current_bar;
+    std::optional<CanonicalMarketPrice> latest_price;
     std::vector<BarRange> missing_ranges;
     std::uint64_t revision = 0;
 };
+
+// Alpaca fixed intraday timeframe syntax: [1-59]Min/[1-59]T and
+// [1-23]Hour/[1-23]H. Calendar/session bars stay provider-owned.
+[[nodiscard]] std::optional<std::int64_t> FixedBarDurationNs(
+    std::string_view timeframe);
+
+// Produces one coherent current candle for snapshot.key.timeframe.
+// finalized_raw_minutes are the provider's raw 1Min base bars for the
+// current target interval. Provider open bars (for example 1Day) use
+// the same current_bar output.
+void ConvergeLiveBar(
+    BarSeriesSnapshot& snapshot,
+    const MarketDataSnapshot& live,
+    const std::vector<MarketBar>& finalized_raw_minutes = {});
 
 struct ChangedBarSeries {
     std::uint64_t sequence = 0;

@@ -13,6 +13,10 @@ namespace {
 
 using namespace tradebox::core;
 
+Decimal D(std::string_view text) {
+    return *Decimal::Parse(text);
+}
+
 class FixedClock final : public IClock {
 public:
     std::chrono::system_clock::time_point Now() const override {
@@ -191,6 +195,60 @@ TEST(TradingCore, DisconnectClearsLiveBarriersAndMarksStateStale) {
     EXPECT_FALSE(snapshot.trade_updates_acknowledged);
     EXPECT_FALSE(snapshot.initial_snapshot_loaded);
     EXPECT_FALSE(snapshot.reconciled);
+}
+
+TEST(TradingCore,
+     DisconnectDuringFillRetainsVisibleStateUntilReconnectReconciliation) {
+    MemoryJournal journal;
+    FixedClock clock;
+    TradingCore core(journal, clock);
+    ASSERT_TRUE(core.Ingest(
+        Event(BrokerEventKind::ConnectionAttemptStarted, 1)));
+    ASSERT_TRUE(core.Ingest(Event(BrokerEventKind::Authorized, 1)));
+    ASSERT_TRUE(core.Ingest(
+        Event(BrokerEventKind::TradeUpdatesAcknowledged, 1)));
+    ASSERT_TRUE(core.Ingest(AccountEvent(1)));
+    ASSERT_TRUE(core.Ingest(PositionsEvent(1)));
+
+    OrderState order;
+    order.id = "disconnect-fill";
+    order.asset_id = "asset-1";
+    order.symbol = "TEST";
+    order.qty = *Decimal::Parse("1");
+    order.filled_qty = Decimal::Zero();
+    ASSERT_TRUE(core.Ingest(OrdersEvent(1, {order})));
+
+    order.filled_qty = *Decimal::Parse("0.5");
+    ASSERT_TRUE(core.Ingest(BrokerEvent{
+        .kind = BrokerEventKind::TradeUpdate,
+        .generation = ConnectionGeneration{1},
+        .source_event_id = "disconnect-fill-execution",
+        .payload = TradeUpdatePayload{
+            .event = "partial_fill",
+            .execution_id = "disconnect-fill-execution",
+            .order = order,
+            .position_qty = *Decimal::Parse("0.5"),
+            .event_at_ms = 2000,
+        },
+    }));
+    ASSERT_TRUE(core.Ingest(
+        Event(BrokerEventKind::Disconnected, 1)));
+
+    const CoreSnapshot stale = core.Snapshot();
+    EXPECT_EQ(stale.safety_status, SafetyStatus::Stale);
+    ASSERT_EQ(stale.orders.size(), 1U);
+    EXPECT_EQ(stale.orders.front().filled_qty.ToString(), "0.5");
+    ASSERT_EQ(stale.positions.size(), 1U);
+    EXPECT_EQ(stale.positions.front().qty.ToString(), "0.5");
+    EXPECT_FALSE(stale.trading_permitted);
+
+    ASSERT_TRUE(core.Ingest(Event(BrokerEventKind::Authorized, 1)));
+    ASSERT_TRUE(core.Ingest(
+        Event(BrokerEventKind::TradeUpdatesAcknowledged, 1)));
+    ASSERT_TRUE(core.Ingest(AccountEvent(1)));
+    ASSERT_TRUE(core.Ingest(PositionsEvent(1)));
+    ASSERT_TRUE(core.Ingest(OrdersEvent(1, {order})));
+    EXPECT_EQ(core.Snapshot().safety_status, SafetyStatus::Live);
 }
 
 TEST(TradingCore, AppliesTradeUpdatesIdempotentlyByExecutionId) {
@@ -419,6 +477,222 @@ TEST(TradingCore, FillPublishesProvisionalExactPositionUntilRestSnapshots) {
     ASSERT_EQ(reconciled.positions.size(), 1U);
     EXPECT_FALSE(reconciled.positions.front().provisional);
     EXPECT_EQ(reconciled.safety_status, SafetyStatus::Live);
+}
+
+TEST(TradingCore, ProjectsLongPositionFromCanonicalMarketPriceExactly) {
+    MemoryJournal journal;
+    FixedClock clock;
+    TradingCore core(journal, clock);
+    PositionState position;
+    position.asset_id = "asset-1";
+    position.symbol = "TEST";
+    position.side = "long";
+    position.qty = D("2.5");
+    position.avg_entry_price = D("100");
+    position.lastday_price = D("99.5");
+    ASSERT_TRUE(core.Ingest(PositionsEvent(0, {position})));
+
+    core.ApplyMarketData(MarketDataSnapshot{
+        .instrument_id = "asset-1",
+        .symbol = "TEST",
+        .feed = MarketDataFeed::Iex,
+        .stream_status = MarketStreamStatus::Subscribed,
+        .trades_subscribed = true,
+        .latest_price = CanonicalMarketPrice{
+            .price = D("101.2"),
+            .event_time_ns = 10,
+            .received_at_ms = 2000,
+        },
+    });
+
+    const CoreSnapshot snapshot = core.Snapshot();
+    const PositionState& valued = snapshot.positions.front();
+    EXPECT_TRUE(valued.valuation_current);
+    EXPECT_TRUE(valued.valuation_from_market_stream);
+    EXPECT_EQ(valued.valuation_feed, MarketDataFeed::Iex);
+    EXPECT_EQ(valued.current_price.ToString(), "101.2");
+    EXPECT_EQ(valued.market_value.ToString(), "253");
+    EXPECT_EQ(valued.unrealized_pl.ToString(), "3");
+    EXPECT_EQ(valued.unrealized_plpc.ToString(), "0.012");
+    EXPECT_EQ(valued.unrealized_intraday_pl.ToString(), "4.25");
+    EXPECT_EQ(valued.change_today.ToString(), "0.017085427");
+}
+
+TEST(TradingCore, ProjectsShortPositionWithSignedExactPnL) {
+    MemoryJournal journal;
+    FixedClock clock;
+    TradingCore core(journal, clock);
+    PositionState position;
+    position.asset_id = "asset-short";
+    position.symbol = "SHORT";
+    position.side = "short";
+    position.qty = D("-3");
+    position.avg_entry_price = D("100");
+    position.lastday_price = D("101");
+    ASSERT_TRUE(core.Ingest(PositionsEvent(0, {position})));
+
+    core.ApplyMarketData(MarketDataSnapshot{
+        .instrument_id = "asset-short",
+        .symbol = "SHORT",
+        .feed = MarketDataFeed::Sip,
+        .stream_status = MarketStreamStatus::Subscribed,
+        .trades_subscribed = true,
+        .latest_price = CanonicalMarketPrice{
+            .price = D("95"),
+            .event_time_ns = 30,
+            .received_at_ms = 2000,
+        },
+    });
+
+    const CoreSnapshot snapshot = core.Snapshot();
+    const PositionState& valued = snapshot.positions.front();
+    EXPECT_EQ(valued.market_value.ToString(), "-285");
+    EXPECT_EQ(valued.unrealized_pl.ToString(), "15");
+    EXPECT_EQ(valued.unrealized_plpc.ToString(), "0.05");
+    EXPECT_EQ(valued.unrealized_intraday_pl.ToString(), "18");
+    EXPECT_EQ(valued.unrealized_intraday_plpc.ToString(),
+              "0.059405941");
+    EXPECT_EQ(valued.change_today.ToString(), "-0.059405941");
+}
+
+TEST(TradingCore,
+     CorrectionsRevalueWhileWrongFeedAndStalePricesAreNotCurrent) {
+    MemoryJournal journal;
+    FixedClock clock;
+    TradingCore core(journal, clock);
+    PositionState position;
+    position.asset_id = "asset-1";
+    position.symbol = "TEST";
+    position.qty = D("1");
+    position.avg_entry_price = D("100");
+    position.lastday_price = D("99");
+    ASSERT_TRUE(core.Ingest(PositionsEvent(0, {position})));
+
+    auto market = MarketDataSnapshot{
+        .instrument_id = "asset-1",
+        .symbol = "TEST",
+        .feed = MarketDataFeed::Iex,
+        .stream_status = MarketStreamStatus::Subscribed,
+        .trades_subscribed = true,
+        .latest_price = CanonicalMarketPrice{
+            .price = D("102"),
+            .event_time_ns = 50,
+            .received_at_ms = 2000,
+        },
+    };
+    core.ApplyMarketData(market);
+    market.latest_price->price = D("101");
+    core.ApplyMarketData(market);
+    EXPECT_EQ(core.Snapshot().positions.front()
+                  .current_price.ToString(),
+              "101");
+
+    market.feed = MarketDataFeed::Sip;
+    market.latest_price->price = D("999");
+    market.latest_price->event_time_ns = 51;
+    core.ApplyMarketData(market);
+    auto snapshot = core.Snapshot();
+    EXPECT_FALSE(snapshot.positions.front().valuation_current);
+    EXPECT_EQ(snapshot.positions.front().current_price.ToString(),
+              "101");
+
+    market.feed = MarketDataFeed::Iex;
+    market.stream_status = MarketStreamStatus::Stale;
+    market.latest_price->price = D("103");
+    market.latest_price->event_time_ns = 52;
+    core.ApplyMarketData(market);
+    snapshot = core.Snapshot();
+    EXPECT_FALSE(snapshot.positions.front().valuation_current);
+    EXPECT_EQ(snapshot.positions.front().current_price.ToString(),
+              "101");
+
+    market.feed = MarketDataFeed::Sip;
+    market.stream_status = MarketStreamStatus::Connecting;
+    market.latest_price.reset();
+    core.ApplyMarketData(market);
+    market.stream_status = MarketStreamStatus::Subscribed;
+    market.latest_price = CanonicalMarketPrice{
+        .price = D("104"),
+        .event_time_ns = 53,
+        .received_at_ms = 2003,
+    };
+    core.ApplyMarketData(market);
+    snapshot = core.Snapshot();
+    EXPECT_TRUE(snapshot.positions.front().valuation_current);
+    EXPECT_EQ(snapshot.positions.front().valuation_feed,
+              MarketDataFeed::Sip);
+    EXPECT_EQ(snapshot.positions.front().current_price.ToString(),
+              "104");
+}
+
+TEST(TradingCore,
+     RestSnapshotReanchorsValuationAndPartialFillDoesNotInventBasis) {
+    MemoryJournal journal;
+    FixedClock clock;
+    TradingCore core(journal, clock);
+    PositionState authoritative;
+    authoritative.asset_id = "asset-1";
+    authoritative.symbol = "TEST";
+    authoritative.qty = D("4");
+    authoritative.avg_entry_price = D("50");
+    authoritative.current_price = D("51");
+    authoritative.market_value = D("204");
+    authoritative.unrealized_pl = D("4");
+    ASSERT_TRUE(
+        core.Ingest(PositionsEvent(0, {authoritative})));
+    auto snapshot = core.Snapshot();
+    EXPECT_TRUE(snapshot.positions.front().valuation_current);
+    EXPECT_FALSE(snapshot.positions.front()
+                     .valuation_from_market_stream);
+    EXPECT_EQ(snapshot.positions.front().market_value.ToString(),
+              "204");
+    core.ApplyMarketData(MarketDataSnapshot{
+        .instrument_id = "asset-1",
+        .symbol = "TEST",
+        .feed = MarketDataFeed::Iex,
+        .stream_status = MarketStreamStatus::Subscribed,
+        .trades_subscribed = true,
+        .latest_price = CanonicalMarketPrice{
+            .price = D("49"),
+            .event_time_ns = 1,
+            .received_at_ms = 1000,
+        },
+    });
+    snapshot = core.Snapshot();
+    EXPECT_FALSE(snapshot.positions.front()
+                     .valuation_from_market_stream);
+    EXPECT_EQ(snapshot.positions.front().current_price.ToString(),
+              "51");
+
+    PositionState provisional;
+    provisional.asset_id = "asset-2";
+    provisional.symbol = "NEW";
+    provisional.qty = D("0.25");
+    provisional.provisional = true;
+    ASSERT_TRUE(core.Ingest(BrokerEvent{
+        .kind = BrokerEventKind::PositionsSnapshot,
+        .generation = ConnectionGeneration{0},
+        .payload = PositionsSnapshotPayload{
+            .positions = {provisional},
+            .received_at_ms = 0,
+        },
+    }));
+    core.ApplyMarketData(MarketDataSnapshot{
+        .instrument_id = "asset-2",
+        .symbol = "NEW",
+        .feed = MarketDataFeed::Iex,
+        .stream_status = MarketStreamStatus::Subscribed,
+        .trades_subscribed = true,
+        .latest_price = CanonicalMarketPrice{
+            .price = D("20"),
+            .event_time_ns = 70,
+            .received_at_ms = 80,
+        },
+    });
+    snapshot = core.Snapshot();
+    EXPECT_FALSE(snapshot.positions.front().valuation_current);
+    EXPECT_EQ(snapshot.positions.front().market_value.ToString(),
+              "0");
 }
 
 TEST(TradingCore, CommandsAreTypedAndReceiveMonotonicIds) {

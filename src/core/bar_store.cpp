@@ -62,10 +62,19 @@ bool BarStore::Upsert(BarUpsertBatch batch) {
             changed = true;
             continue;
         }
+        // An updated stream bar is the provider's correction of its
+        // normal minute bar. A duplicate or late normal delivery must
+        // not roll that correction back.
+        if (position->source == BarSource::ProviderStream &&
+            position->state == BarState::Revised &&
+            incoming.source == BarSource::ProviderStream &&
+            incoming.state == BarState::Finalized)
+            continue;
         if (SamePayload(*position, incoming)) continue;
         incoming.revision = position->revision + 1;
-        if (position->state == BarState::Finalized ||
-            position->state == BarState::Revised)
+        if (incoming.state != BarState::Open &&
+            (position->state == BarState::Finalized ||
+             position->state == BarState::Revised))
             incoming.state = BarState::Revised;
         *position = std::move(incoming);
         changed = true;
@@ -75,7 +84,7 @@ bool BarStore::Upsert(BarUpsertBatch batch) {
         batch.covered_range->start_ns <
             batch.covered_range->end_ns) {
         const std::vector<BarRange> previous = state.coverage;
-        MergeCoverage(state.coverage, *batch.covered_range);
+        MergeBarRange(state.coverage, *batch.covered_range);
         changed = changed || previous != state.coverage;
     }
     if (changed) {
@@ -107,7 +116,7 @@ BarSeriesSnapshot BarStore::Bars(
         state.bars, range.end_ns, {}, &MarketBar::start_ns);
     result.bars.assign(first, last);
     result.missing_ranges =
-        MissingRanges(state.coverage, range);
+        MissingBarRanges(state.coverage, range);
     return result;
 }
 
@@ -150,52 +159,6 @@ ChangedBarSeriesBatch BarStore::BarChanges(
         result.next_sequence =
             std::max(after_sequence, changes_.Newest());
     return result;
-}
-
-void BarStore::MergeCoverage(
-    std::vector<BarRange>& coverage, BarRange added) {
-    std::vector<BarRange> merged;
-    merged.reserve(coverage.size() + 1);
-    bool inserted = false;
-    for (const BarRange range : coverage) {
-        if (range.end_ns < added.start_ns) {
-            merged.push_back(range);
-        } else if (added.end_ns < range.start_ns) {
-            if (!inserted) {
-                merged.push_back(added);
-                inserted = true;
-            }
-            merged.push_back(range);
-        } else {
-            added.start_ns =
-                std::min(added.start_ns, range.start_ns);
-            added.end_ns =
-                std::max(added.end_ns, range.end_ns);
-        }
-    }
-    if (!inserted) merged.push_back(added);
-    coverage = std::move(merged);
-}
-
-std::vector<BarRange> BarStore::MissingRanges(
-    const std::vector<BarRange>& coverage, BarRange requested) {
-    std::vector<BarRange> missing;
-    if (requested.start_ns >= requested.end_ns) return missing;
-    std::int64_t cursor = requested.start_ns;
-    for (const BarRange range : coverage) {
-        if (range.end_ns <= cursor) continue;
-        if (range.start_ns >= requested.end_ns) break;
-        if (range.start_ns > cursor)
-            missing.push_back({
-                cursor,
-                std::min(range.start_ns, requested.end_ns),
-            });
-        cursor = std::max(cursor, range.end_ns);
-        if (cursor >= requested.end_ns) break;
-    }
-    if (cursor < requested.end_ns)
-        missing.push_back({cursor, requested.end_ns});
-    return missing;
 }
 
 void BarStore::RecordChange(

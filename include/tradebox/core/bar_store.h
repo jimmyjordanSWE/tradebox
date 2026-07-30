@@ -34,10 +34,6 @@ private:
         std::uint64_t change_sequence = 0;
     };
 
-    static void MergeCoverage(
-        std::vector<BarRange>& coverage, BarRange added);
-    static std::vector<BarRange> MissingRanges(
-        const std::vector<BarRange>& coverage, BarRange requested);
     void RecordChange(const BarSeriesKey& key,
                       SeriesState& state);
 

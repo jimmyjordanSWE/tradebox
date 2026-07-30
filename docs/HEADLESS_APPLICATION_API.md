@@ -7,7 +7,8 @@ injectable `OrderExecutionService`.
 
 ## Command contract
 
-Every place, cancel, or replace command carries:
+Every place, replace, cancel, cancel-all, position-close, or close-all command
+carries:
 
 - A caller-generated, globally unique `request_id`.
 - A stable source name such as `gui`, `cli`, `strategy`, or `llm`.
@@ -31,7 +32,9 @@ The application processes commands on one serialized worker:
 5. Validate the broker-native order or replacement.
 6. Issue exactly one broker request.
 7. Durably record the HTTP outcome.
-8. Return `BrokerAccepted`, `BrokerRejected`, or `Indeterminate`.
+8. Return a typed outcome: validation/safety/recovery rejection,
+   `BrokerAccepted`, `BrokerRejected`, `PartiallyAccepted`, `Indeterminate`,
+   `Duplicate`, `NotDispatched`, or `ServiceStopped`.
 
 A transport error, timeout, HTTP 408/429/5xx response, or failure to persist
 the returned outcome is `Indeterminate`. TradeBox does not automatically retry
@@ -56,7 +59,7 @@ events and reconciliation.
 
 ## Market-data projection
 
-`TradingApplication::MarketData(symbol)` exposes a read-only headless
+`TradingApplication::MarketData(symbol)` exposes a read-only quote/trade
 projection containing:
 
 - Exact bid/ask price and size.
@@ -65,6 +68,11 @@ projection containing:
 - Trade-ID deduplication.
 - Trade correction and cancellation handling.
 - Feed, stream, and quote/trade subscription health.
+
+`TradingApplication::Bars(key, range)` exposes stable-instrument-ID,
+timeframe-specific candlestick series. `ChangedMarketInstruments`,
+`MarketDataChanges`, and `ChangedBarSeries` provide bounded incremental reads
+for clients that do not need to copy a complete snapshot every frame.
 
 Rendering policy, chart zoom, colors, and order-form drafts belong to interface
 adapters and are not part of this API.

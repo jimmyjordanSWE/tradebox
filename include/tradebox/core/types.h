@@ -28,6 +28,8 @@ enum class SafetyStatus {
     Error,
 };
 
+enum class MarketDataFeed { Unknown, Iex, Sip };
+
 struct ConnectionGeneration {
     std::uint64_t value = 0;
 
@@ -144,6 +146,11 @@ struct PositionState {
     Decimal lastday_price;
     Decimal change_today;
     bool provisional = false;
+    bool valuation_current = false;
+    bool valuation_from_market_stream = false;
+    MarketDataFeed valuation_feed = MarketDataFeed::Unknown;
+    std::int64_t valuation_event_time_ns = 0;
+    std::int64_t valuation_received_at_ms = 0;
 };
 
 struct AccountSnapshotPayload {

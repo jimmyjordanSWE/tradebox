@@ -2,6 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <tuple>
+#include <vector>
+
 namespace {
 
 using namespace tradebox::core;
@@ -32,6 +35,7 @@ TEST(MarketDataStore, PublishesExactQuoteAndSubscriptionHealth) {
         .trade_symbols = {"AAPL"},
         .quote_symbols = {"AAPL"},
         .message = "subscribed",
+        .received_at_ms = 500,
     });
     store.Ingest(QuoteReceived{
         .quote =
@@ -52,6 +56,7 @@ TEST(MarketDataStore, PublishesExactQuoteAndSubscriptionHealth) {
     EXPECT_EQ(snapshot.stream_status, MarketStreamStatus::Subscribed);
     EXPECT_TRUE(snapshot.trades_subscribed);
     EXPECT_TRUE(snapshot.quotes_subscribed);
+    EXPECT_EQ(snapshot.projection_started_at_ns, 500'000'000);
     ASSERT_TRUE(snapshot.latest_quote);
     EXPECT_EQ(snapshot.latest_quote->bid_price.ToString(), "201.1234");
     EXPECT_EQ(snapshot.latest_quote->ask_price.ToString(), "201.1235");
@@ -283,6 +288,267 @@ TEST(MarketDataStore,
     ASSERT_EQ(changes.instruments.size(), 2U);
     EXPECT_EQ(changes.instruments.front().sequence, 3U);
     EXPECT_EQ(changes.instruments.back().sequence, 4U);
+}
+
+TEST(MarketDataStore,
+     PublishesCanonicalPriceAndProvisionalMinuteAtomically) {
+    constexpr std::int64_t minute = 60LL * 1'000'000'000;
+    MarketDataStore store;
+    store.Ingest(MarketStreamChanged{
+        .status = MarketStreamStatus::Subscribed,
+        .feed = MarketDataFeed::Sip,
+        .trade_symbols = {"AAPL"},
+    });
+    auto first = Trade("1", "201.25", "first", minute + 10);
+    first.tape = "C";
+    first.conditions = {"@"};
+    first.size = D("100.5");
+    store.Ingest(TradeReceived{.trade = std::move(first)});
+    auto second = Trade("2", "202.75", "second", minute + 20);
+    second.tape = "C";
+    second.conditions = {"@"};
+    second.size = D("2.25");
+    store.Ingest(TradeReceived{.trade = std::move(second)});
+
+    const auto snapshot = store.Snapshot("AAPL");
+    ASSERT_TRUE(snapshot.latest_price);
+    EXPECT_EQ(snapshot.latest_price->price.ToString(), "202.75");
+    EXPECT_EQ(snapshot.latest_price->trade_id, "2");
+    ASSERT_EQ(snapshot.provisional_minute_bars.size(), 1U);
+    const auto& bar = snapshot.provisional_minute_bars.front();
+    EXPECT_EQ(bar.start_ns, minute);
+    EXPECT_EQ(bar.open.ToString(), "201.25");
+    EXPECT_EQ(bar.high.ToString(), "202.75");
+    EXPECT_EQ(bar.low.ToString(), "201.25");
+    EXPECT_EQ(bar.close.ToString(), "202.75");
+    EXPECT_EQ(bar.volume.ToString(), "102.75");
+    EXPECT_EQ(bar.trade_count, 2U);
+}
+
+TEST(MarketDataStore,
+     AppliesAlpacaMinuteConditionRulesToLiveProjection) {
+    constexpr std::int64_t minute = 60LL * 1'000'000'000;
+    MarketDataStore store;
+    auto regular = Trade("regular", "200", "regular", minute + 1);
+    regular.tape = "C";
+    regular.conditions = {"@"};
+    regular.size = D("10");
+    store.Ingest(TradeReceived{.trade = std::move(regular)});
+
+    auto odd_lot = Trade("odd", "999", "odd", minute + 2);
+    odd_lot.tape = "C";
+    odd_lot.conditions = {"@", "I"};
+    odd_lot.size = D("3");
+    store.Ingest(TradeReceived{.trade = std::move(odd_lot)});
+
+    const auto snapshot = store.Snapshot("AAPL");
+    ASSERT_TRUE(snapshot.latest_price);
+    EXPECT_EQ(snapshot.latest_price->price.ToString(), "200");
+    ASSERT_EQ(snapshot.provisional_minute_bars.size(), 1U);
+    EXPECT_EQ(snapshot.provisional_minute_bars[0].high.ToString(),
+              "200");
+    EXPECT_EQ(snapshot.provisional_minute_bars[0].close.ToString(),
+              "200");
+    EXPECT_EQ(snapshot.provisional_minute_bars[0].volume.ToString(),
+              "13");
+    EXPECT_EQ(snapshot.provisional_minute_bars[0].trade_count, 2U);
+}
+
+TEST(MarketDataStore,
+     RebuildsLivePriceAndMinuteAfterCorrectionAndCancel) {
+    constexpr std::int64_t minute = 60LL * 1'000'000'000;
+    MarketDataStore store;
+    auto first = Trade("first", "100", "first", minute + 1);
+    first.tape = "C";
+    first.conditions = {"@"};
+    first.size = D("10");
+    store.Ingest(TradeReceived{.trade = std::move(first)});
+    auto second = Trade("second", "110", "second", minute + 2);
+    second.tape = "C";
+    second.conditions = {"@"};
+    second.size = D("20");
+    store.Ingest(TradeReceived{.trade = std::move(second)});
+
+    auto corrected =
+        Trade("second-corrected", "105", "corrected", minute + 2);
+    corrected.tape = "C";
+    corrected.conditions = {"@"};
+    corrected.size = D("5");
+    store.Ingest(TradeCorrected{
+        .symbol = "AAPL",
+        .original_trade_id = "second",
+        .corrected_trade = std::move(corrected),
+    });
+    auto snapshot = store.Snapshot("AAPL");
+    ASSERT_TRUE(snapshot.latest_price);
+    EXPECT_EQ(snapshot.latest_price->price.ToString(), "105");
+    ASSERT_EQ(snapshot.provisional_minute_bars.size(), 1U);
+    EXPECT_EQ(snapshot.provisional_minute_bars[0].high.ToString(),
+              "105");
+    EXPECT_EQ(snapshot.provisional_minute_bars[0].volume.ToString(),
+              "15");
+
+    store.Ingest(TradeCanceled{
+        .symbol = "AAPL",
+        .trade_id = "second-corrected",
+        .event_time_ns = minute + 2,
+    });
+    snapshot = store.Snapshot("AAPL");
+    ASSERT_TRUE(snapshot.latest_price);
+    EXPECT_EQ(snapshot.latest_price->price.ToString(), "100");
+    ASSERT_EQ(snapshot.provisional_minute_bars.size(), 1U);
+    EXPECT_EQ(snapshot.provisional_minute_bars[0].close.ToString(),
+              "100");
+    EXPECT_EQ(snapshot.provisional_minute_bars[0].volume.ToString(),
+              "10");
+}
+
+TEST(MarketDataStore,
+     RemovesNonExtremumTradeWithoutChangingMinutePrices) {
+    constexpr std::int64_t minute = 60LL * 1'000'000'000;
+    MarketDataStore store;
+    for (const auto& [id, price, size, offset] :
+         std::vector<std::tuple<const char*, const char*,
+                                const char*, std::int64_t>>{
+             {"open", "100", "10", 1},
+             {"middle", "101", "20", 2},
+             {"close", "102", "30", 3},
+         }) {
+        auto trade = Trade(id, price, id, minute + offset);
+        trade.tape = "C";
+        trade.conditions = {"@"};
+        trade.size = D(size);
+        store.Ingest(TradeReceived{.trade = std::move(trade)});
+    }
+
+    store.Ingest(TradeCanceled{
+        .symbol = "AAPL",
+        .trade_id = "middle",
+        .event_time_ns = minute + 2,
+    });
+    const auto snapshot = store.Snapshot("AAPL");
+    ASSERT_TRUE(snapshot.latest_price);
+    EXPECT_EQ(snapshot.latest_price->price.ToString(), "102");
+    ASSERT_EQ(snapshot.provisional_minute_bars.size(), 1U);
+    const auto& bar = snapshot.provisional_minute_bars[0];
+    EXPECT_EQ(bar.open.ToString(), "100");
+    EXPECT_EQ(bar.high.ToString(), "102");
+    EXPECT_EQ(bar.low.ToString(), "100");
+    EXPECT_EQ(bar.close.ToString(), "102");
+    EXPECT_EQ(bar.volume.ToString(), "40");
+    EXPECT_EQ(bar.trade_count, 2U);
+}
+
+TEST(MarketDataStore,
+     RolloverPublishesOnlyOpenMinuteAndLateTradeStaysClosed) {
+    constexpr std::int64_t minute = 60LL * 1'000'000'000;
+    MarketDataStore store;
+    auto first = Trade("first", "100", "first", minute + 1);
+    first.tape = "C";
+    first.conditions = {"@"};
+    store.Ingest(TradeReceived{.trade = std::move(first)});
+
+    auto next = Trade("next", "110", "next", 2 * minute + 1);
+    next.tape = "C";
+    next.conditions = {"@"};
+    store.Ingest(TradeReceived{.trade = std::move(next)});
+
+    auto late = Trade("late", "999", "late", minute + 2);
+    late.tape = "C";
+    late.conditions = {"@"};
+    store.Ingest(TradeReceived{.trade = std::move(late)});
+
+    const auto snapshot = store.Snapshot("AAPL");
+    ASSERT_EQ(snapshot.provisional_minute_bars.size(), 1U);
+    EXPECT_EQ(snapshot.provisional_minute_bars[0].start_ns,
+              2 * minute);
+    EXPECT_EQ(snapshot.provisional_minute_bars[0].high.ToString(),
+              "110");
+}
+
+TEST(MarketDataStore, ReconnectBoundaryClearsLiveProjection) {
+    constexpr std::int64_t minute = 60LL * 1'000'000'000;
+    MarketDataStore store;
+    store.Ingest(MarketStreamChanged{
+        .status = MarketStreamStatus::Subscribed,
+        .feed = MarketDataFeed::Iex,
+    });
+    auto trade = Trade("before", "100", "before", minute + 1);
+    trade.tape = "C";
+    trade.conditions = {"@"};
+    store.Ingest(TradeReceived{.trade = std::move(trade)});
+    ASSERT_TRUE(store.Snapshot("AAPL").latest_price);
+
+    store.Ingest(MarketStreamChanged{
+        .status = MarketStreamStatus::Connecting,
+        .feed = MarketDataFeed::Iex,
+    });
+    const auto snapshot = store.Snapshot("AAPL");
+    EXPECT_FALSE(snapshot.latest_price);
+    EXPECT_TRUE(snapshot.provisional_minute_bars.empty());
+}
+
+TEST(MarketDataStore, ClearsLiveProjectionWhenFeedChanges) {
+    constexpr std::int64_t minute = 60LL * 1'000'000'000;
+    MarketDataStore store;
+    store.Ingest(MarketStreamChanged{
+        .status = MarketStreamStatus::Subscribed,
+        .feed = MarketDataFeed::Iex,
+    });
+    auto trade = Trade("iex", "100", "iex", minute + 1);
+    trade.tape = "C";
+    trade.conditions = {"@"};
+    store.Ingest(TradeReceived{.trade = std::move(trade)});
+    ASSERT_TRUE(store.Snapshot("AAPL").latest_price);
+
+    store.Ingest(MarketStreamChanged{
+        .status = MarketStreamStatus::Subscribed,
+        .feed = MarketDataFeed::Sip,
+    });
+    const auto snapshot = store.Snapshot("AAPL");
+    EXPECT_FALSE(snapshot.latest_price);
+    EXPECT_TRUE(snapshot.provisional_minute_bars.empty());
+}
+
+TEST(MarketDataStore,
+     PublishesLatestStockTradingStatusAndIgnoresOlderStatus) {
+    MarketDataStore store;
+    store.Ingest(MarketStreamChanged{
+        .status = MarketStreamStatus::Subscribed,
+        .feed = MarketDataFeed::Sip,
+        .trade_symbols = {"AAPL"},
+        .quote_symbols = {"AAPL"},
+        .status_symbols = {"*"},
+    });
+    store.Ingest(TradingStatusReceived{
+        .status = {
+            .instrument_id = "asset-aapl",
+            .symbol = "AAPL",
+            .state = SecurityTradingState::Halted,
+            .status_code = "H",
+            .status_message = "Trading Halt",
+            .event_time_ns = 200,
+            .received_at_ms = 20,
+        },
+    });
+    store.Ingest(TradingStatusReceived{
+        .status = {
+            .instrument_id = "asset-aapl",
+            .symbol = "AAPL",
+            .state = SecurityTradingState::Trading,
+            .status_code = "T",
+            .status_message = "Trading Resumption",
+            .event_time_ns = 100,
+            .received_at_ms = 10,
+        },
+    });
+
+    const auto snapshot = store.Snapshot("asset-aapl");
+    EXPECT_TRUE(snapshot.statuses_subscribed);
+    ASSERT_TRUE(snapshot.trading_status);
+    EXPECT_EQ(snapshot.trading_status->state,
+              SecurityTradingState::Halted);
+    EXPECT_EQ(snapshot.trading_status->status_code, "H");
 }
 
 }  // namespace

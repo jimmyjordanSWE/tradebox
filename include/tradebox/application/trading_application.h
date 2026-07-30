@@ -1,9 +1,11 @@
 #pragma once
 
 #include "tradebox/core/order_command.h"
+#include "tradebox/core/account_activity.h"
 #include "tradebox/core/bar_series.h"
 #include "tradebox/core/market_data.h"
 #include "tradebox/core/types.h"
+#include "tradebox/core/rest_health.h"
 
 #include <expected>
 #include <future>
@@ -28,6 +30,9 @@ struct ConnectionRequest {
 class TradingApplication final {
 public:
     explicit TradingApplication(Database& database);
+    TradingApplication(
+        Database& database,
+        core::IOrderCommandJournal& order_journal);
     TradingApplication(UiEventQueue& events, Database& database);
     ~TradingApplication();
 
@@ -59,10 +64,20 @@ public:
         core::NativeOrderCommand command);
     [[nodiscard]] std::expected<core::OrderCommandLookup, std::string>
     OrderCommandStatus(const std::string& request_id);
+    [[nodiscard]] core::AccountActivityPage AccountActivities(
+        const core::AccountActivityQuery& query) const;
+    void RefreshAccountActivities();
+    [[nodiscard]] core::RestTransportHealth RestHealth() const;
+    [[nodiscard]] core::MarketDataPipelineHealth
+    MarketDataHealth() const;
 
     void RefreshMarketSymbols(const std::vector<std::string>& symbols);
     void RequestMarketHistory(const std::string& symbol,
                               const std::string& timeframe = "1Day");
+    void RequestMarketHistory(const std::string& symbol,
+                              const std::string& timeframe,
+                              core::BarRange range);
+    void RequestMarketHistory(core::HistoricalBarQuery query);
     [[nodiscard]] std::future<core::TickSeries> RequestTicks(
         core::TickQuery query);
     void RefreshAssetCatalog();

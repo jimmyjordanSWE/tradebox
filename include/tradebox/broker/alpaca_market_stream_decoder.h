@@ -23,6 +23,7 @@ struct StreamControl {
     std::string message;
     std::vector<std::string> trade_symbols;
     std::vector<std::string> quote_symbols;
+    std::vector<std::string> status_symbols;
 };
 
 struct DecodedBar {

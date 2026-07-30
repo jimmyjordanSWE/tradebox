@@ -101,5 +101,5 @@ Watchlist**. One window appears containing the saved ETF list and one combined
 chart. The default view is normalized performance; the user can switch to raw
 price or choose a numerator and denominator for a relative-strength chart.
 
-This design is intentionally parked until the current menu, account selection,
-login, and credential flow are established.
+This remains a future product surface built on the V1 market-data and workspace
+foundations.

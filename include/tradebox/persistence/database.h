@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tradebox/core/order_command.h"
+#include "tradebox/core/account_activity.h"
 #include "tradebox/core/asset_catalog.h"
 #include "tradebox/core/bar_series.h"
 #include "tradebox/core/market_data.h"
@@ -9,6 +10,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <expected>
 #include <filesystem>
 #include <mutex>
 #include <optional>
@@ -49,12 +51,15 @@ struct DatabaseWriterTelemetry {
     std::uint64_t accepted_bars = 0;
     std::uint64_t dequeued_bars = 0;
     std::uint64_t dropped_bars = 0;
+    std::uint64_t write_failures = 0;
+    std::string last_write_error;
 };
 
 struct StoredMarketTick {
     std::string feed;
     std::string source_event_id;
     std::string kind;
+    std::string instrument_id;
     std::string symbol;
     std::int64_t event_time_ns = 0;
     std::int64_t received_at_ms = 0;
@@ -96,7 +101,7 @@ public:
                           const std::string& alias);
     std::vector<Bar> LoadBars(const std::string& symbol);
     void StoreBars(const std::string& symbol, const std::vector<Bar>& bars);
-    void StoreProviderBars(
+    std::expected<void, std::string> StoreProviderBars(
         const tradebox::core::BarUpsertBatch& batch);
     bool QueueProviderBars(
         tradebox::core::BarUpsertBatch batch);
@@ -106,17 +111,19 @@ public:
     void QueueTimelineEvent(std::string source, std::string source_event_id,
                             std::string kind, std::string symbol,
                             std::int64_t event_time_ms, std::string payload);
-    void QueueMarketTickEvent(std::string feed,
+    bool QueueMarketTickEvent(std::string feed,
                               std::string source_event_id,
-                              std::string kind, std::string symbol,
+                              std::string kind,
+                              std::string instrument_id,
+                              std::string symbol,
                               std::int64_t event_time_ns,
                               std::int64_t received_at_ms,
                               std::string payload);
-    void QueueMarketDataEvent(
+    bool QueueMarketDataEvent(
         std::string feed, std::string source_event_id,
         tradebox::core::MarketDataEventPtr event);
-    void FlushQueuedWrites();
-    void StoreMarketTickEvents(
+    std::expected<void, std::string> FlushQueuedWrites();
+    std::expected<void, std::string> StoreMarketTickEvents(
         const std::vector<StoredMarketTick>& events);
     tradebox::core::TickSeries LoadMarketTicks(
         const tradebox::core::TickQuery& query);
@@ -124,7 +131,7 @@ public:
     MissingMarketTickCoverage(
         const tradebox::core::TickQuery& query,
         std::string_view kind);
-    void MarkMarketTickCoverage(
+    std::expected<void, std::string> MarkMarketTickCoverage(
         const tradebox::core::TickQuery& query,
         std::string_view kind,
         tradebox::core::TickCoverage coverage);
@@ -140,8 +147,21 @@ public:
         const tradebox::core::NativeOrderCommand& command);
     std::expected<void, std::string> CompleteOrderCommand(
         const tradebox::core::OrderCommandResult& result);
+    std::expected<void, std::string> MarkOrderCommandDispatchStarted(
+        const std::string& request_id);
+    std::expected<
+        std::vector<tradebox::core::RecoverableOrderCommand>,
+        std::string>
+    LoadRecoverableOrderCommands();
+    std::expected<void, std::string> ResolveOrderCommandRecovery(
+        const tradebox::core::OrderCommandResult& result);
     std::expected<tradebox::core::OrderCommandLookup, std::string>
     LookupOrderCommand(const std::string& request_id);
+    std::expected<tradebox::core::AccountActivityWriteResult, std::string>
+    StoreAccountActivities(
+        const std::vector<tradebox::core::AccountActivity>& activities);
+    tradebox::core::AccountActivityPage LoadAccountActivities(
+        const tradebox::core::AccountActivityQuery& query);
 
     const std::filesystem::path& DataDirectory() const { return data_directory_; }
 
@@ -151,6 +171,7 @@ private:
         std::string source;
         std::string source_event_id;
         std::string kind;
+        std::string instrument_id;
         std::string symbol;
         std::int64_t event_time = 0;
         std::int64_t available_at_ms = 0;
@@ -159,10 +180,11 @@ private:
     };
 
     void WriterLoop();
-    void FlushEvents(std::vector<PendingEvent>& events);
-    void FlushProviderBars(
+    std::expected<void, std::string> FlushEvents(
+        std::vector<PendingEvent>& events);
+    std::expected<void, std::string> FlushProviderBars(
         const std::vector<tradebox::core::BarUpsertBatch>& batches);
-    void StoreProviderBarBatchesLocked(
+    std::expected<void, std::string> StoreProviderBarBatchesLocked(
         const std::vector<tradebox::core::BarUpsertBatch>& batches);
     bool Execute(const char* sql, std::string* error = nullptr);
     bool ExecuteMarket(const char* sql, std::string* error = nullptr);
@@ -189,5 +211,7 @@ private:
     std::uint64_t accepted_bars_ = 0;
     std::uint64_t dequeued_bars_ = 0;
     std::uint64_t dropped_bars_ = 0;
+    std::uint64_t write_failures_ = 0;
+    std::string last_write_error_;
     std::thread writer_;
 };

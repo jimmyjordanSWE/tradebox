@@ -43,3 +43,42 @@ TEST(Decimal, RejectsMalformedInput) {
     EXPECT_FALSE(Decimal::Parse("1e3"));
     EXPECT_FALSE(Decimal::Parse(" 1"));
 }
+
+TEST(Decimal, AddsExactValuesAcrossScalesAndSigns) {
+    const Decimal left = *Decimal::Parse("123.456789001");
+    const Decimal right = *Decimal::Parse("0.000000009");
+    EXPECT_EQ((left + right).ToString(), "123.45678901");
+    EXPECT_EQ(
+        (left + *Decimal::Parse("-23.456789001")).ToString(),
+        "100");
+    EXPECT_EQ(
+        (*Decimal::Parse("-2.5") + *Decimal::Parse("1.25"))
+            .ToString(),
+        "-1.25");
+}
+
+TEST(Decimal, SubtractsExactNonNegativeValuesInPlace) {
+    Decimal volume = *Decimal::Parse("1000000.75");
+    volume -= *Decimal::Parse("999999.5");
+    EXPECT_EQ(volume.ToString(), "1.25");
+    volume -= *Decimal::Parse("1.25");
+    EXPECT_EQ(volume.ToString(), "0");
+}
+
+TEST(Decimal, MultipliesAndDividesWithoutBinaryFloatingPoint) {
+    const Decimal quantity = *Decimal::Parse("-2.5");
+    const Decimal price = *Decimal::Parse("101.125");
+    EXPECT_EQ((quantity * price).ToString(), "-252.8125");
+
+    const auto ratio =
+        Decimal::Parse("1")->Divide(*Decimal::Parse("3"));
+    ASSERT_TRUE(ratio);
+    EXPECT_EQ(ratio->ToString(), "0.333333333");
+
+    const auto rounded =
+        Decimal::Parse("2")->Divide(*Decimal::Parse("3"), 2);
+    ASSERT_TRUE(rounded);
+    EXPECT_EQ(rounded->ToString(), "0.67");
+    EXPECT_FALSE(
+        Decimal::Parse("1")->Divide(Decimal::Zero()));
+}

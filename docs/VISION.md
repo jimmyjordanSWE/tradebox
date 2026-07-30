@@ -34,21 +34,23 @@ summary retain their model/prompt provenance and references to their inputs.
 Corrections append new events; they do not rewrite what the workstation
 previously knew.
 
-## First slice
+## V1 foundation
 
-The first slice is intentionally read-only:
+V1 establishes the broker-connected core:
 
 - Save Alpaca paper/live API credentials in Windows Credential Manager.
-- Authenticate and display a basic account snapshot.
-- Maintain a persistent watchlist/workspace.
-- Backfill and cache up to 1,000 IEX daily bars per symbol.
-- Use one Alpaca market-data WebSocket for every open chart.
-- Render live-updating daily candlesticks with OpenGL through Dear ImGui.
-- Append raw market messages to a source-neutral SQLite timeline.
+- Maintain reconciled account, order, and position state from REST snapshots
+  and the account WebSocket.
+- Submit, replace, cancel, and emergency-close broker-native orders through
+  typed commands, durable intent journaling, idempotency, and safety gates.
+- Maintain a persistent watchlist/workspace and stable instrument identities.
+- Backfill, cache, and live-update candlesticks for every supported timeframe.
+- Share supervised market-data and account WebSockets across consumers.
+- Append raw market and account events to source-neutral SQLite timelines.
 
-There is no order submission, scanner, audio capture, transcription, news
-connector, or replay UI in this slice. The universal timeline exists now so
-those features do not require retrofitting recordability later.
+Scanner, audio capture, transcription, news connectors, automated strategy
+execution, and the replay UI remain outside V1. The universal timeline exists
+now so those features do not require retrofitting recordability later.
 
 ## Runtime model
 
@@ -95,5 +97,5 @@ outside the OneDrive-synchronized repository.
 - Semantic UI actions and broker updates join the universal timeline.
 - Journal markers and raw audio clips attach to timeline timestamps.
 - Speech-to-text and behavioral analysis operate on journal data.
-- Order entry is introduced only after broker reconciliation and risk
-  reservation semantics are designed and tested in paper mode.
+- Automated strategy orders are introduced only after their own risk,
+  supervision, and paper-account acceptance criteria are designed and tested.

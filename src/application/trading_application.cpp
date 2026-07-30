@@ -10,9 +10,85 @@
 #include "tradebox/persistence/database_order_command_journal.h"
 #include "tradebox/platform/credentials.h"
 
+#include <algorithm>
+#include <type_traits>
 #include <utility>
 
 namespace tradebox::application {
+namespace {
+
+void ClearSensitiveString(std::string& value) noexcept {
+    volatile char* bytes = value.data();
+    for (std::size_t index = 0; index < value.size(); ++index)
+        bytes[index] = '\0';
+    value.clear();
+}
+
+class CoreValuationMarketDataSink final
+    : public core::IMarketDataSink {
+public:
+    CoreValuationMarketDataSink(
+        core::MarketDataStore& store,
+        core::TradingCore& trading_core)
+        : store_(store), trading_core_(trading_core) {}
+
+    void Ingest(core::MarketDataEventPtr event) override {
+        if (!event) return;
+        store_.Ingest(event);
+        std::visit(
+            [this](const auto& typed) {
+                using T = std::decay_t<decltype(typed)>;
+                if constexpr (
+                    std::is_same_v<T,
+                                   core::MarketStreamChanged>) {
+                    const core::CoreSnapshot account =
+                        trading_core_.Snapshot();
+                    for (const core::PositionState& position :
+                         account.positions) {
+                        const std::string& identifier =
+                            position.asset_id.empty()
+                                ? position.symbol
+                                : position.asset_id;
+                        trading_core_.ApplyMarketData(
+                            store_.Snapshot(identifier));
+                    }
+                } else if constexpr (
+                    std::is_same_v<T, core::QuoteReceived>) {
+                    Apply(typed.quote.instrument_id,
+                          typed.quote.symbol);
+                } else if constexpr (
+                    std::is_same_v<T, core::TradeReceived>) {
+                    Apply(typed.trade.instrument_id,
+                          typed.trade.symbol);
+                } else if constexpr (
+                    std::is_same_v<T, core::TradeCorrected>) {
+                    Apply(typed.instrument_id, typed.symbol);
+                } else if constexpr (
+                    std::is_same_v<
+                        T, core::TradingStatusReceived>) {
+                    Apply(typed.status.instrument_id,
+                          typed.status.symbol);
+                } else {
+                    Apply(typed.instrument_id, typed.symbol);
+                }
+            },
+            *event);
+    }
+
+private:
+    void Apply(const std::string& instrument_id,
+               const std::string& symbol) {
+        trading_core_.ApplyMarketData(
+            store_.Snapshot(
+                instrument_id.empty() ? symbol
+                                      : instrument_id));
+    }
+
+    core::MarketDataStore& store_;
+    core::TradingCore& trading_core_;
+};
+
+}  // namespace
 
 class TradingApplication::Impl final {
 public:
@@ -22,18 +98,38 @@ public:
           journal(database),
           order_journal(database),
           core(journal, clock),
-          broker(*owned_events, database, core, market_data,
+          valuation_market_data(market_data, core),
+          broker(*owned_events, database, core,
+                 valuation_market_data,
                  market_data, bars),
-          order_execution(core, broker, order_journal, clock) {}
+          order_execution(core, broker, order_journal, clock,
+                          &market_data) {}
+
+    Impl(Database& database,
+         core::IOrderCommandJournal& external_order_journal)
+        : database(database),
+          owned_events(std::make_unique<UiEventQueue>()),
+          journal(database),
+          order_journal(database),
+          core(journal, clock),
+          valuation_market_data(market_data, core),
+          broker(*owned_events, database, core,
+                 valuation_market_data,
+                 market_data, bars),
+          order_execution(core, broker, external_order_journal, clock,
+                          &market_data) {}
 
     Impl(UiEventQueue& events, Database& database)
         : database(database),
           journal(database),
           order_journal(database),
           core(journal, clock),
-          broker(events, database, core, market_data,
+          valuation_market_data(market_data, core),
+          broker(events, database, core,
+                 valuation_market_data,
                  market_data, bars),
-          order_execution(core, broker, order_journal, clock) {}
+          order_execution(core, broker, order_journal, clock,
+                          &market_data) {}
 
     Database& database;
     std::unique_ptr<UiEventQueue> owned_events;
@@ -42,6 +138,7 @@ public:
     core::SystemClock clock;
     core::TradingCore core;
     core::MarketDataStore market_data;
+    CoreValuationMarketDataSink valuation_market_data;
     core::BarStore bars;
     AlpacaService broker;
     OrderExecutionService order_execution;
@@ -49,6 +146,11 @@ public:
 
 TradingApplication::TradingApplication(Database& database)
     : impl_(std::make_unique<Impl>(database)) {}
+
+TradingApplication::TradingApplication(
+    Database& database,
+    core::IOrderCommandJournal& order_journal)
+    : impl_(std::make_unique<Impl>(database, order_journal)) {}
 
 TradingApplication::TradingApplication(UiEventQueue& events,
                                        Database& database)
@@ -89,27 +191,70 @@ core::BarSeriesSnapshot TradingApplication::Bars(
     core::BarRange range) const {
     core::BarSeriesSnapshot snapshot =
         impl_->bars.Bars(key, range);
-    if (snapshot.missing_ranges.empty()) return snapshot;
-
-    StoredBarSeries stored =
-        impl_->database.LoadProviderBars(key, range);
-    std::optional<core::BarRange> first_coverage;
-    if (!stored.coverage.empty()) {
-        first_coverage = stored.coverage.front();
-        stored.coverage.erase(stored.coverage.begin());
-    }
-    impl_->bars.Upsert({
-        .key = key,
-        .symbol = std::move(stored.symbol),
-        .bars = std::move(stored.bars),
-        .covered_range = first_coverage,
-    });
-    for (const core::BarRange coverage : stored.coverage)
+    if (!snapshot.missing_ranges.empty()) {
+        StoredBarSeries stored =
+            impl_->database.LoadProviderBars(key, range);
+        std::optional<core::BarRange> first_coverage;
+        if (!stored.coverage.empty()) {
+            first_coverage = stored.coverage.front();
+            stored.coverage.erase(stored.coverage.begin());
+        }
         impl_->bars.Upsert({
             .key = key,
-            .covered_range = coverage,
+            .symbol = std::move(stored.symbol),
+            .bars = std::move(stored.bars),
+            .covered_range = first_coverage,
         });
-    return impl_->bars.Bars(key, range);
+        for (const core::BarRange coverage : stored.coverage)
+            impl_->bars.Upsert({
+                .key = key,
+                .covered_range = coverage,
+            });
+        snapshot = impl_->bars.Bars(key, range);
+    }
+
+    const std::string identifier =
+        key.instrument_id.empty() ? snapshot.symbol
+                                  : key.instrument_id;
+    const core::MarketDataSnapshot live =
+        impl_->market_data.Snapshot(identifier);
+    std::vector<core::MarketBar> base_minutes;
+    const auto duration =
+        core::FixedBarDurationNs(key.timeframe);
+    if (duration && *duration > 60LL * 1'000'000'000 &&
+        key.adjustment == core::BarAdjustment::Raw &&
+        !live.provisional_minute_bars.empty()) {
+        const auto newest = std::ranges::max_element(
+            live.provisional_minute_bars, {},
+            &core::ProvisionalMinuteBar::start_ns);
+        const std::int64_t interval_start =
+            (newest->start_ns / *duration) * *duration;
+        const core::BarRange base_range{
+            interval_start,
+            newest->start_ns + 60LL * 1'000'000'000,
+        };
+        core::BarSeriesKey base_key = key;
+        base_key.timeframe = "1Min";
+        const StoredBarSeries stored =
+            impl_->database.LoadProviderBars(
+                base_key, base_range);
+        base_minutes = stored.bars;
+        const auto in_memory =
+            impl_->bars.Bars(base_key, base_range);
+        for (const core::MarketBar& minute :
+             in_memory.bars) {
+            const auto position = std::ranges::lower_bound(
+                base_minutes, minute.start_ns, {},
+                &core::MarketBar::start_ns);
+            if (position != base_minutes.end() &&
+                position->start_ns == minute.start_ns)
+                *position = minute;
+            else
+                base_minutes.insert(position, minute);
+        }
+    }
+    core::ConvergeLiveBar(snapshot, live, base_minutes);
+    return snapshot;
 }
 
 core::ChangedBarSeriesBatch TradingApplication::ChangedBarSeries(
@@ -125,11 +270,11 @@ TradingApplication::Connect(ConnectionRequest request) {
         core::ConnectAccount{request.environment});
     if (!receipt || !receipt->accepted) return receipt;
 
-    AlpacaCredentials credentials{
-        .key = std::move(request.api_key),
-        .secret = std::move(request.api_secret),
-        .paper = request.environment == core::AccountEnvironment::Paper,
-    };
+    AlpacaCredentials credentials(
+        request.api_key, request.api_secret,
+        request.environment == core::AccountEnvironment::Paper);
+    ClearSensitiveString(request.api_key);
+    ClearSensitiveString(request.api_secret);
     impl_->broker.Connect(std::move(credentials),
                           request.market_symbols,
                           request.market_data_feed);
@@ -153,6 +298,48 @@ TradingApplication::OrderCommandStatus(
     return impl_->order_execution.Lookup(request_id);
 }
 
+core::AccountActivityPage TradingApplication::AccountActivities(
+    const core::AccountActivityQuery& query) const {
+    return impl_->database.LoadAccountActivities(query);
+}
+
+void TradingApplication::RefreshAccountActivities() {
+    impl_->broker.RequestAccountActivities();
+}
+
+core::RestTransportHealth TradingApplication::RestHealth() const {
+    return impl_->broker.RestHealth();
+}
+
+core::MarketDataPipelineHealth
+TradingApplication::MarketDataHealth() const {
+    const auto storage =
+        impl_->database.LoadMarketDataStorageUsage();
+    const auto writer =
+        impl_->database.WriterTelemetry();
+    return {
+        .candlestick_bytes = storage.candlestick_bytes,
+        .tick_bytes = storage.tick_bytes,
+        .database_bytes = storage.database_bytes,
+        .candlestick_rows = storage.candlestick_rows,
+        .tick_rows = storage.tick_rows,
+        .pending_events = writer.pending_events,
+        .high_water_events = writer.high_water_events,
+        .dropped_market_events =
+            writer.dropped_market_events,
+        .pending_bars = writer.pending_bars,
+        .high_water_bars = writer.high_water_bars,
+        .dropped_bars = writer.dropped_bars,
+        .persistence_failures = writer.write_failures,
+        .last_persistence_error = writer.last_write_error,
+        .retention_limited = false,
+        .overloaded =
+            writer.dropped_market_events != 0 ||
+            writer.dropped_bars != 0 ||
+            writer.write_failures != 0,
+    };
+}
+
 void TradingApplication::RefreshMarketSymbols(
     const std::vector<std::string>& symbols) {
     impl_->broker.RefreshSymbols(symbols);
@@ -161,6 +348,17 @@ void TradingApplication::RefreshMarketSymbols(
 void TradingApplication::RequestMarketHistory(
     const std::string& symbol, const std::string& timeframe) {
     impl_->broker.RequestHistory(symbol, timeframe);
+}
+
+void TradingApplication::RequestMarketHistory(
+    const std::string& symbol, const std::string& timeframe,
+    core::BarRange range) {
+    impl_->broker.RequestHistory(symbol, timeframe, range);
+}
+
+void TradingApplication::RequestMarketHistory(
+    core::HistoricalBarQuery query) {
+    impl_->broker.RequestHistory(std::move(query));
 }
 
 std::future<core::TickSeries> TradingApplication::RequestTicks(
