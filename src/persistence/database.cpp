@@ -625,7 +625,7 @@ CREATE TABLE IF NOT EXISTS app_settings (
   value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS market_tick_events (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id INTEGER PRIMARY KEY,
   feed TEXT NOT NULL,
   source_event_id TEXT,
   kind TEXT NOT NULL,
@@ -633,13 +633,10 @@ CREATE TABLE IF NOT EXISTS market_tick_events (
   symbol TEXT NOT NULL,
   event_time_ns INTEGER NOT NULL,
   received_at_ms INTEGER NOT NULL,
-  raw_payload TEXT NOT NULL,
-  UNIQUE(feed, source_event_id, kind)
+  raw_payload TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS market_tick_events_series
-  ON market_tick_events(instrument_id, event_time_ns, feed, kind);
 CREATE TABLE IF NOT EXISTS typed_market_ticks (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id INTEGER PRIMARY KEY,
   feed TEXT NOT NULL,
   source_event_id TEXT,
   kind TEXT NOT NULL,
@@ -661,11 +658,8 @@ CREATE TABLE IF NOT EXISTS typed_market_ticks (
   ask_price_text TEXT,
   ask_size_text TEXT,
   ask_exchange TEXT,
-  corrected INTEGER NOT NULL DEFAULT 0,
-  UNIQUE(feed, source_event_id, kind)
+  corrected INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS typed_market_ticks_series
-  ON typed_market_ticks(instrument_id, event_time_ns, feed, kind);
 CREATE TABLE IF NOT EXISTS market_tick_coverage (
   symbol TEXT NOT NULL,
   feed TEXT NOT NULL,
@@ -675,8 +669,6 @@ CREATE TABLE IF NOT EXISTS market_tick_coverage (
   completed_at_ms INTEGER NOT NULL,
   PRIMARY KEY(symbol, feed, kind, start_ns, end_ns)
 );
-CREATE INDEX IF NOT EXISTS market_tick_coverage_lookup
-  ON market_tick_coverage(symbol, feed, kind, start_ns, end_ns);
 CREATE TABLE IF NOT EXISTS market_tick_coverage_v2 (
   instrument_id TEXT NOT NULL,
   symbol TEXT NOT NULL,
@@ -687,9 +679,6 @@ CREATE TABLE IF NOT EXISTS market_tick_coverage_v2 (
   completed_at_ms INTEGER NOT NULL,
   PRIMARY KEY(instrument_id, feed, kind, start_ns, end_ns)
 );
-CREATE INDEX IF NOT EXISTS market_tick_coverage_v2_lookup
-  ON market_tick_coverage_v2(
-    instrument_id, feed, kind, start_ns, end_ns);
 CREATE TABLE IF NOT EXISTS provider_bars (
   instrument_id TEXT NOT NULL,
   symbol TEXT NOT NULL,
@@ -709,8 +698,6 @@ CREATE TABLE IF NOT EXISTS provider_bars (
   revision INTEGER NOT NULL,
   PRIMARY KEY(instrument_id,feed,timeframe,adjustment,start_ns)
 );
-CREATE INDEX IF NOT EXISTS provider_bars_range
-  ON provider_bars(instrument_id,feed,timeframe,adjustment,start_ns);
 CREATE TABLE IF NOT EXISTS provider_bar_coverage (
   instrument_id TEXT NOT NULL,
   feed INTEGER NOT NULL,
@@ -730,13 +717,28 @@ CREATE TABLE IF NOT EXISTS provider_bar_coverage (
         "DROP INDEX IF EXISTS market_tick_events_series;"
         "CREATE INDEX IF NOT EXISTS market_tick_events_series "
         "ON market_tick_events("
-        "instrument_id,event_time_ns,feed,kind);",
+        "instrument_id,feed,event_time_ns);"
+        "CREATE UNIQUE INDEX IF NOT EXISTS market_tick_events_source "
+        "ON market_tick_events(feed,source_event_id) "
+        "WHERE source_event_id IS NOT NULL;"
+        "CREATE INDEX IF NOT EXISTS market_tick_events_corrections "
+        "ON market_tick_events(instrument_id,feed,event_time_ns) "
+        "WHERE kind IN ('x','c');"
+        "DROP INDEX IF EXISTS market_tick_coverage_lookup;"
+        "DROP INDEX IF EXISTS market_tick_coverage_v2_lookup;"
+        "DROP INDEX IF EXISTS provider_bars_range;",
         nullptr);
     ExecuteMarket(
         "DROP INDEX IF EXISTS typed_market_ticks_series;"
         "CREATE INDEX IF NOT EXISTS typed_market_ticks_series "
         "ON typed_market_ticks("
-        "instrument_id,event_time_ns,feed,kind);",
+        "instrument_id,feed,event_time_ns);"
+        "CREATE UNIQUE INDEX IF NOT EXISTS typed_market_ticks_source "
+        "ON typed_market_ticks(feed,source_event_id) "
+        "WHERE source_event_id IS NOT NULL;"
+        "CREATE INDEX IF NOT EXISTS typed_market_ticks_corrections "
+        "ON typed_market_ticks(instrument_id,feed,event_time_ns) "
+        "WHERE kind IN ('x','c');",
         nullptr);
     writer_ = std::thread(&Database::WriterLoop, this);
     return true;
@@ -2548,24 +2550,24 @@ MarketDataStorageUsage Database::LoadMarketDataStorageUsage() {
         "SELECT coalesce(sum(pgsize),0) FROM dbstat "
         "WHERE name IN ('daily_bars',"
         "'sqlite_autoindex_daily_bars_1',"
-        "'provider_bars','provider_bars_range',"
+        "'provider_bars',"
         "'sqlite_autoindex_provider_bars_1',"
         "'provider_bar_coverage',"
         "'sqlite_autoindex_provider_bar_coverage_1')");
     usage.tick_bytes = scalar(
         "SELECT coalesce(sum(pgsize),0) FROM dbstat "
         "WHERE name IN ('market_tick_events',"
-        "'sqlite_autoindex_market_tick_events_1',"
+        "'market_tick_events_source',"
         "'market_tick_events_series',"
+        "'market_tick_events_corrections',"
         "'typed_market_ticks',"
-        "'sqlite_autoindex_typed_market_ticks_1',"
+        "'typed_market_ticks_source',"
         "'typed_market_ticks_series',"
+        "'typed_market_ticks_corrections',"
         "'market_tick_coverage',"
         "'sqlite_autoindex_market_tick_coverage_1',"
-        "'market_tick_coverage_lookup',"
         "'market_tick_coverage_v2',"
-        "'sqlite_autoindex_market_tick_coverage_v2_1',"
-        "'market_tick_coverage_v2_lookup')");
+        "'sqlite_autoindex_market_tick_coverage_v2_1')");
 
     std::error_code error;
     for (const std::filesystem::path path : {

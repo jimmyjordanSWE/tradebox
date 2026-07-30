@@ -60,8 +60,15 @@ struct DecodedMarketFrame {
 using InstrumentResolver =
     std::function<std::string(std::string_view symbol)>;
 
+enum class MarketJsonBackend {
+    DirectWithRapidFallback,
+    RapidJsonSax,
+};
+
 DecodedMarketFrame DecodeMarketFrame(
     std::string_view raw_frame, std::int64_t received_at_ms,
-    const InstrumentResolver& resolve_instrument);
+    const InstrumentResolver& resolve_instrument,
+    MarketJsonBackend backend =
+        MarketJsonBackend::DirectWithRapidFallback);
 
 }  // namespace tradebox::broker::alpaca

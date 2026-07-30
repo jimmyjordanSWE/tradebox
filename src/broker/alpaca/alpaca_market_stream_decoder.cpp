@@ -1,6 +1,8 @@
 #include "tradebox/broker/alpaca_market_stream_decoder.h"
 
-#include <nlohmann/json.hpp>
+#include <rapidjson/error/en.h>
+#include <rapidjson/memorystream.h>
+#include <rapidjson/reader.h>
 
 #include <charconv>
 #include <cstdint>
@@ -13,8 +15,6 @@
 
 namespace tradebox::broker::alpaca {
 namespace {
-
-using json = nlohmann::json;
 
 int Digits(std::string_view value, std::size_t offset,
            std::size_t count) {
@@ -462,23 +462,22 @@ public:
             ScalarType::Boolean, value ? "true" : "false");
     }
 
-    bool number_integer(json::number_integer_t value) {
+    bool number_integer(std::int64_t value) {
         return SetScalar(
             ScalarType::Signed, std::to_string(value));
     }
 
-    bool number_unsigned(json::number_unsigned_t value) {
+    bool number_unsigned(std::uint64_t value) {
         return SetScalar(
             ScalarType::Unsigned, std::to_string(value));
     }
 
     bool number_float(
-        json::number_float_t,
-        const json::string_t& token) {
+        double, const std::string& token) {
         return SetScalar(ScalarType::Float, token);
     }
 
-    bool string(json::string_t& value) {
+    bool string(std::string& value) {
         if (item_active_ && depth_ == 3 &&
             active_array_) {
             active_array_->push_back(std::move(value));
@@ -486,10 +485,6 @@ public:
         }
         return SetScalar(
             ScalarType::String, std::move(value));
-    }
-
-    bool binary(json::binary_t&) {
-        return SetScalar(ScalarType::Missing, {});
     }
 
     bool start_object(std::size_t) {
@@ -506,7 +501,7 @@ public:
         return true;
     }
 
-    bool key(json::string_t& value) {
+    bool key(const std::string& value) {
         if (item_active_ && depth_ == 2)
             current_field_ = FieldFor(value);
         return true;
@@ -528,7 +523,7 @@ public:
             root_is_array_ = true;
             root_closed_ = false;
             result_.items.reserve(
-                elements == json::size_type(-1) ? 0 : elements);
+                elements == std::size_t(-1) ? 0 : elements);
             ++depth_;
             return true;
         }
@@ -555,20 +550,9 @@ public:
         return true;
     }
 
-    bool parse_error(
-        std::size_t, const std::string&,
-        const nlohmann::detail::exception& error) {
-        error_ = error.what();
-        return false;
-    }
-
     [[nodiscard]] bool Complete() const {
         return root_is_array_ && root_closed_ &&
                depth_ == 0;
-    }
-
-    [[nodiscard]] const std::string& Error() const {
-        return error_;
     }
 
     DecodedMarketFrame TakeResult() {
@@ -803,7 +787,94 @@ private:
     bool root_is_array_ = false;
     bool root_closed_ = false;
     bool item_active_ = false;
-    std::string error_;
+};
+
+class RapidJsonSaxAdapter {
+public:
+    explicit RapidJsonSaxAdapter(MarketFrameSax& destination)
+        : destination_(destination) {}
+
+    bool Null() { return destination_.null(); }
+    bool Bool(bool value) {
+        return destination_.boolean(value);
+    }
+    bool Int(int value) {
+        return destination_.number_integer(value);
+    }
+    bool Uint(unsigned value) {
+        return destination_.number_unsigned(value);
+    }
+    bool Int64(std::int64_t value) {
+        return destination_.number_integer(value);
+    }
+    bool Uint64(std::uint64_t value) {
+        return destination_.number_unsigned(value);
+    }
+    bool Double(double value) {
+        return destination_.number_float(value, {});
+    }
+    bool RawNumber(const char* value,
+                   rapidjson::SizeType length, bool) {
+        const std::string_view token(value, length);
+        if (token.find_first_of(".eE") !=
+            std::string_view::npos) {
+            double parsed = 0;
+            const auto converted = std::from_chars(
+                token.data(), token.data() + token.size(),
+                parsed, std::chars_format::general);
+            if (converted.ec != std::errc{} ||
+                converted.ptr !=
+                    token.data() + token.size())
+                return false;
+            return destination_.number_float(
+                parsed, std::string(token));
+        }
+        if (!token.empty() && token.front() == '-') {
+            std::int64_t parsed = 0;
+            const auto converted = std::from_chars(
+                token.data(), token.data() + token.size(),
+                parsed);
+            return converted.ec == std::errc{} &&
+                   converted.ptr ==
+                       token.data() + token.size() &&
+                   destination_.number_integer(parsed);
+        }
+        std::uint64_t parsed = 0;
+        const auto converted = std::from_chars(
+            token.data(), token.data() + token.size(),
+            parsed);
+        return converted.ec == std::errc{} &&
+               converted.ptr ==
+                   token.data() + token.size() &&
+               destination_.number_unsigned(parsed);
+    }
+    bool String(const char* value,
+                rapidjson::SizeType length, bool) {
+        std::string text(value, length);
+        return destination_.string(text);
+    }
+    bool Key(const char* value,
+             rapidjson::SizeType length, bool) {
+        std::string text(value, length);
+        return destination_.key(text);
+    }
+    bool StartObject() {
+        return destination_.start_object(
+            std::size_t(-1));
+    }
+    bool EndObject(rapidjson::SizeType) {
+        return destination_.end_object();
+    }
+    bool StartArray() {
+        return destination_.start_array(
+            std::size_t(-1));
+    }
+    bool EndArray(rapidjson::SizeType) {
+        return destination_.end_array();
+    }
+
+private:
+    MarketFrameSax& destination_;
 };
 
 class DirectJsonReader {
@@ -857,7 +928,7 @@ private:
                 return true;
             }
             // Escapes and non-ASCII input use the fully validating
-            // nlohmann SAX fallback.
+            // Generic SAX fallback.
             if (value == '\\' || value < 0x20 ||
                 value >= 0x80)
                 return false;
@@ -868,7 +939,7 @@ private:
 
     bool ParseObject(std::size_t depth) {
         if (!destination_.start_object(
-                json::size_type(-1)))
+                std::size_t(-1)))
             return false;
         ++cursor_;
         SkipWhitespace();
@@ -896,7 +967,7 @@ private:
 
     bool ParseArray(std::size_t depth) {
         if (!destination_.start_array(
-                json::size_type(-1)))
+                std::size_t(-1)))
             return false;
         ++cursor_;
         SkipWhitespace();
@@ -1048,28 +1119,56 @@ private:
     std::size_t cursor_ = 0;
 };
 
+DecodedMarketFrame DecodeWithRapidJson(
+    std::string_view raw_frame,
+    std::int64_t received_at_ms,
+    const InstrumentResolver& resolve_instrument) {
+    MarketFrameSax decoder(
+        received_at_ms, resolve_instrument);
+    RapidJsonSaxAdapter adapter(decoder);
+    rapidjson::MemoryStream stream(
+        raw_frame.data(), raw_frame.size());
+    rapidjson::Reader reader;
+    constexpr unsigned kFlags =
+        rapidjson::kParseNumbersAsStringsFlag |
+        rapidjson::kParseValidateEncodingFlag;
+    const bool parsed = reader.Parse<kFlags>(
+        stream, adapter);
+    if (!parsed || !decoder.Complete()) {
+        std::string message =
+            "market stream JSON is invalid";
+        if (!parsed) {
+            message += " at byte " +
+                       std::to_string(
+                           reader.GetErrorOffset()) +
+                       ": " +
+                       rapidjson::GetParseError_En(
+                           reader.GetParseErrorCode());
+        } else {
+            message += ": packet is not an array";
+        }
+        throw std::runtime_error(std::move(message));
+    }
+    return decoder.TakeResult();
+}
+
 }  // namespace
 
 DecodedMarketFrame DecodeMarketFrame(
     std::string_view raw_frame, std::int64_t received_at_ms,
-    const InstrumentResolver& resolve_instrument) {
-    MarketFrameSax direct_decoder(
-        received_at_ms, resolve_instrument);
-    if (DirectJsonReader(raw_frame, direct_decoder).Parse())
-        return direct_decoder.TakeResult();
-
-    MarketFrameSax decoder(received_at_ms, resolve_instrument);
-    const bool parsed = json::sax_parse(
-        raw_frame.begin(), raw_frame.end(), &decoder);
-    if (!parsed || !decoder.Complete()) {
-        if (!decoder.Error().empty())
-            throw std::runtime_error(
-                "market stream JSON is invalid: " +
-                decoder.Error());
-        throw std::runtime_error(
-            "market stream packet is not an array");
+    const InstrumentResolver& resolve_instrument,
+    MarketJsonBackend backend) {
+    if (backend ==
+        MarketJsonBackend::DirectWithRapidFallback) {
+        MarketFrameSax direct_decoder(
+            received_at_ms, resolve_instrument);
+        if (DirectJsonReader(
+                raw_frame, direct_decoder).Parse())
+            return direct_decoder.TakeResult();
     }
-    return decoder.TakeResult();
+    return DecodeWithRapidJson(
+        raw_frame, received_at_ms,
+        resolve_instrument);
 }
 
 }  // namespace tradebox::broker::alpaca

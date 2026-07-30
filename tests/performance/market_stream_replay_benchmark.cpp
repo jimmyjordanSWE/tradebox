@@ -68,8 +68,33 @@ int main(int argc, char** argv) {
         argc > 4 ? argv[4] : "iex";
     const std::size_t expected_instruments =
         argc > 5 ? std::stoull(argv[5]) : 10;
-    const bool profile_phases =
-        argc > 6 && std::string_view(argv[6]) == "profile";
+    bool profile_phases = false;
+    auto json_backend =
+        tradebox::broker::alpaca::
+            MarketJsonBackend::DirectWithRapidFallback;
+    std::string_view json_backend_name =
+        "direct-rapidjson";
+    for (int argument = 6; argument < argc; ++argument) {
+        const std::string_view option(argv[argument]);
+        if (option == "profile") {
+            profile_phases = true;
+        } else if (option == "direct-rapidjson") {
+            json_backend =
+                tradebox::broker::alpaca::
+                    MarketJsonBackend::
+                        DirectWithRapidFallback;
+            json_backend_name = option;
+        } else if (option == "rapidjson") {
+            json_backend =
+                tradebox::broker::alpaca::
+                    MarketJsonBackend::RapidJsonSax;
+            json_backend_name = option;
+        } else {
+            return Fail(
+                "unknown benchmark option: " +
+                std::string(option));
+        }
+    }
     const bool sip_soak = feed_name == "sip";
     if (feed_name != "iex" && !sip_soak)
         return Fail("feed must be iex or sip");
@@ -147,7 +172,8 @@ int main(int argc, char** argv) {
                     [](std::string_view symbol) {
                         return "synthetic:" +
                                std::string(symbol);
-                    });
+                    },
+                    json_backend);
             if (profile_phases)
                 decode_elapsed +=
                     std::chrono::steady_clock::now() -
@@ -338,6 +364,7 @@ int main(int argc, char** argv) {
               << " | queue peak "
               << writer.high_water_events
               << " | feed " << feed_name
+              << " | json " << json_backend_name
               << " | instruments " << expected_instruments
               << '\n';
     if (profile_phases) {

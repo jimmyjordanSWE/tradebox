@@ -36,6 +36,18 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(nlohmann_json)
 
 FetchContent_Declare(
+  rapidjson
+  GIT_REPOSITORY https://github.com/Tencent/rapidjson.git
+  GIT_TAG 24b5e7a8b27f42fa16b96fc70aade9106cf7102f
+  SOURCE_SUBDIR tradebox-no-cmake-project
+)
+FetchContent_MakeAvailable(rapidjson)
+add_library(rapidjson_headers INTERFACE)
+target_include_directories(rapidjson_headers SYSTEM INTERFACE
+  ${rapidjson_SOURCE_DIR}/include
+)
+
+FetchContent_Declare(
   sqlite_amalgamation
   URL https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip
   URL_HASH SHA3_256=628a44cfe82c66aed1ccbbe85a562d2e33ebe64b3288981ed76285612227934e
@@ -136,6 +148,7 @@ target_link_libraries(tradebox_broker_alpaca
     tradebox_platform
   PRIVATE
     nlohmann_json::nlohmann_json
+    rapidjson_headers
     winhttp
 )
 tradebox_enable_windows_api(tradebox_broker_alpaca)

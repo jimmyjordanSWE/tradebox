@@ -169,6 +169,40 @@ The complete optimized-symbol build, including the GUI, succeeded and all
 All rejected source experiments were reverted. They remain recorded here so
 they are not accidentally repeated.
 
+2026-07-30 RapidJSON market-decoder experiment - in progress
+Dependency: Tencent RapidJSON pinned to commit
+24b5e7a8b27f42fa16b96fc70aade9106cf7102f.
+Design: the decoder exposes four selectable modes for an apples-to-apples
+comparison: direct+nlohmann fallback, direct+RapidJSON fallback,
+nlohmann-only SAX, and RapidJSON-only SAX. Production retains the committed
+direct+nlohmann default while the experiment is uncommitted.
+
+SIP, 5 interleaved measured runs per backend:
+  direct+nlohmann median ingestion/durable:
+    299392 / 223401 events/s
+  direct+RapidJSON median ingestion/durable:
+    290734 / 216629 events/s
+  nlohmann-only SAX median ingestion/durable:
+    261522 / 217357 events/s
+  RapidJSON-only SAX median ingestion/durable:
+    294219 / 239942 events/s
+
+Five interleaved phase-profile runs:
+  nlohmann-only SAX median decode: 1035.32 ms
+  RapidJSON-only SAX median decode: 859.04 ms
+  RapidJSON parser-time change: -17.0%
+
+Interpretation:
+- RapidJSON SAX is materially faster than nlohmann SAX for the same canonical
+  event builder.
+- The direct parser remains faster than either library parser.
+- Ordinary corpus frames never enter either fallback, so the two direct modes
+  are functionally the same hot path; their end-to-end difference is system
+  and asynchronous SQLite variance.
+- Replacing only the fallback improves uncommon escaped/Unicode frames but
+  cannot materially change normal stream throughput. Final acceptance should
+  therefore prioritize semantic parity, dependency cost, and maintainability.
+
 Profiling status
 ----------------
 Windows Performance Recorder and Analyzer are installed and working from an
@@ -335,3 +369,61 @@ Potential next experiments
 - Measure persistence batching and queue synchronization separately.
 - Test profile-guided optimization only after a representative training corpus
   and repeatable clean PGO build procedure exist.
+
+2026-07-30 narrow SQLite tick-index experiment (accepted)
+---------------------------------------------------------
+Build and workload: Release, tracing enabled, direct decoder with RapidJSON
+fallback, 500,000-event SIP corpus, 1 warm-up plus 5 measured runs.
+
+Previous same-code RapidJSON experiment median:
+  ingestion: 290734 events/s
+  durable:   216629 events/s
+
+Narrow-index schema:
+  ingestion min/median/mean/max/stddev:
+    289616 / 292519 / 296653 / 311237 / 7809 events/s
+  durable min/median/mean/max/stddev:
+    245886 / 256554 / 253795 / 259182 / 5618 events/s
+
+Median change:
+  ingestion: +0.6%
+  durable:  +18.4%
+
+Accepted changes:
+- Tick row ids use INTEGER PRIMARY KEY without AUTOINCREMENT.
+- Deduplication indexes contain only rows with a non-null broker source id and
+  omit the redundant kind column.
+- Series indexes order equality keys before the time range:
+  (instrument_id, feed, event_time_ns).
+- Rare cancel/correction rows have small partial indexes so reconstruction can
+  find out-of-range amendments without indexing kind for every quote/trade.
+- Coverage and provider-bar indexes identical to their primary keys were
+  removed.
+
+Safety and correctness:
+- WAL and synchronous=FULL remain enabled.
+- Broker-id deduplication, exact decimals, correction/cancel reconstruction,
+  restart persistence, and asynchronous failure surfacing are unchanged.
+- All 162 tests pass after preserving the legacy symbol-only migration path.
+
+Interpretation:
+- SQLite itself was not the immediate limitation; the prior schema made every
+  tick maintain wide or redundant B-trees.
+- The next storage experiment should compact the wide nullable typed-tick row
+  and its text keys. Do not weaken durability or checkpoint safety.
+- A different engine is justified only if a compact SQLite layout still misses
+  the required rate or exhibits unacceptable checkpoint tail latency.
+
+2026-07-30 integer feed/kind SQLite experiment (rejected)
+---------------------------------------------------------
+Changed only the typed-tick feed and kind columns/bindings from short text to
+integers. Same Release SIP workload, 1 warm-up plus 5 measured runs:
+  ingestion min/median/mean/max/stddev:
+    271462 / 281225 / 284242 / 297831 / 9121 events/s
+  durable min/median/mean/max/stddev:
+    242594 / 245756 / 250522 / 264141 / 7941 events/s
+
+The machine-level slowdown affected ingestion and durable rates together; the
+median durable/ingestion ratio was 0.874 versus 0.877 for the accepted text-key
+schema. There is no measurable writer benefit, so the change was reverted.
+Short closed-set text values are retained for clarity.

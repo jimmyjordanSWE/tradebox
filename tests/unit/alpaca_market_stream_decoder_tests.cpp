@@ -21,37 +21,52 @@ TEST(AlpacaMarketStreamDecoder,
        "t":"2026-07-28T13:30:00.123456790Z"}
     ])";
 
-    const auto decoded =
-        broker::alpaca::DecodeMarketFrame(
-            frame, 1234,
-            [](std::string_view) {
-                return std::string("isin:US46090E1038");
-            });
+    for (const auto backend : {
+             broker::alpaca::MarketJsonBackend::
+                 DirectWithRapidFallback,
+             broker::alpaca::MarketJsonBackend::
+                 RapidJsonSax,
+         }) {
+        const auto decoded =
+            broker::alpaca::DecodeMarketFrame(
+                frame, 1234,
+                [](std::string_view) {
+                    return std::string(
+                        "isin:US46090E1038");
+                },
+                backend);
 
-    ASSERT_EQ(decoded.controls.size(), 2U);
-    EXPECT_EQ(
-        decoded.controls[0].type,
-        broker::alpaca::StreamControlType::Authenticated);
-    EXPECT_EQ(decoded.controls[1].trade_symbols,
-              std::vector<std::string>{"QQQ"});
-    ASSERT_EQ(decoded.items.size(), 2U);
+        ASSERT_EQ(decoded.controls.size(), 2U);
+        EXPECT_EQ(
+            decoded.controls[0].type,
+            broker::alpaca::StreamControlType::
+                Authenticated);
+        EXPECT_EQ(decoded.controls[1].trade_symbols,
+                  std::vector<std::string>{"QQQ"});
+        ASSERT_EQ(decoded.items.size(), 2U);
 
-    const auto& quote = std::get<core::QuoteReceived>(
-        *decoded.items[0].market_event);
-    EXPECT_EQ(quote.quote.instrument_id,
-              "isin:US46090E1038");
-    EXPECT_EQ(quote.quote.bid_price.ToString(), "500.01");
-    EXPECT_EQ(quote.quote.event_time_ns % 1'000'000,
-              456789);
+        const auto& quote = std::get<core::QuoteReceived>(
+            *decoded.items[0].market_event);
+        EXPECT_EQ(quote.quote.instrument_id,
+                  "isin:US46090E1038");
+        EXPECT_EQ(
+            quote.quote.bid_price.ToString(), "500.01");
+        EXPECT_EQ(
+            quote.quote.event_time_ns % 1'000'000,
+            456789);
 
-    const auto& trade = std::get<core::TradeReceived>(
-        *decoded.items[1].market_event);
-    EXPECT_EQ(trade.trade.trade_id, "42");
-    EXPECT_EQ(trade.trade.price.ToString(), "500.015");
-    EXPECT_EQ(decoded.items[1].source_event_id,
-              "QQQ:" +
-                  std::to_string(trade.trade.event_time_ns) +
-                  ":42");
+        const auto& trade = std::get<core::TradeReceived>(
+            *decoded.items[1].market_event);
+        EXPECT_EQ(trade.trade.trade_id, "42");
+        EXPECT_EQ(
+            trade.trade.price.ToString(), "500.015");
+        EXPECT_EQ(
+            decoded.items[1].source_event_id,
+            "QQQ:" +
+                std::to_string(
+                    trade.trade.event_time_ns) +
+                ":42");
+    }
 }
 
 TEST(AlpacaMarketStreamDecoder,
@@ -182,24 +197,32 @@ TEST(AlpacaMarketStreamDecoder,
        "t":"2026-07-28T13:30:00.123456789Z"}
     ])";
 
-    const auto decoded =
-        broker::alpaca::DecodeMarketFrame(
-            frame, 1234,
-            [](std::string_view symbol) {
-                return "asset:" + std::string(symbol);
-            });
+    for (const auto backend : {
+             broker::alpaca::MarketJsonBackend::
+                 DirectWithRapidFallback,
+             broker::alpaca::MarketJsonBackend::
+                 RapidJsonSax,
+         }) {
+        const auto decoded =
+            broker::alpaca::DecodeMarketFrame(
+                frame, 1234,
+                [](std::string_view symbol) {
+                    return "asset:" + std::string(symbol);
+                },
+                backend);
 
-    ASSERT_EQ(decoded.items.size(), 1U);
-    const auto& trade = std::get<core::TradeReceived>(
-        *decoded.items[0].market_event);
-    EXPECT_EQ(trade.trade.symbol, "AAPL");
-    EXPECT_EQ(trade.trade.instrument_id, "asset:AAPL");
-    EXPECT_EQ(trade.trade.trade_id, "escaped-\"id");
-    EXPECT_EQ(trade.trade.exchange, "V");
-    EXPECT_EQ(trade.trade.price.ToString(), "500.015");
-    EXPECT_EQ(trade.trade.size.ToString(), "100");
-    EXPECT_EQ(trade.trade.conditions,
-              std::vector<std::string>{"@"});
+        ASSERT_EQ(decoded.items.size(), 1U);
+        const auto& trade = std::get<core::TradeReceived>(
+            *decoded.items[0].market_event);
+        EXPECT_EQ(trade.trade.symbol, "AAPL");
+        EXPECT_EQ(trade.trade.instrument_id, "asset:AAPL");
+        EXPECT_EQ(trade.trade.trade_id, "escaped-\"id");
+        EXPECT_EQ(trade.trade.exchange, "V");
+        EXPECT_EQ(trade.trade.price.ToString(), "500.015");
+        EXPECT_EQ(trade.trade.size.ToString(), "100");
+        EXPECT_EQ(trade.trade.conditions,
+                  std::vector<std::string>{"@"});
+    }
 }
 
 TEST(AlpacaMarketStreamDecoder,
@@ -228,18 +251,28 @@ TEST(AlpacaMarketStreamDecoder,
 
 TEST(AlpacaMarketStreamDecoder,
      RejectsMalformedAndTruncatedJsonWithoutPartialSuccess) {
-    for (const std::string_view frame : {
-             std::string_view{R"([{"T":"t","S":"QQQ")"},
-             std::string_view{R"([{"T":"t","S":"\uD800"}])"},
-             std::string_view{R"([{"T":"t","S":"QQQ","p":01}])"},
+    for (const auto backend : {
+             broker::alpaca::MarketJsonBackend::
+                 DirectWithRapidFallback,
+             broker::alpaca::MarketJsonBackend::
+                 RapidJsonSax,
          }) {
-        EXPECT_THROW(
-            broker::alpaca::DecodeMarketFrame(
-                frame, 1234,
-                [](std::string_view symbol) {
-                    return std::string(symbol);
-                }),
-            std::runtime_error);
+        for (const std::string_view frame : {
+                 std::string_view{R"([{"T":"t","S":"QQQ")"},
+                 std::string_view{
+                     R"([{"T":"t","S":"\uD800"}])"},
+                 std::string_view{
+                     R"([{"T":"t","S":"QQQ","p":01}])"},
+             }) {
+            EXPECT_THROW(
+                broker::alpaca::DecodeMarketFrame(
+                    frame, 1234,
+                    [](std::string_view symbol) {
+                        return std::string(symbol);
+                    },
+                    backend),
+                std::runtime_error);
+        }
     }
 }
 
