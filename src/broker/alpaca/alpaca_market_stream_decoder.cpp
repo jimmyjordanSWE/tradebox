@@ -3,11 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <cctype>
-#include <ctime>
-#include <iomanip>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -16,67 +12,116 @@ namespace {
 
 using json = nlohmann::json;
 
-std::int64_t ParseTimestampMs(const std::string& value) {
-    if (value.size() < 19) return 0;
-    std::tm time{};
-    std::istringstream stream(value.substr(0, 19));
-    stream >> std::get_time(&time, "%Y-%m-%dT%H:%M:%S");
-    if (stream.fail()) return 0;
-    std::int64_t milliseconds =
-        static_cast<std::int64_t>(_mkgmtime64(&time)) * 1'000;
-    const std::size_t dot = value.find('.');
-    if (dot != std::string::npos) {
-        std::string fraction;
-        for (std::size_t index = dot + 1;
-             index < value.size() && fraction.size() < 3; ++index) {
-            if (!std::isdigit(
-                    static_cast<unsigned char>(value[index])))
-                break;
-            fraction.push_back(value[index]);
-        }
-        while (fraction.size() < 3) fraction.push_back('0');
-        if (!fraction.empty()) milliseconds += std::stoi(fraction);
+int Digits(std::string_view value, std::size_t offset,
+           std::size_t count) {
+    if (offset + count > value.size()) return -1;
+    int result = 0;
+    for (std::size_t index = 0; index < count; ++index) {
+        const char digit = value[offset + index];
+        if (digit < '0' || digit > '9') return -1;
+        result = result * 10 + digit - '0';
     }
-    const std::size_t offset_at =
-        value.find_first_of("+-", 19);
-    if (offset_at != std::string::npos &&
-        offset_at + 5 < value.size()) {
-        try {
-            const int hours =
-                std::stoi(value.substr(offset_at + 1, 2));
-            const int minutes =
-                std::stoi(value.substr(offset_at + 4, 2));
-            const std::int64_t offset_ms =
-                static_cast<std::int64_t>(hours * 60 + minutes) *
-                60 * 1'000;
-            milliseconds +=
-                value[offset_at] == '+' ? -offset_ms : offset_ms;
-        } catch (...) {
-        }
-    }
-    return milliseconds;
+    return result;
 }
 
-std::int64_t ParseTimestampNs(const std::string& value) {
-    const std::int64_t milliseconds = ParseTimestampMs(value);
-    if (milliseconds == 0) return 0;
-    std::int64_t sub_millisecond_ns = 0;
-    const std::size_t dot = value.find('.');
-    if (dot != std::string::npos) {
-        std::string fraction;
-        for (std::size_t index = dot + 1;
-             index < value.size() && fraction.size() < 9; ++index) {
-            if (!std::isdigit(
-                    static_cast<unsigned char>(value[index])))
-                break;
-            fraction.push_back(value[index]);
+constexpr bool LeapYear(int year) {
+    return year % 4 == 0 &&
+           (year % 100 != 0 || year % 400 == 0);
+}
+
+constexpr int DaysInMonth(int year, int month) {
+    constexpr int days[] = {
+        31, 28, 31, 30, 31, 30,
+        31, 31, 30, 31, 30, 31,
+    };
+    return days[month - 1] +
+           (month == 2 && LeapYear(year) ? 1 : 0);
+}
+
+constexpr std::int64_t DaysFromCivil(int year, unsigned month,
+                                     unsigned day) {
+    year -= month <= 2;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned year_of_era =
+        static_cast<unsigned>(year - era * 400);
+    const unsigned day_of_year =
+        (153 * (month > 2 ? month - 3 : month + 9) + 2) /
+            5 +
+        day - 1;
+    const unsigned day_of_era =
+        year_of_era * 365 + year_of_era / 4 -
+        year_of_era / 100 + day_of_year;
+    return static_cast<std::int64_t>(era) * 146097 +
+           day_of_era - 719468;
+}
+
+std::int64_t ParseTimestampNs(std::string_view value) {
+    if (value.size() < 19 || value[4] != '-' ||
+        value[7] != '-' ||
+        (value[10] != 'T' && value[10] != 't') ||
+        value[13] != ':' || value[16] != ':')
+        return 0;
+    const int year = Digits(value, 0, 4);
+    const int month = Digits(value, 5, 2);
+    const int day = Digits(value, 8, 2);
+    const int hour = Digits(value, 11, 2);
+    const int minute = Digits(value, 14, 2);
+    const int second = Digits(value, 17, 2);
+    if (year < 1 || month < 1 || month > 12 || day < 1 ||
+        day > DaysInMonth(year, month) || hour < 0 ||
+        hour > 23 || minute < 0 || minute > 59 ||
+        second < 0 || second > 59)
+        return 0;
+
+    std::size_t cursor = 19;
+    std::int64_t fractional_ns = 0;
+    int fractional_digits = 0;
+    if (cursor < value.size() && value[cursor] == '.') {
+        ++cursor;
+        while (cursor < value.size() &&
+               value[cursor] >= '0' && value[cursor] <= '9') {
+            if (fractional_digits < 9) {
+                fractional_ns =
+                    fractional_ns * 10 + value[cursor] - '0';
+                ++fractional_digits;
+            }
+            ++cursor;
         }
-        while (fraction.size() < 9) fraction.push_back('0');
-        if (fraction.size() == 9)
-            sub_millisecond_ns =
-                std::stoll(fraction.substr(3, 6));
+        while (fractional_digits++ < 9) fractional_ns *= 10;
     }
-    return milliseconds * 1'000'000 + sub_millisecond_ns;
+
+    int offset_seconds = 0;
+    if (cursor < value.size() &&
+        (value[cursor] == 'Z' || value[cursor] == 'z')) {
+        ++cursor;
+    } else if (cursor < value.size() &&
+               (value[cursor] == '+' || value[cursor] == '-')) {
+        const bool positive = value[cursor] == '+';
+        if (cursor + 6 != value.size() ||
+            value[cursor + 3] != ':')
+            return 0;
+        const int offset_hours =
+            Digits(value, cursor + 1, 2);
+        const int offset_minutes =
+            Digits(value, cursor + 4, 2);
+        if (offset_hours < 0 || offset_hours > 23 ||
+            offset_minutes < 0 || offset_minutes > 59)
+            return 0;
+        offset_seconds =
+            (offset_hours * 60 + offset_minutes) * 60;
+        if (positive) offset_seconds = -offset_seconds;
+        cursor += 6;
+    }
+    if (cursor != value.size()) return 0;
+
+    const std::int64_t seconds_since_epoch =
+        DaysFromCivil(year, static_cast<unsigned>(month),
+                      static_cast<unsigned>(day)) *
+            86'400 +
+        hour * 3'600 + minute * 60 + second +
+        offset_seconds;
+    return seconds_since_epoch * 1'000'000'000 +
+           fractional_ns;
 }
 
 std::string String(const json& object, const char* key) {

@@ -1,0 +1,154 @@
+TradeBox native performance ledger
+==================================
+
+Purpose
+-------
+This is the append-only comparison record for compiler-option and core-code
+performance experiments. Keep rejected experiments as evidence; do not replace
+old results with a newer best run.
+
+Measurement rules
+-----------------
+1. Use a clean MSVC x64 Release build and record the exact flags.
+2. Close avoidable high-CPU applications and keep the same Windows power plan.
+3. Preload benchmark corpora (the benchmark does this before timing).
+4. Run at least two warm-ups, then use the median of nine IEX measurements.
+5. Use at least one warm-up and the median of five SIP measurements.
+6. Compare ingestion and durable throughput separately.
+7. Treat changes smaller than 3% as noise until repeated on another day.
+8. Run all correctness tests before accepting a compiler option or code change.
+
+Reference machine
+-----------------
+Date: 2026-07-30
+OS: Windows 11 Pro 10.0.26200
+CPU: AMD Ryzen AI 7 350, 8 cores / 16 logical processors
+RAM: 33,439,793,152 bytes
+Power plan: Balanced (381b4222-f694-41f0-9685-ff5bb260df2e)
+Hypervisor present: yes
+Compiler: MSVC 19.44.35222, x64
+Generator: Ninja
+Source: commit 240703f plus GUI-only monitor-refresh working-tree change
+
+Workloads
+---------
+IEX: 100,000 synthetic events, 10 instruments, correction-heavy.
+SIP: 500,000 synthetic events, 20 instruments, correction-heavy, including a
+stale/reconnect transition.
+
+Results
+-------
+2026-07-30 BASELINE - accepted reference
+Flags: /O2 /Ob2 /DNDEBUG, /INCREMENTAL:NO, no IPO, portable x64 ISA
+IEX runs: 9 measured after 2 warm-ups
+  ingestion min/median/mean/max/stddev: 146121 / 156969 / 154911 / 161734 / 4878 events/s
+  durable   min/median/mean/max/stddev: 108075 / 115479 / 114002 / 118813 / 3367 events/s
+SIP runs: 5 measured after 1 warm-up
+  ingestion min/median/mean/max: 134315 / 137880 / 137678 / 140028 events/s
+  durable   min/median/mean/max: 125949 / 129116 / 128788 / 130299 events/s
+
+2026-07-30 MSVC whole-program optimization - rejected
+Flags: baseline plus /GL and /LTCG
+IEX runs: 9 measured after 2 warm-ups
+  ingestion min/median/mean/max: 144454 / 147779 / 148839 / 153958 events/s
+  durable   min/median/mean/max: 106880 / 108550 / 109103 / 112917 events/s
+Change versus baseline median: ingestion -5.9%, durable -6.0%
+Decision: reject; slower on both primary measures.
+
+2026-07-30 AVX2 code generation - rejected
+Flags: /O2 /Ob2 /DNDEBUG /arch:AVX2, no IPO
+IEX runs: 9 measured after 2 warm-ups
+  ingestion min/median/mean/max: 149714 / 153544 / 154150 / 159458 events/s
+  durable   min/median/mean/max: 110623 / 112952 / 113383 / 116958 events/s
+Change versus baseline median: ingestion -2.2%, durable -2.2%
+Decision: reject; no demonstrated gain and reduces CPU compatibility.
+
+2026-07-30 fixed-format market timestamp parser - accepted
+Change: replaced per-event istringstream/get_time, substrings, and numeric
+temporary allocations with validated fixed-position UTC/nanosecond parsing.
+Flags: baseline portable Release flags.
+IEX runs: 9 measured after 2 warm-ups
+  ingestion min/median/mean/max/stddev: 182313 / 189213 / 188014 / 192861 / 3173 events/s
+  durable   min/median/mean/max/stddev: 128540 / 132363 / 131811 / 134407 / 2016 events/s
+Change versus baseline median: ingestion +20.5%, durable +14.6%
+SIP runs: 5 measured after 1 warm-up
+  ingestion min/median/mean/max/stddev: 166520 / 168076 / 167776 / 168729 / 887 events/s
+  durable   min/median/mean/max/stddev: 153614 / 154053 / 154448 / 155469 / 705 events/s
+Change versus baseline median: ingestion +21.9%, durable +19.3%
+Decision: accept; the complete Release suite passed 157/157 tests.
+
+Profiling status
+----------------
+Windows Performance Recorder and Analyzer are installed. A WPR CPU-sampling
+start failed with 0xc5585011 because this process lacks the system-profile
+privilege. This is an elevation issue, not a WSL, Hyper-V, or VBS conflict.
+No Windows security or virtualization feature was disabled.
+
+The benchmark supports an optional final "profile" argument that reports time
+spent in JSON/frame decoding, persistence queueing, in-memory projection, and
+durable flush. These timings are diagnostic and must not replace the normal
+un-instrumented throughput numbers.
+
+Initial SIP phase profile before timestamp optimization:
+  decode 3016.51 ms; persistence enqueue 186.38 ms;
+  in-memory projection 986.39 ms; durable flush 230.17 ms.
+
+SIP phase profile after timestamp optimization:
+  decode 2205.93 ms; persistence enqueue 171.26 ms;
+  in-memory projection 896.84 ms; durable flush 344.28 ms.
+Decoder time fell 26.9%. It still accounts for about 67% of instrumented
+ingestion time and remains the primary CPU optimization target. Flush time is
+affected by asynchronous writer scheduling and should be compared through the
+repeated uninstrumented durable-throughput result, not one phase-profile run.
+
+Concurrency baseline
+--------------------
+The normal SIP benchmark uses a serialized decode/projection producer plus the
+asynchronous database writer. One run reached a maximum of five process threads
+but consumed about 1.41 equivalent CPU cores on average (6.44 process CPU
+seconds over 4.56 wall seconds). The hot decoder and MarketDataStore projection
+remain serialized.
+
+Independent-process scaling probe, 500,000 SIP events per process:
+  processes  total events  wall seconds  aggregate events/s  scaling
+          1       500000          4.420              113114    1.00x
+          2      1000000          5.396              185316    1.64x
+          4      2000000          7.237              276376    2.44x
+
+Interpretation: independent time-series work scales, but four-way efficiency is
+already only about 61%. Do not create a thread per symbol or timeframe. The
+first production experiment should use two bounded decoder workers:
+
+1. The socket reader assigns a monotonically increasing frame sequence.
+2. Two workers decode complete frames independently.
+3. One ordered commit stage applies completed frames by sequence.
+4. The existing database writer remains asynchronous.
+5. Queue overflow is surfaced as a gap/safety condition; events are not dropped.
+
+This preserves global broker order while parallelizing the current dominant
+CPU phase. Keep MarketDataStore mutation serialized initially. Consider
+instrument sharding only if profiling later shows projection, rather than
+decoding, has become dominant.
+
+Do not pin workers initially. Let the Windows scheduler place them; affinity can
+reduce scheduler flexibility and worsen behavior across power states or
+heterogeneous cores. Test affinity only as a recorded benchmark experiment.
+
+Commands
+--------
+Standard repeated run:
+  powershell -ExecutionPolicy Bypass -File tools/run_performance_suite.ps1
+
+SIP repeated run:
+  powershell -ExecutionPolicy Bypass -File tools/run_performance_suite.ps1 -Feed sip -WarmupRuns 1 -MeasuredRuns 5
+
+Phase profile:
+  build\tradebox_market_replay_benchmark.exe build\testdata\alpaca_sip_stream_20x25000.jsonl 500000 build\benchmark-results\sip-profile.json sip 20 profile
+
+Potential next experiments
+--------------------------
+- Use an elevated WPR CPU trace to obtain call-stack hotspots.
+- Measure allocation reduction in market-frame decoding.
+- Measure persistence batching and queue synchronization separately.
+- Test profile-guided optimization only after a representative training corpus
+  and repeatable clean PGO build procedure exist.

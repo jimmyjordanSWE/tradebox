@@ -9,6 +9,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -67,6 +68,8 @@ int main(int argc, char** argv) {
         argc > 4 ? argv[4] : "iex";
     const std::size_t expected_instruments =
         argc > 5 ? std::stoull(argv[5]) : 10;
+    const bool profile_phases =
+        argc > 6 && std::string_view(argv[6]) == "profile";
     const bool sip_soak = feed_name == "sip";
     if (feed_name != "iex" && !sip_soak)
         return Fail("feed must be iex or sip");
@@ -100,6 +103,10 @@ int main(int argc, char** argv) {
     std::uint64_t control_events = 0;
     std::uint64_t correction_events = 0;
     std::uint64_t cancellation_events = 0;
+    std::chrono::steady_clock::duration decode_elapsed{};
+    std::chrono::steady_clock::duration persistence_enqueue_elapsed{};
+    std::chrono::steady_clock::duration projection_elapsed{};
+    std::chrono::steady_clock::duration flush_elapsed{};
     DatabaseWriterTelemetry writer;
     bool reconnected = false;
     bool persistence_rejected = false;
@@ -130,6 +137,10 @@ int main(int argc, char** argv) {
         const std::uint64_t stale_at =
             expected_events / 3;
         for (const std::string& encoded_frame : frames) {
+            const auto decode_start =
+                profile_phases
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
             auto frame =
                 tradebox::broker::alpaca::DecodeMarketFrame(
                     encoded_frame, 1'783'511'400'000,
@@ -137,6 +148,10 @@ int main(int argc, char** argv) {
                         return "synthetic:" +
                                std::string(symbol);
                     });
+            if (profile_phases)
+                decode_elapsed +=
+                    std::chrono::steady_clock::now() -
+                    decode_start;
             control_events += frame.controls.size();
             for (auto& item : frame.items) {
                 ++decoded_events;
@@ -151,15 +166,34 @@ int main(int argc, char** argv) {
                         *item.market_event))
                     ++cancellation_events;
                 if (item.market_tick) {
+                    const auto enqueue_start =
+                        profile_phases
+                            ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::
+                                  time_point{};
                     if (!database.QueueMarketDataEvent(
                             feed_name,
                             std::move(item.source_event_id),
                             item.market_event))
                         persistence_rejected = true;
+                    if (profile_phases)
+                        persistence_enqueue_elapsed +=
+                            std::chrono::steady_clock::now() -
+                            enqueue_start;
                 }
-                if (item.market_event)
+                if (item.market_event) {
+                    const auto projection_start =
+                        profile_phases
+                            ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::
+                                  time_point{};
                     market_data.Ingest(
                         std::move(item.market_event));
+                    if (profile_phases)
+                        projection_elapsed +=
+                            std::chrono::steady_clock::now() -
+                            projection_start;
+                }
             }
             if (sip_soak && !stale_observed &&
                 decoded_events >= stale_at) {
@@ -203,7 +237,14 @@ int main(int argc, char** argv) {
             }
         }
         ingestion_end = std::chrono::steady_clock::now();
+        const auto flush_start =
+            profile_phases
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
         const auto flushed = database.FlushQueuedWrites();
+        if (profile_phases)
+            flush_elapsed =
+                std::chrono::steady_clock::now() - flush_start;
         if (!flushed)
             return Fail(
                 "persistence flush failed: " + flushed.error());
@@ -288,6 +329,22 @@ int main(int argc, char** argv) {
               << " | feed " << feed_name
               << " | instruments " << expected_instruments
               << '\n';
+    if (profile_phases) {
+        const auto milliseconds = [](const auto elapsed) {
+            return std::chrono::duration<double, std::milli>(
+                       elapsed)
+                .count();
+        };
+        std::cout << std::fixed << std::setprecision(2)
+                  << "PHASE PROFILE | decode "
+                  << milliseconds(decode_elapsed)
+                  << " ms | persistence enqueue "
+                  << milliseconds(persistence_enqueue_elapsed)
+                  << " ms | in-memory projection "
+                  << milliseconds(projection_elapsed)
+                  << " ms | durable flush "
+                  << milliseconds(flush_elapsed) << " ms\n";
+    }
     if (!result_path.empty()) {
         std::error_code error;
         std::filesystem::create_directories(

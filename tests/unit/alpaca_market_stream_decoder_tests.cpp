@@ -55,6 +55,28 @@ TEST(AlpacaMarketStreamDecoder,
 }
 
 TEST(AlpacaMarketStreamDecoder,
+     NormalizesTimestampOffsetsWithoutLosingNanoseconds) {
+    constexpr std::string_view frame = R"([
+      {"T":"t","S":"QQQ","i":"utc","x":"V","p":"500","s":"1",
+       "c":[],"z":"C","t":"2026-07-28T13:30:00.123456789Z"},
+      {"T":"t","S":"QQQ","i":"offset","x":"V","p":"500","s":"1",
+       "c":[],"z":"C","t":"2026-07-28T16:00:00.123456789+02:30"}
+    ])";
+
+    const auto decoded =
+        broker::alpaca::DecodeMarketFrame(
+            frame, 1, [](std::string_view symbol) {
+                return "asset:" + std::string(symbol);
+            });
+
+    ASSERT_EQ(decoded.items.size(), 2U);
+    EXPECT_EQ(decoded.items[0].event_time_ns,
+              decoded.items[1].event_time_ns);
+    EXPECT_EQ(decoded.items[0].event_time_ns,
+              1'785'245'400'123'456'789);
+}
+
+TEST(AlpacaMarketStreamDecoder,
      DecodesTradingHaltsAndResumeStates) {
     constexpr std::string_view frame = R"([
       {"T":"s","S":"AAPL","sc":"H","sm":"Trading Halt",
