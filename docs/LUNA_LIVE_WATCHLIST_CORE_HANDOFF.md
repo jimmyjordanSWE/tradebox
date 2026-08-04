@@ -36,6 +36,20 @@ Do not implement any of the following in this work:
 Do not delete the tested tick/replay APIs. They are optional future capability,
 not the current product's storage foundation.
 
+### Source truth versus durable history
+
+The live normalized trade and quote events are source truth while they are in
+the pipeline and in the bounded recent in-memory buffers needed for rendering,
+deduplication, corrections, and derived features. They are not a promise to
+retain every raw tick locally.
+
+The durable local history for this product is the canonical one-minute bar
+projection plus its coverage/presence and quality metadata. Larger timeframes
+derive from those minutes. If exact trades or quotes are needed later for a
+specific replay, fetch them on demand from the provider and run the same
+deterministic feature code; do not create a permanent raw-tick warehouse as a
+side effect of the live watchlist path.
+
 ## Existing foundation to preserve
 
 The repository already provides:
@@ -103,10 +117,22 @@ Tick test:
 The UI decides whether buyer/seller pressure maps to green/red and how it is
 drawn.
 
-## Required core model
+## Derived-feature boundary
 
-Add a small independent pressure module rather than embedding formulas in the
-GUI or Alpaca adapter. Suggested files:
+Trade pressure is not market truth. The authoritative layer is the normalized
+event stream and its persisted projections: trades, quotes, provider bars,
+corrections, cancellations, timestamps, source provenance, and data-quality
+state. Those values must remain useful even if the pressure feature is removed,
+replaced, or recalculated with a different version.
+
+Pressure is therefore an optional, replayable derived feature. It may live in
+the core process for latency and determinism, but it must be a separate module
+that consumes normalized events. It must not be embedded in the Alpaca adapter,
+the canonical market-data rows, or the UI rendering code. The same module must
+be usable for live events and historical replay, with configuration and feature
+version explicit in its output.
+
+Suggested files:
 
 ```text
 include/tradebox/core/trade_pressure.h
@@ -205,21 +231,30 @@ Memory remains bounded for every symbol.
 
 ## Integration boundary
 
-Integrate one reducer into `MarketDataStore::SymbolState`.
+Keep `MarketDataStore` authoritative for normalized source events and canonical
+market projections. Attach the pressure reducer through a derived-feature
+boundary (for example, a feature consumer fed by accepted trade/quote events),
+not by making pressure part of the source record schema.
 
-- Quote application updates the reducer's usable quote state.
-- Accepted/deduplicated trades add one pressure contribution.
-- Corrections and cancellations update recent contributions.
-- Out-of-order observations must not rewind decay time.
-- Stream disconnect/feed change marks pressure stale and clears classification
-  context consistently with the existing live projection boundary.
+- Quote events update the feature's usable-quote context.
+- Accepted/deduplicated trades are offered to the feature once.
+- Corrections and cancellations are offered to the feature when they affect a
+  contribution inside its bounded correction horizon.
+- Out-of-order observations must not rewind feature decay time.
+- Stream disconnect/feed change marks the feature stale and clears its
+  classification context consistently with the existing live projection
+  boundary.
 
-Expose `TradePressureSnapshot` through `MarketDataSnapshot`. Preserve existing
-snapshot and delta semantics. A pressure change records the instrument through
-the existing changed-instrument ring; do not add a second polling channel.
+Expose the result as an optional derived snapshot alongside the existing market
+snapshot (or through a generic feature-snapshot collection). Preserve existing
+source snapshot and delta semantics. A feature change may use the existing
+changed-instrument ring; do not add a second polling channel. Consumers must be
+able to ignore the feature and still receive complete market truth.
 
-Do not persist decayed pressure. It is derived transient state. Persisted
-trades/quotes and provider bars retain their existing behavior.
+Do not persist decayed pressure or require durable raw trades/quotes for it. It
+is derived transient state over the bounded live event window. Persist the
+canonical minute/bar projections and their data-quality metadata; exact raw
+events are fetched on demand when a replay explicitly needs them.
 
 ## Implementation sequence
 
@@ -259,14 +294,17 @@ Required tests:
 
 Acceptance: the reducer is deterministic and all focused tests pass.
 
-### Step 3: market-store integration
+### Step 3: derived-feature integration
 
-Add the reducer to symbol state and expose the snapshot. Test both single-event
-and batch ingestion.
+Connect the reducer to accepted normalized trade/quote events through the
+smallest existing event/projection boundary. Do not alter canonical trade or
+quote storage to carry pressure fields. Test both single-event and batch
+ingestion.
 
 Required tests:
 
-- quote then trade publishes pressure atomically with latest price;
+- quote then trade publishes the derived pressure result alongside the latest
+  price;
 - duplicate trade does not add duplicate pressure;
 - correction/cancellation updates price, provisional minute, tape, and pressure
   coherently;
@@ -274,8 +312,8 @@ Required tests:
 - changed-instrument cursor reports pressure changes;
 - consumer overrun retains existing gap behavior.
 
-Acceptance: no new adapter dependency enters `core`; every market-store test
-passes.
+Acceptance: no new adapter dependency enters the feature module; canonical
+market-data tests remain source-focused; every integration test passes.
 
 ### Step 4: application/watchlist surface
 

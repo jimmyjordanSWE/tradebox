@@ -26,9 +26,13 @@ The immediate product is deliberately smaller than the eventual platform:
   in the current slice.
 - Exact historical trades and quotes may later be fetched for one symbol-day
   on demand and cached as a replay package.
+- Raw ticks are not part of the durable local database for the current product.
+  The live pipeline may keep a bounded in-memory event window for correction,
+  rendering, and feature calculation, while canonical one-minute projections
+  provide permanent local history.
 
-The current implementation is allowed to retain its tested tick persistence,
-but new product work must not depend on retaining every tick forever.
+Tested tick/replay APIs may remain available for future on-demand replay, but
+the live watchlist path must not persist every tick as a side effect.
 
 ## Core Principle
 
@@ -49,9 +53,9 @@ Tick data is a zoom layer, not the default historical database.
 ```text
 Alpaca live and historical APIs
             ↓
-Raw capture and import
+Normalized live event model (bounded in memory)
             ↓
-Canonical market-event model
+Canonical one-minute projections and quality metadata
             ↓
 ┌────────────────────────────────────────────┐
 │ Live scanner and market-state projection   │
@@ -302,8 +306,14 @@ Maintain compact per-symbol state:
 
 ### Current watchlist trade pressure
 
-The current slice adds a transient pressure signal for every subscribed
-watchlist symbol. The core reports market meaning, not presentation colors:
+The current slice adds an optional transient derived feature for every
+subscribed watchlist symbol. Normalized trades, quotes, timestamps, provider
+provenance, corrections, cancellations, and data-quality state remain the
+authoritative market truth. Pressure is computed from that event stream and is
+replayable/configurable; it is not stored as a source fact and must not be
+required for canonical market-data persistence.
+
+The feature reports market meaning, not presentation colors:
 
 ```text
 signed pressure      [-1, +1]
@@ -533,8 +543,10 @@ Performance profiles should be configurable: portable, balanced, throughput, ben
 2. Validate persistent watchlist subscription, live IEX streaming, minute-bar
    persistence, reconnect behavior, and visible persistence health with about
    30 paper-trading symbols.
-3. Add the deterministic decaying trade-pressure reducer and expose it through
-   immutable market-data snapshots and incremental change APIs.
+3. Add the deterministic decaying trade-pressure feature as a separate
+   consumer of normalized market events. Expose its optional snapshot through
+   the existing immutable/incremental data path without adding pressure fields
+   to canonical source records.
 4. Integrate the pressure snapshot into the existing watchlist UI. No alert
    engine or broad UI rewrite belongs in this slice.
 5. Finalize canonical one-minute aggregation and the compressed symbol-day
@@ -563,8 +575,9 @@ requires them.
 - Quotes are mainly live/replay context and may be compressed or discarded after derivation.
 - One-second summaries and raw capture are future optional zoom layers, not
   current dependencies.
-- The current watchlist pressure signal is transient live state; it does not
-  require permanent per-trade history.
+- Derived features such as watchlist pressure are transient/recomputable live
+  state; they do not redefine or replace canonical market truth and do not
+  require permanent per-trade feature history.
 - Feed selection is visible once at the application level. Provenance remains
   stored and queryable without repetitive warning language.
 - Covered/no-trade minutes and missing minutes are distinct in permanent
