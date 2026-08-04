@@ -1,6 +1,7 @@
 #include "tradebox/application/trading_application.h"
 #include "tradebox/persistence/database.h"
 #include "tradebox/platform/credentials.h"
+#include "tradebox/ui/chart_view.h"
 #include "tradebox/ui/model.h"
 
 #include <SDL3/SDL.h>
@@ -37,6 +38,7 @@
 #include "imgui_internal.h"
 #include "imgui_impl_opengl3.h"
 #include "imgui_impl_sdl3.h"
+#include "implot.h"
 
 namespace {
 
@@ -66,6 +68,9 @@ struct Chart {
     std::string symbol;
     std::string timeframe = "1Day";
     std::vector<Bar> bars;
+    tradebox::ui::ChartViewSeries view_series;
+    tradebox::ui::ChartViewDataState view_state =
+        tradebox::ui::ChartViewDataState::Loading;
     int visible_bars = 120;
     double last_trade_price = 0;
     std::int64_t last_trade_timestamp_ms = 0;
@@ -172,6 +177,10 @@ struct App {
 };
 
 void RequestChartData(App& app, Chart& chart);
+
+void SyncChartViewSeries(Chart& chart) {
+    chart.view_series = tradebox::ui::CopyChartViewSeries(chart.bars);
+}
 
 void AddMessage(App& app, std::string message) {
     app.messages.push_back(std::move(message));
@@ -356,37 +365,45 @@ void UpsertDailyBar(Chart& chart, const Bar& bar) {
                                  });
     if (same_day != chart.bars.end()) {
         *same_day = bar;
-        return;
-    }
-    auto position = std::lower_bound(
-        chart.bars.begin(), chart.bars.end(), bar.timestamp_ms,
-        [](const Bar& existing, std::int64_t timestamp) {
-            return existing.timestamp_ms < timestamp;
-        });
-    if (position != chart.bars.end() &&
-        position->timestamp_ms == bar.timestamp_ms) {
-        *position = bar;
     } else {
-        chart.bars.insert(position, bar);
+        auto position = std::lower_bound(
+            chart.bars.begin(), chart.bars.end(), bar.timestamp_ms,
+            [](const Bar& existing, std::int64_t timestamp) {
+                return existing.timestamp_ms < timestamp;
+            });
+        if (position != chart.bars.end() &&
+            position->timestamp_ms == bar.timestamp_ms) {
+            *position = bar;
+        } else {
+            chart.bars.insert(position, bar);
+        }
     }
+    chart.view_state = tradebox::ui::ChartViewDataState::Live;
+    SyncChartViewSeries(chart);
 }
 
 void ApplyTrade(Chart& chart, const Bar& trade) {
     if (trade.close <= 0) return;
     chart.last_trade_price = trade.close;
     chart.last_trade_timestamp_ms = trade.timestamp_ms;
-    const std::int64_t day = (trade.timestamp_ms / kDayMs) * kDayMs;
+    constexpr std::int64_t kMinuteMs = 60'000;
+    const std::int64_t bucket_ms = chart.timeframe == "1Min"
+                                       ? kMinuteMs
+                                       : kDayMs;
+    const std::int64_t day = (trade.timestamp_ms / bucket_ms) * bucket_ms;
     if (chart.bars.empty() ||
-        chart.bars.back().timestamp_ms / kDayMs != day / kDayMs) {
+        chart.bars.back().timestamp_ms / bucket_ms != day / bucket_ms) {
         chart.bars.push_back(
             {day, trade.close, trade.close, trade.close, trade.close, trade.volume});
-        return;
+    } else {
+        Bar& current = chart.bars.back();
+        current.high = std::max(current.high, trade.close);
+        current.low = std::min(current.low, trade.close);
+        current.close = trade.close;
+        current.volume += trade.volume;
     }
-    Bar& current = chart.bars.back();
-    current.high = std::max(current.high, trade.close);
-    current.low = std::min(current.low, trade.close);
-    current.close = trade.close;
-    current.volume += trade.volume;
+    chart.view_state = tradebox::ui::ChartViewDataState::Live;
+    SyncChartViewSeries(chart);
 }
 
 double PreviousSessionClose(const Chart& chart) {
@@ -676,11 +693,21 @@ void DrainEvents(App& app) {
                     event.operational_state == OperationalState::Disconnected) {
                     app.connection_state = ConnectionState::Disconnected;
                     app.market_subscription_active = false;
+                    for (auto& [symbol, chart] : app.charts) {
+                        static_cast<void>(symbol);
+                        chart.view_state =
+                            tradebox::ui::ChartViewDataState::Stale;
+                    }
                 } else if (
                     event.operational_state == OperationalState::Failed ||
                     event.operational_state == OperationalState::Degraded) {
                     app.connection_state = ConnectionState::Error;
                     app.market_subscription_active = false;
+                    for (auto& [symbol, chart] : app.charts) {
+                        static_cast<void>(symbol);
+                        chart.view_state =
+                            tradebox::ui::ChartViewDataState::Stale;
+                    }
                 }
                 break;
             case OperationalComponent::None:
@@ -747,9 +774,13 @@ void DrainEvents(App& app) {
         if (event.type == UiEventType::HistoricalBars) {
             if (event.timeframe != chart.timeframe) continue;
             chart.bars = std::move(event.bars);
+            chart.view_state = chart.bars.empty()
+                                   ? tradebox::ui::ChartViewDataState::NoData
+                                   : tradebox::ui::ChartViewDataState::Cached;
+            SyncChartViewSeries(chart);
             AddMessage(app, event.symbol + ": " +
                                 std::to_string(chart.bars.size()) +
-                                " daily bars ready");
+                                " " + chart.timeframe + " bars ready");
         } else if (event.type == UiEventType::DailyBar) {
             UpsertDailyBar(chart, event.bar);
         }
@@ -2006,10 +2037,16 @@ void AddSymbol(App& app, const std::string& symbol) {
     if (std::find(app.watchlist.begin(), app.watchlist.end(), symbol) !=
         app.watchlist.end())
         return;
-    app.watchlist.push_back(symbol);
+    auto next_watchlist = app.watchlist;
+    next_watchlist.push_back(symbol);
+    if (const auto saved = app.database.SaveWatchlist(next_watchlist);
+        !saved) {
+        AddMessage(app, "Could not save watchlist: " + saved.error());
+        return;
+    }
+    app.watchlist = std::move(next_watchlist);
     Chart chart{symbol};
     app.charts.emplace(symbol, std::move(chart));
-    app.database.SaveWatchlist(app.watchlist);
     app.application.RefreshMarketSymbols(app.watchlist);
 }
 
@@ -2025,9 +2062,16 @@ void OpenChart(App& app, Chart& chart) {
 
 void RemoveSymbol(App& app, std::size_t index) {
     if (index >= app.watchlist.size()) return;
+    auto next_watchlist = app.watchlist;
+    next_watchlist.erase(
+        next_watchlist.begin() + static_cast<std::ptrdiff_t>(index));
+    if (const auto saved = app.database.SaveWatchlist(next_watchlist);
+        !saved) {
+        AddMessage(app, "Could not save watchlist: " + saved.error());
+        return;
+    }
     app.charts.erase(app.watchlist[index]);
-    app.watchlist.erase(app.watchlist.begin() + static_cast<std::ptrdiff_t>(index));
-    app.database.SaveWatchlist(app.watchlist);
+    app.watchlist = std::move(next_watchlist);
     app.application.RefreshMarketSymbols(app.watchlist);
 }
 
@@ -2184,109 +2228,10 @@ void FormatDate(std::int64_t timestamp_ms, char* output, std::size_t size) {
 }
 
 void DrawChartCanvas(Chart& chart) {
-    ImVec2 size = ImGui::GetContentRegionAvail();
-    size.x = std::max(size.x, 240.0f);
-    size.y = std::max(size.y, 180.0f);
-    ImGui::InvisibleButton("chart-canvas", size,
-                           ImGuiButtonFlags_MouseButtonLeft);
-    const ImVec2 top_left = ImGui::GetItemRectMin();
-    const ImVec2 bottom_right = ImGui::GetItemRectMax();
-    ImDrawList* draw = ImGui::GetWindowDrawList();
-    draw->AddRectFilled(top_left, bottom_right, IM_COL32(12, 17, 25, 255));
-
-    if (ImGui::IsItemHovered()) {
-        const float wheel = ImGui::GetIO().MouseWheel;
-        if (wheel != 0) {
-            chart.visible_bars = std::clamp(
-                chart.visible_bars - static_cast<int>(wheel * 12), 20, 1000);
-        }
-    }
-    if (chart.bars.empty()) {
-        draw->AddText(ImVec2(top_left.x + 16, top_left.y + 16),
-                      IM_COL32(145, 155, 170, 255),
-                      "Waiting for daily bars...");
-        return;
-    }
-
-    const int count =
-        std::min(chart.visible_bars, static_cast<int>(chart.bars.size()));
-    const int first = static_cast<int>(chart.bars.size()) - count;
-    double minimum = chart.bars[first].low;
-    double maximum = chart.bars[first].high;
-    for (int i = first; i < static_cast<int>(chart.bars.size()); ++i) {
-        minimum = std::min(minimum, chart.bars[i].low);
-        maximum = std::max(maximum, chart.bars[i].high);
-    }
-    const double padding = std::max((maximum - minimum) * 0.06, 0.01);
-    minimum -= padding;
-    maximum += padding;
-
-    const float label_width = 66.0f;
-    const float plot_width = std::max(size.x - label_width, 1.0f);
-    const float plot_height = std::max(size.y - 20.0f, 1.0f);
-    auto y = [&](double price) {
-        return top_left.y + static_cast<float>((maximum - price) /
-                                               (maximum - minimum)) *
-                                plot_height;
-    };
-    for (int line = 0; line <= 5; ++line) {
-        const float line_y = top_left.y + plot_height * line / 5.0f;
-        draw->AddLine(ImVec2(top_left.x, line_y),
-                      ImVec2(top_left.x + plot_width, line_y),
-                      IM_COL32(45, 54, 67, 120));
-        const double price = maximum - (maximum - minimum) * line / 5.0;
-        char label[32];
-        std::snprintf(label, sizeof(label), "%.2f", price);
-        draw->AddText(ImVec2(top_left.x + plot_width + 5, line_y - 7),
-                      IM_COL32(165, 174, 190, 255), label);
-    }
-
-    const float step = plot_width / static_cast<float>(count);
-    const float body_width = std::max(1.0f, std::min(step * 0.68f, 12.0f));
-    for (int index = 0; index < count; ++index) {
-        const Bar& bar = chart.bars[first + index];
-        const float x = top_left.x + (index + 0.5f) * step;
-        const ImU32 color = bar.close >= bar.open
-                                ? IM_COL32(53, 211, 143, 255)
-                                : IM_COL32(244, 91, 105, 255);
-        draw->AddLine(ImVec2(x, y(bar.high)), ImVec2(x, y(bar.low)), color,
-                      1.0f);
-        float open_y = y(bar.open);
-        float close_y = y(bar.close);
-        if (std::fabs(open_y - close_y) < 1.0f) close_y = open_y + 1.0f;
-        draw->AddRectFilled(
-            ImVec2(x - body_width / 2, std::min(open_y, close_y)),
-            ImVec2(x + body_width / 2, std::max(open_y, close_y)), color);
-    }
-
-    char first_date[16], last_date[16];
-    FormatDate(chart.bars[first].timestamp_ms, first_date, sizeof(first_date));
-    FormatDate(chart.bars.back().timestamp_ms, last_date, sizeof(last_date));
-    draw->AddText(ImVec2(top_left.x, bottom_right.y - 16),
-                  IM_COL32(145, 155, 170, 255), first_date);
-    const ImVec2 last_size = ImGui::CalcTextSize(last_date);
-    draw->AddText(
-        ImVec2(top_left.x + plot_width - last_size.x, bottom_right.y - 16),
-        IM_COL32(145, 155, 170, 255), last_date);
-
-    if (ImGui::IsItemHovered()) {
-        const ImVec2 mouse = ImGui::GetIO().MousePos;
-        draw->AddLine(ImVec2(mouse.x, top_left.y),
-                      ImVec2(mouse.x, top_left.y + plot_height),
-                      IM_COL32(190, 198, 212, 110));
-        draw->AddLine(ImVec2(top_left.x, mouse.y),
-                      ImVec2(top_left.x + plot_width, mouse.y),
-                      IM_COL32(190, 198, 212, 110));
-        const int hovered = std::clamp(
-            static_cast<int>((mouse.x - top_left.x) / step), 0, count - 1);
-        const Bar& bar = chart.bars[first + hovered];
-        char date[16], tooltip[192];
-        FormatDate(bar.timestamp_ms, date, sizeof(date));
-        std::snprintf(tooltip, sizeof(tooltip),
-                      "%s\nO %.2f  H %.2f  L %.2f  C %.2f\nVolume %.0f", date,
-                      bar.open, bar.high, bar.low, bar.close, bar.volume);
-        ImGui::SetTooltip("%s", tooltip);
-    }
+    const std::string plot_id = "chart-plot-" + chart.symbol;
+    tradebox::ui::RenderChartView(plot_id, chart.timeframe,
+                                  chart.view_series, chart.visible_bars,
+                                  chart.view_state);
 }
 
 void DrawCharts(App& app) {
@@ -2310,6 +2255,9 @@ void DrawCharts(App& app) {
                       ? 2 : 0;
         if (ImGui::Combo("Timeframe", &timeframe_index, timeframes, 3)) {
             chart.timeframe = timeframes[timeframe_index];
+            chart.bars.clear();
+            chart.view_series.bars.clear();
+            chart.view_state = tradebox::ui::ChartViewDataState::Loading;
             RequestChartData(app, chart);
         }
         if (!chart.bars.empty()) {
@@ -2629,6 +2577,7 @@ int RunApplication(const LaunchOptions& options) {
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    ImPlot::CreateContext();
     ImGui::StyleColorsDark();
     ImGuiIO& io = ImGui::GetIO();
     io.Fonts->AddFontDefaultVector();
@@ -2689,7 +2638,9 @@ int RunApplication(const LaunchOptions& options) {
         }
     }
     if (app.watchlist.size() >= 4) {
-        database.SaveWatchlist(app.watchlist);
+        if (const auto saved = database.SaveWatchlist(app.watchlist);
+            !saved)
+            AddMessage(app, "Could not save watchlist: " + saved.error());
     }
     for (const std::string& symbol : app.watchlist) {
         Chart chart{symbol};
@@ -2864,6 +2815,7 @@ int RunApplication(const LaunchOptions& options) {
     static_cast<void>(disconnect_result);
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
+    ImPlot::DestroyContext();
     ImGui::DestroyContext();
     SDL_GL_DestroyContext(gl);
     SDL_DestroyWindow(window);

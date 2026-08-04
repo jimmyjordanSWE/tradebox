@@ -92,7 +92,8 @@ public:
     bool OpenAt(const std::filesystem::path& database_path,
                 std::string& error);
     std::vector<std::string> LoadWatchlist();
-    void SaveWatchlist(const std::vector<std::string>& symbols);
+    std::expected<void, std::string> SaveWatchlist(
+        const std::vector<std::string>& symbols);
     std::vector<tradebox::core::TradableAsset> LoadAssetCatalog();
     void SaveAssetCatalog(const std::vector<tradebox::core::TradableAsset>& assets);
     WindowPlacement LoadWindowPlacement();

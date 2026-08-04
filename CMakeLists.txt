@@ -15,6 +15,15 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(dear_imgui)
 
+FetchContent_Declare(
+  implot
+  GIT_REPOSITORY https://github.com/epezent/implot.git
+  GIT_TAG v1.0
+  GIT_SHALLOW TRUE
+  SOURCE_SUBDIR tradebox-no-cmake-project
+)
+FetchContent_MakeAvailable(implot)
+
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST OFF CACHE BOOL "" FORCE)
@@ -93,6 +102,13 @@ function(tradebox_enable_windows_api target)
   )
 endfunction()
 
+add_library(tradebox_implot STATIC
+  ${implot_SOURCE_DIR}/implot.cpp
+  ${implot_SOURCE_DIR}/implot_items.cpp
+)
+target_include_directories(tradebox_implot PUBLIC ${implot_SOURCE_DIR})
+target_link_libraries(tradebox_implot PUBLIC imgui)
+
 add_library(tradebox_core STATIC
   src/core/decimal.cpp
   src/core/asset_catalog.cpp
@@ -101,6 +117,7 @@ add_library(tradebox_core STATIC
   src/core/market_data_store.cpp
   src/core/order_request.cpp
   src/core/system_clock.cpp
+  src/core/trade_pressure.cpp
   src/core/trading_core.cpp
 )
 target_include_directories(tradebox_core PUBLIC include)
@@ -172,6 +189,9 @@ tradebox_enable_strict_warnings(tradebox_application)
 add_executable(tradebox_gui WIN32
   src/adapters/gui/main.cpp
   src/adapters/gui/model.cpp
+  src/adapters/gui/workspace.cpp
+  src/adapters/gui/chart_view.cpp
+  src/adapters/gui/chart_view_data.cpp
 )
 set_target_properties(tradebox_gui PROPERTIES OUTPUT_NAME TradeBoxNative)
 target_compile_features(tradebox_gui PRIVATE cxx_std_23)
@@ -185,11 +205,32 @@ target_link_libraries(tradebox_gui PRIVATE
   tradebox_persistence
   tradebox_platform
   imgui
+  tradebox_implot
   nlohmann_json::nlohmann_json
   SDL3::SDL3-static
   opengl32
   psapi
 )
+
+add_executable(tradebox_dummy_ui WIN32
+  src/adapters/gui_dummy/main.cpp
+  src/adapters/gui/workspace.cpp
+)
+set_target_properties(tradebox_dummy_ui PROPERTIES OUTPUT_NAME TradeBoxDummyUI)
+target_compile_features(tradebox_dummy_ui PRIVATE cxx_std_23)
+target_include_directories(tradebox_dummy_ui PRIVATE include)
+target_compile_definitions(tradebox_dummy_ui PRIVATE
+  WIN32_LEAN_AND_MEAN
+  NOMINMAX
+  _WIN32_WINNT=0x0A00
+)
+target_link_libraries(tradebox_dummy_ui PRIVATE
+  imgui
+  SDL3::SDL3-static
+  opengl32
+)
+tradebox_enable_windows_api(tradebox_dummy_ui)
+tradebox_enable_strict_warnings(tradebox_dummy_ui)
 
 include(CTest)
 option(
@@ -215,6 +256,7 @@ if(BUILD_TESTING)
     tests/unit/market_data_store_tests.cpp
     tests/unit/order_request_tests.cpp
     tests/unit/trading_core_tests.cpp
+    tests/unit/trade_pressure_tests.cpp
   )
   target_compile_features(tradebox_core_tests PRIVATE cxx_std_23)
   target_link_libraries(tradebox_core_tests PRIVATE
@@ -235,6 +277,7 @@ if(BUILD_TESTING)
     tests/unit/alpaca_rest_transport_tests.cpp
     tests/unit/alpaca_stream_supervision_tests.cpp
     tests/unit/database_order_command_journal_tests.cpp
+    tests/unit/database_watchlist_tests.cpp
     tests/unit/order_execution_service_tests.cpp
   )
   target_compile_features(tradebox_order_pipeline_tests PRIVATE cxx_std_23)
@@ -248,8 +291,11 @@ if(BUILD_TESTING)
   tradebox_enable_strict_warnings(tradebox_order_pipeline_tests)
   gtest_discover_tests(tradebox_order_pipeline_tests)
 
-  add_executable(tradebox_ui_tests tests/unit/ui_model_tests.cpp
-    src/adapters/gui/model.cpp)
+  add_executable(tradebox_ui_tests
+    tests/unit/ui_model_tests.cpp
+    tests/unit/chart_view_tests.cpp
+    src/adapters/gui/model.cpp
+    src/adapters/gui/chart_view_data.cpp)
   target_compile_features(tradebox_ui_tests PRIVATE cxx_std_23)
   target_link_libraries(tradebox_ui_tests PRIVATE tradebox_core GTest::gtest_main)
   tradebox_enable_strict_warnings(tradebox_ui_tests)

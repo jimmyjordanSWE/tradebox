@@ -1420,21 +1420,58 @@ std::vector<std::string> Database::LoadWatchlist() {
     return result;
 }
 
-void Database::SaveWatchlist(const std::vector<std::string>& symbols) {
+std::expected<void, std::string> Database::SaveWatchlist(
+    const std::vector<std::string>& symbols) {
     std::scoped_lock lock(db_mutex_);
-    Execute("BEGIN IMMEDIATE; DELETE FROM watchlist;");
+    if (!db_)
+        return std::unexpected("Database is not open");
+
+    std::string error;
+    if (!Execute("BEGIN IMMEDIATE;", &error))
+        return std::unexpected("Could not begin watchlist save: " + error);
+    const auto rollback = [&]() {
+        Execute("ROLLBACK;", nullptr);
+    };
+    if (!Execute("DELETE FROM watchlist;", &error)) {
+        rollback();
+        return std::unexpected("Could not clear watchlist: " + error);
+    }
+
     sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(
-        db_, "INSERT INTO watchlist(symbol, sort_order) VALUES(?, ?)", -1,
-        &statement, nullptr);
+    if (sqlite3_prepare_v2(
+            db_,
+            "INSERT INTO watchlist(symbol, sort_order) VALUES(?, ?)",
+            -1, &statement, nullptr) != SQLITE_OK) {
+        error = sqlite3_errmsg(db_);
+        rollback();
+        return std::unexpected("Could not prepare watchlist save: " +
+                               error);
+    }
     for (std::size_t i = 0; i < symbols.size(); ++i) {
-        sqlite3_bind_text(statement, 1, symbols[i].c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(statement, 2, static_cast<int>(i));
-        sqlite3_step(statement);
-        sqlite3_reset(statement);
+        if (sqlite3_bind_text(statement, 1, symbols[i].c_str(), -1,
+                              SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_bind_int(statement, 2, static_cast<int>(i)) !=
+                SQLITE_OK ||
+            sqlite3_step(statement) != SQLITE_DONE) {
+            error = sqlite3_errmsg(db_);
+            sqlite3_finalize(statement);
+            rollback();
+            return std::unexpected("Could not insert watchlist row: " +
+                                   error);
+        }
+        if (sqlite3_reset(statement) != SQLITE_OK) {
+            error = sqlite3_errmsg(db_);
+            sqlite3_finalize(statement);
+            rollback();
+            return std::unexpected("Could not reset watchlist row: " +
+                                   error);
+        }
     }
     sqlite3_finalize(statement);
-    Execute("COMMIT;");
+    if (!Execute("COMMIT;", &error))
+        return std::unexpected("Could not commit watchlist save: " +
+                               error);
+    return {};
 }
 
 std::vector<tradebox::core::TradableAsset> Database::LoadAssetCatalog() {

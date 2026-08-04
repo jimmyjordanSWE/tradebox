@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tradebox/core/decimal.h"
+#include "tradebox/core/trade_pressure_types.h"
 #include "tradebox/core/types.h"
 
 #include <cstdint>
@@ -175,6 +176,7 @@ struct MarketDataSnapshot {
     std::uint64_t revision = 0;
     std::int64_t last_received_at_ms = 0;
     std::string status_message;
+    std::optional<TradePressureSnapshot> trade_pressure;
 };
 
 struct SequencedMarketDataEvent {
@@ -201,6 +203,7 @@ struct MarketDataDelta {
     bool gap_detected = false;
     std::int64_t last_received_at_ms = 0;
     std::string status_message;
+    std::optional<TradePressureSnapshot> trade_pressure;
 };
 
 struct ChangedInstrument {

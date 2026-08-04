@@ -354,6 +354,186 @@ TEST(MarketDataStore,
 }
 
 TEST(MarketDataStore,
+     PublishesPressureAlongsideLatestPriceAndDelta) {
+    MarketDataStore store;
+    store.Ingest(QuoteReceived{.quote = {
+        .symbol = "AAPL",
+        .bid_price = D("99"),
+        .ask_price = D("101"),
+        .event_time_ns = 1'000'000'000,
+        .received_at_ms = 1'000,
+    }});
+    auto trade = Trade("buyer", "101", "100", 1'001'000'000);
+    trade.tape = "C";
+    trade.conditions = {"@"};
+    trade.received_at_ms = 1'001;
+    store.Ingest(TradeReceived{.trade = std::move(trade)});
+
+    const auto snapshot = store.Snapshot("AAPL");
+    ASSERT_TRUE(snapshot.latest_price);
+    EXPECT_EQ(snapshot.latest_price->price.ToString(), "101");
+    ASSERT_TRUE(snapshot.trade_pressure);
+    EXPECT_EQ(snapshot.trade_pressure->buyer_trades, 1U);
+    EXPECT_EQ(snapshot.trade_pressure->seller_trades, 0U);
+    EXPECT_EQ(snapshot.trade_pressure->latest_method,
+              TradeClassificationMethod::QuoteTest);
+
+    const auto delta = store.Delta("AAPL", 0, 10);
+    ASSERT_TRUE(delta.trade_pressure);
+    EXPECT_EQ(delta.trade_pressure->buyer_trades, 1U);
+    EXPECT_EQ(delta.events.size(), 2U);
+}
+
+TEST(MarketDataStore,
+     BatchIngestPublishesPressureInEventOrder) {
+    MarketDataStore store;
+    auto quote = QuoteReceived{.quote = {
+        .symbol = "AAPL",
+        .bid_price = D("99"),
+        .ask_price = D("101"),
+        .event_time_ns = 1'000'000'000,
+        .received_at_ms = 1'000,
+    }};
+    auto trade = Trade("buyer", "101", "100", 1'001'000'000);
+    trade.tape = "C";
+    trade.conditions = {"@"};
+    trade.received_at_ms = 1'001;
+    store.IngestBatch({
+        ShareMarketDataEvent(std::move(quote)),
+        ShareMarketDataEvent(TradeReceived{.trade = std::move(trade)}),
+    });
+
+    const auto snapshot = store.Snapshot("AAPL");
+    ASSERT_TRUE(snapshot.trade_pressure);
+    EXPECT_EQ(snapshot.trade_pressure->buyer_trades, 1U);
+    EXPECT_EQ(snapshot.trade_pressure->latest_method,
+              TradeClassificationMethod::QuoteTest);
+}
+
+TEST(MarketDataStore,
+     DuplicateTradeDoesNotAddDuplicatePressureOrChangedInstrument) {
+    MarketDataStore store;
+    auto trade = Trade("same", "101", "100", 1'001'000'000);
+    trade.received_at_ms = 1'001;
+    store.Ingest(TradeReceived{.trade = trade});
+    const auto first = store.Changes(0, 10);
+    ASSERT_EQ(first.instruments.size(), 1U);
+
+    store.Ingest(TradeReceived{.trade = std::move(trade)});
+    const auto snapshot = store.Snapshot("AAPL");
+    ASSERT_TRUE(snapshot.trade_pressure);
+    EXPECT_EQ(snapshot.trade_pressure->buyer_trades, 0U);
+    EXPECT_EQ(snapshot.trade_pressure->unknown_trades, 1U);
+    EXPECT_TRUE(
+        store.Changes(first.next_sequence, 10).instruments.empty());
+}
+
+TEST(MarketDataStore,
+     CorrectionAndCancellationUpdatePressureWithCanonicalPrice) {
+    MarketDataStore store;
+    store.Ingest(QuoteReceived{.quote = {
+        .symbol = "AAPL",
+        .bid_price = D("99"),
+        .ask_price = D("101"),
+        .event_time_ns = 1'000'000'000,
+        .received_at_ms = 1'000,
+    }});
+    auto original = Trade("original", "101", "100", 1'001'000'000);
+    original.tape = "C";
+    original.conditions = {"@"};
+    original.received_at_ms = 1'001;
+    store.Ingest(TradeReceived{.trade = std::move(original)});
+
+    auto corrected = Trade("corrected", "99", "100", 1'001'000'000);
+    corrected.tape = "C";
+    corrected.conditions = {"@"};
+    corrected.received_at_ms = 1'002;
+    store.Ingest(TradeCorrected{
+        .symbol = "AAPL",
+        .original_trade_id = "original",
+        .corrected_trade = std::move(corrected),
+    });
+    auto snapshot = store.Snapshot("AAPL");
+    ASSERT_TRUE(snapshot.latest_price);
+    EXPECT_EQ(snapshot.latest_price->price.ToString(), "99");
+    ASSERT_TRUE(snapshot.trade_pressure);
+    EXPECT_EQ(snapshot.trade_pressure->buyer_trades, 0U);
+    EXPECT_EQ(snapshot.trade_pressure->seller_trades, 1U);
+
+    store.Ingest(TradeCanceled{
+        .symbol = "AAPL",
+        .trade_id = "corrected",
+        .event_time_ns = 1'001'000'000,
+        .received_at_ms = 1'003,
+    });
+    snapshot = store.Snapshot("AAPL");
+    EXPECT_FALSE(snapshot.latest_price);
+    ASSERT_TRUE(snapshot.trade_pressure);
+    EXPECT_EQ(snapshot.trade_pressure->buyer_trades, 0U);
+    EXPECT_EQ(snapshot.trade_pressure->seller_trades, 0U);
+    EXPECT_EQ(snapshot.trade_pressure->activity, 0.0);
+}
+
+TEST(MarketDataStore,
+     ReconnectMarksPressureStaleAndNewEventsResumeIt) {
+    MarketDataStore store;
+    store.Ingest(MarketStreamChanged{
+        .status = MarketStreamStatus::Subscribed,
+        .feed = MarketDataFeed::Iex,
+        .trade_symbols = {"AAPL"},
+        .quote_symbols = {"AAPL"},
+    });
+    auto trade = Trade("before", "101", "100", 1'001'000'000);
+    trade.received_at_ms = 1'001;
+    store.Ingest(TradeReceived{.trade = std::move(trade)});
+    ASSERT_TRUE(store.Snapshot("AAPL").trade_pressure);
+    EXPECT_FALSE(store.Snapshot("AAPL").trade_pressure->stale);
+
+    store.Ingest(MarketStreamChanged{
+        .status = MarketStreamStatus::Connecting,
+        .feed = MarketDataFeed::Iex,
+        .received_at_ms = 1'002,
+    });
+    ASSERT_TRUE(store.Snapshot("AAPL").trade_pressure);
+    EXPECT_TRUE(store.Snapshot("AAPL").trade_pressure->stale);
+
+    auto resumed = Trade("after", "101", "100", 1'003'000'000);
+    resumed.received_at_ms = 1'003;
+    store.Ingest(TradeReceived{.trade = std::move(resumed)});
+    ASSERT_TRUE(store.Snapshot("AAPL").trade_pressure);
+    EXPECT_FALSE(store.Snapshot("AAPL").trade_pressure->stale);
+
+    store.Ingest(MarketStreamChanged{
+        .status = MarketStreamStatus::Subscribed,
+        .feed = MarketDataFeed::Sip,
+    });
+    ASSERT_TRUE(store.Snapshot("AAPL").trade_pressure);
+    EXPECT_TRUE(store.Snapshot("AAPL").trade_pressure->stale);
+}
+
+TEST(MarketDataStore,
+     PressureChangesUseTheExistingChangedInstrumentCursor) {
+    MarketDataStore store;
+    auto first_trade = Trade("first", "100", "100", 1'000'000'000);
+    first_trade.received_at_ms = 1'000;
+    store.Ingest(TradeReceived{.trade = std::move(first_trade)});
+    const auto first = store.Changes(0, 10);
+    ASSERT_EQ(first.instruments.size(), 1U);
+
+    store.Ingest(QuoteReceived{.quote = {
+        .symbol = "AAPL",
+        .bid_price = D("99"),
+        .ask_price = D("101"),
+        .event_time_ns = 1'001'000'000,
+        .received_at_ms = 1'001,
+    }});
+    const auto second =
+        store.Changes(first.next_sequence, 10);
+    ASSERT_EQ(second.instruments.size(), 1U);
+    EXPECT_EQ(second.instruments.front().symbol, "AAPL");
+}
+
+TEST(MarketDataStore,
      AppliesAlpacaMinuteConditionRulesToLiveProjection) {
     constexpr std::int64_t minute = 60LL * 1'000'000'000;
     MarketDataStore store;

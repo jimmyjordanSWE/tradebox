@@ -2,6 +2,7 @@
 
 #include "tradebox/core/market_data.h"
 #include "tradebox/core/sequence_ring.h"
+#include "tradebox/core/trade_pressure.h"
 
 #include <cstddef>
 #include <memory>
@@ -76,6 +77,7 @@ private:
             live_trade_by_id;
         std::vector<LiveMinute> live_minutes;
         std::optional<CanonicalMarketPrice> latest_price;
+        TradePressureReducer trade_pressure;
         std::int64_t newest_minute_start_ns = 0;
         std::uint64_t live_revision = 0;
         SequenceRing<MarketDataEventPtr> events;

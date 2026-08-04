@@ -10,6 +10,13 @@ constexpr std::int64_t kDayNs =
     24LL * 60 * 60 * 1'000'000'000;
 constexpr std::int64_t kMinuteNs = 60LL * 1'000'000'000;
 
+std::int64_t ObservationTimeMs(
+    std::int64_t event_time_ns,
+    std::int64_t received_at_ms) {
+    if (received_at_ms > 0) return received_at_ms;
+    return event_time_ns > 0 ? event_time_ns / 1'000'000 : 0;
+}
+
 struct MinuteUpdateRules {
     bool price = false;
     bool volume = false;
@@ -187,6 +194,8 @@ MarketDataSnapshot MarketDataStore::Snapshot(
     }
     result.revision = state->revision;
     result.last_received_at_ms = state->last_received_at_ms;
+    result.trade_pressure = state->trade_pressure.Snapshot(
+        state->last_received_at_ms);
     return result;
 }
 
@@ -236,6 +245,8 @@ MarketDataDelta MarketDataStore::Delta(
     }
     result.next_sequence = state.next_sequence - 1;
     result.last_received_at_ms = state.last_received_at_ms;
+    result.trade_pressure = state.trade_pressure.Snapshot(
+        state.last_received_at_ms);
     if (state.events.Empty() || maximum_events == 0) return result;
     const std::uint64_t oldest = state.events.Oldest();
     result.gap_detected =
@@ -322,6 +333,10 @@ void MarketDataStore::Apply(
                  event.quote.received_at_ms);
     state.quote_owner = owner;
     state.quote = &event.quote;
+    state.trade_pressure.ObserveQuote(
+        event.quote,
+        ObservationTimeMs(event.quote.event_time_ns,
+                          event.quote.received_at_ms));
     ++state.revision;
     AppendEvent(state, owner);
     RecordChange(state);
@@ -337,6 +352,10 @@ void MarketDataStore::Apply(
     const bool inserted =
         InsertTrade(state, owner, &event.trade);
     if (!inserted) return;
+    state.trade_pressure.ObserveTrade(
+        event.trade,
+        ObservationTimeMs(event.trade.event_time_ns,
+                          event.trade.received_at_ms));
     InsertLiveTrade(state, owner, event.trade,
                     receive_sequence);
     state.last_received_at_ms =
@@ -356,7 +375,11 @@ void MarketDataStore::Apply(
         state, event.trade_id, event.event_time_ns);
     const bool erased_live = EraseLiveTrade(
         state, event.trade_id, event.event_time_ns);
-    if (erased || erased_live)
+    const bool pressure_changed = state.trade_pressure.CancelTrade(
+        event.trade_id, event.event_time_ns,
+        ObservationTimeMs(event.event_time_ns,
+                          event.received_at_ms));
+    if (erased || erased_live || pressure_changed)
         ++state.revision;
     AppendEvent(state, owner);
     RecordChange(state);
@@ -371,6 +394,11 @@ void MarketDataStore::Apply(
                event.corrected_trade.event_time_ns);
     EraseLiveTrade(state, event.original_trade_id,
                    event.corrected_trade.event_time_ns);
+    state.trade_pressure.CorrectTrade(
+        event.original_trade_id, event.corrected_trade,
+        ObservationTimeMs(
+            event.corrected_trade.event_time_ns,
+            event.corrected_trade.received_at_ms));
     const std::uint64_t receive_sequence =
         next_receive_sequence_;
     InsertTrade(state, owner, &event.corrected_trade, true);
@@ -419,6 +447,11 @@ void MarketDataStore::Apply(
         feed_ != next_feed;
     const bool connection_boundary =
         event.status == MarketStreamStatus::Connecting;
+    const bool pressure_boundary =
+        feed_changed || connection_boundary ||
+        event.status == MarketStreamStatus::Disconnected ||
+        event.status == MarketStreamStatus::Stale ||
+        event.status == MarketStreamStatus::Error;
     feed_ = next_feed;
     stream_status_ = event.status;
     status_message_ = event.message;
@@ -462,6 +495,8 @@ void MarketDataStore::Apply(
             state->newest_minute_start_ns = 0;
             ++state->live_revision;
         }
+        if (pressure_boundary)
+            state->trade_pressure.MarkStale();
         ++state->revision;
         RecordChange(*state);
     }
