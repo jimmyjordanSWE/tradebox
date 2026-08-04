@@ -62,6 +62,19 @@ enum class ConnectionState {
     Error
 };
 
+enum class EventSeverity {
+    Auto,
+    Info,
+    Warning,
+    Error,
+};
+
+struct EventLogEntry {
+    std::int64_t recorded_at_ms = 0;
+    EventSeverity severity = EventSeverity::Info;
+    std::string text;
+};
+
 struct LaunchOptions {
     std::filesystem::path capture_path;
     bool capture_and_exit = false;
@@ -136,7 +149,7 @@ struct App {
     std::array<char, 160> key{};
     std::array<char, 160> secret{};
     std::array<char, 24> new_symbol{};
-    std::vector<std::string> messages;
+    std::vector<EventLogEntry> messages;
     struct OrderTicket {
         OrderEntryDraft draft;
         std::array<char, 96> name{'U','n','t','i','t','l','e','d',' ','o','r','d','e','r'};
@@ -273,10 +286,49 @@ void RestoreOpenCharts(App& app) {
 
 void RequestChartData(App& app, Chart& chart);
 
-void AddMessage(App& app, std::string message) {
-    app.messages.push_back(std::move(message));
-    if (app.messages.size() > 100)
-        app.messages.erase(app.messages.begin(), app.messages.begin() + 20);
+std::int64_t SystemNowMs();
+
+bool ContainsInsensitive(std::string_view text, std::string_view needle) {
+    return std::search(
+               text.begin(), text.end(), needle.begin(), needle.end(),
+               [](char left, char right) {
+                   return std::tolower(static_cast<unsigned char>(left)) ==
+                          std::tolower(static_cast<unsigned char>(right));
+               }) != text.end();
+}
+
+EventSeverity ClassifyEventSeverity(std::string_view message) {
+    for (const std::string_view marker :
+         {"error", "failed", "rejected", "could not", "indeterminate"}) {
+        if (ContainsInsensitive(message, marker)) return EventSeverity::Error;
+    }
+    for (const std::string_view marker :
+         {"warning", "stale", "waiting", "unavailable", "reconnecting"}) {
+        if (ContainsInsensitive(message, marker)) return EventSeverity::Warning;
+    }
+    return EventSeverity::Info;
+}
+
+EventSeverity EventSeverityFromOperational(OperationalSeverity severity) {
+    switch (severity) {
+    case OperationalSeverity::Critical: return EventSeverity::Error;
+    case OperationalSeverity::Warning: return EventSeverity::Warning;
+    case OperationalSeverity::Informational: return EventSeverity::Info;
+    }
+    return EventSeverity::Info;
+}
+
+void AddMessage(App& app, std::string message,
+                EventSeverity severity = EventSeverity::Auto) {
+    if (message.empty()) return;
+    if (severity == EventSeverity::Auto)
+        severity = ClassifyEventSeverity(message);
+    app.messages.insert(app.messages.begin(), EventLogEntry{
+        .recorded_at_ms = SystemNowMs(),
+        .severity = severity,
+        .text = std::move(message),
+    });
+    if (app.messages.size() > 100) app.messages.resize(100);
 }
 
 void ClearCredentialInputs(App& app) {
@@ -605,7 +657,7 @@ void ApplyChartSnapshot(
     if (chart.core_snapshot.bars.empty() &&
         !chart.core_snapshot.current_bar) {
         chart.view_state = tradebox::ui::ChartViewDataState::NoData;
-        chart.data_message = "No historical bars returned for this range.";
+        chart.data_message = "No chart data available. See Activity > Events.";
     } else if (!chart.core_snapshot.missing_ranges.empty()) {
         chart.view_state = tradebox::ui::ChartViewDataState::Loading;
     } else if (chart.core_snapshot.current_bar ||
@@ -697,7 +749,8 @@ void DrainEvents(App& app) {
                     chart != app.charts.end()) {
                     chart->second.view_state =
                         tradebox::ui::ChartViewDataState::NoData;
-                    chart->second.data_message = event.message;
+                    chart->second.data_message =
+                        "Chart data request failed. See Activity > Events.";
                     chart->second.history_loaded = false;
                 }
             }
@@ -767,7 +820,9 @@ void DrainEvents(App& app) {
             case OperationalComponent::None:
                 break;
             }
-            AddMessage(app, std::move(event.message));
+            AddMessage(app, std::move(event.message),
+                       EventSeverityFromOperational(
+                           event.operational_severity));
             continue;
         }
         if (event.type == UiEventType::MarketClock) {
@@ -2769,18 +2824,16 @@ void DrawOrdersContent(App& app) {
                safety == tradebox::core::SafetyStatus::Connecting) {
         ImGui::TextColored(
             ImVec4(0.96f, 0.72f, 0.30f, 1.0f),
-            "%zu orders | RECONCILING | %s", app.orders.size(),
-            app.core_view.status_message.c_str());
+            "%zu orders | RECONCILING", app.orders.size());
     } else {
         ImGui::TextColored(
             ImVec4(0.96f, 0.56f, 0.30f, 1.0f),
-            "%zu orders | STALE %s old | %s",
+            "%zu orders | STALE %s old",
             app.orders.size(),
             FormatDelay(app.orders_received_at_ms > 0
                             ? SystemNowMs() - app.orders_received_at_ms
                             : -1)
-                .c_str(),
-            app.core_view.status_message.c_str());
+                .c_str());
     }
     ImGui::SameLine();
     ImGui::Checkbox("Active", &app.show_active_orders);
@@ -2886,13 +2939,88 @@ void DrawOrdersContent(App& app) {
     }
 }
 
+const char* EventSeverityLabel(EventSeverity severity) {
+    switch (severity) {
+    case EventSeverity::Info: return "INFO";
+    case EventSeverity::Warning: return "WARNING";
+    case EventSeverity::Error: return "ERROR";
+    case EventSeverity::Auto: return "INFO";
+    }
+    return "INFO";
+}
+
+ImVec4 EventSeverityColor(EventSeverity severity) {
+    switch (severity) {
+    case EventSeverity::Warning: return ImVec4(0.96f, 0.72f, 0.30f, 1.0f);
+    case EventSeverity::Error: return ImVec4(0.96f, 0.38f, 0.43f, 1.0f);
+    case EventSeverity::Auto:
+    case EventSeverity::Info: return ImVec4(0.48f, 0.67f, 0.88f, 1.0f);
+    }
+    return ImVec4(0.48f, 0.67f, 0.88f, 1.0f);
+}
+
+std::string FormatEventTimestamp(std::int64_t timestamp_ms) {
+    const std::time_t seconds =
+        static_cast<std::time_t>(timestamp_ms / 1'000);
+    std::tm local{};
+    localtime_s(&local, &seconds);
+    std::ostringstream result;
+    result << std::put_time(&local, "%H:%M:%S");
+    return result.str();
+}
+
+std::string CopyableEventLog(const std::vector<EventLogEntry>& entries) {
+    std::ostringstream text;
+    for (const EventLogEntry& entry : entries) {
+        text << FormatEventTimestamp(entry.recorded_at_ms) << "  "
+             << EventSeverityLabel(entry.severity) << "  " << entry.text
+             << '\n';
+    }
+    return text.str();
+}
+
 void DrawEventLogContent(App& app) {
-    ImGui::TextDisabled("Source events are recorded on the replay timeline.");
+    ImGui::TextDisabled("Newest first. Copy exact broker and history details for troubleshooting.");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Copy all")) {
+        const std::string copy = CopyableEventLog(app.messages);
+        ImGui::SetClipboardText(copy.c_str());
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%zu retained", app.messages.size());
     ImGui::Separator();
-    for (const std::string& message : app.messages)
-        ImGui::TextWrapped("%s", message.c_str());
-    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4)
-        ImGui::SetScrollHereY(1.0f);
+    if (!ImGui::BeginTable(
+            "event-log", 4,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
+                ImGuiTableFlags_SizingStretchProp,
+            ImVec2(0, ImGui::GetContentRegionAvail().y)))
+        return;
+    ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 74.0f);
+    ImGui::TableSetupColumn("Level", ImGuiTableColumnFlags_WidthFixed, 72.0f);
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 44.0f);
+    ImGui::TableSetupColumn("Message", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableHeadersRow();
+    for (std::size_t index = 0; index < app.messages.size(); ++index) {
+        const EventLogEntry& entry = app.messages[index];
+        ImGui::PushID(static_cast<int>(index));
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        const std::string timestamp = FormatEventTimestamp(entry.recorded_at_ms);
+        ImGui::TextUnformatted(timestamp.c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextColored(EventSeverityColor(entry.severity), "%s",
+                           EventSeverityLabel(entry.severity));
+        ImGui::TableNextColumn();
+        if (ImGui::SmallButton("Copy"))
+            ImGui::SetClipboardText(entry.text.c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextWrapped("%s", entry.text.c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Use Copy to place this exact text on the clipboard.");
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
 }
 
 void DrawActivity(App& app) {
