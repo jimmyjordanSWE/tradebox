@@ -2592,6 +2592,8 @@ DatabaseWriterTelemetry Database::WriterTelemetry() const {
         .high_water_events = queue_high_water_,
         .accepted_events = accepted_events_,
         .dequeued_events = dequeued_events_,
+        .event_write_batches = event_write_batches_,
+        .event_write_nanoseconds = event_write_nanoseconds_,
         .dropped_market_events = dropped_market_events_,
         .dropped_timeline_events = dropped_timeline_events_,
         .pending_bar_batches = pending_bar_batches_.size(),
@@ -2664,8 +2666,23 @@ void Database::WriterLoop() {
                 stopping_)
                 break;
         }
+        const auto event_write_start =
+            std::chrono::steady_clock::now();
         const auto event_write = FlushEvents(batch);
+        const auto event_write_elapsed =
+            std::chrono::steady_clock::now() -
+            event_write_start;
         const auto bar_write = FlushProviderBars(bar_batches);
+        if (!batch.empty()) {
+            std::scoped_lock lock(queue_mutex_);
+            ++event_write_batches_;
+            event_write_nanoseconds_ +=
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(
+                        event_write_elapsed)
+                        .count());
+        }
         if (!event_write || !bar_write) {
             std::scoped_lock lock(queue_mutex_);
             ++write_failures_;
@@ -2700,10 +2717,24 @@ void Database::WriterLoop() {
         }
         pending_bar_count_ = 0;
     }
+    const auto event_write_start =
+        std::chrono::steady_clock::now();
     const auto event_write = FlushEvents(remaining);
+    const auto event_write_elapsed =
+        std::chrono::steady_clock::now() -
+        event_write_start;
     const auto bar_write = FlushProviderBars(remaining_bar_batches);
     {
         std::scoped_lock lock(queue_mutex_);
+        if (!remaining.empty()) {
+            ++event_write_batches_;
+            event_write_nanoseconds_ +=
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(
+                        event_write_elapsed)
+                        .count());
+        }
         if (!event_write || !bar_write) {
             ++write_failures_;
             last_write_error_ =

@@ -427,3 +427,103 @@ The machine-level slowdown affected ingestion and durable rates together; the
 median durable/ingestion ratio was 0.874 versus 0.877 for the accepted text-key
 schema. There is no measurable writer benefit, so the change was reverted.
 Short closed-set text values are retained for clarity.
+
+2026-07-30 writer-active telemetry and compact-payload experiment
+-----------------------------------------------------------------
+Writer-active telemetry measures only time spent inside durable event
+transactions, excluding producer decoding/projection and queue waiting. It is
+reported by the replay benchmark so producer changes cannot hide the actual
+persistence ceiling.
+
+Accepted wide-row baseline, five 500,000-event SIP runs:
+  writer-active rates:
+    318739 / 318316 / 308734 / 312431 / 249032 events/s
+  median: 312431 events/s
+
+Compact versioned BLOB experiment (rejected), same workload:
+  writer-active rates:
+    276743 / 295479 / 300021 / 297552 / 293206 events/s
+  median: 295479 events/s
+  median change: -5.4%
+
+SQLite already represents nullable fields compactly. Constructing a separate
+length-prefixed payload added copying and encoding work that outweighed fewer
+SQL bindings. The format change was reverted. Writer-active telemetry remains.
+
+Full-market engineering target:
+  1500000 normalized SIP events/s end to end, with CPU capacity left for
+  scanners and an all-market heat-map projection.
+
+At the current 312431 writer-active median, one SQLite writer requires about a
+4.8x improvement to reach the target alone. The next experiments must test
+structural concurrency or removal of hot secondary-index work rather than
+cosmetic row encoding.
+
+2026-07-30 single-writer SQLite upper-bound probes (diagnostic only)
+-------------------------------------------------------------------
+Same durable 500,000-event SIP workload. Writer-active rates isolate SQLite
+transaction work. Three runs per temporary schema.
+
+Accepted production indexes:
+  median: 312431 events/s
+
+Dedup index only; time-range and correction indexes removed:
+  411988 / 429742 / 436322 events/s
+  median: 429742 events/s
+  change from accepted: +37.6%
+
+No typed-tick secondary indexes:
+  622615 / 601838 / 612717 events/s
+  median: 612717 events/s
+  change from accepted: +96.1%
+
+Both diagnostic schemas were reverted. The first makes historical range reads
+scan the full tick table; the second also removes durable reconnect
+deduplication. Neither is production-safe.
+
+Conclusion:
+- Secondary B-tree maintenance is the dominant SQLite write cost.
+- Even the unsafe no-index upper bound is only 0.61M events/s on this machine,
+  so a single SQLite writer cannot meet the 1.5M full-market target.
+- Reaching the target while retaining SQLite requires sharded durable writers,
+  plus a design that avoids synchronously building every historical query
+  index on the ingestion critical path.
+
+2026-07-30 indexed SQLite shard-capacity probe
+----------------------------------------------
+The replay benchmark can route each instrument consistently to 1-16 independent
+temporary Database instances using `db-shards=N`. This is a benchmark-only
+probe; production persistence is still single-shard.
+
+Fully indexed 500,000-event SIP results, three runs per configuration.
+Aggregate writer-active capacity is total events divided by the slowest shard's
+accumulated transaction time, which models concurrently active shard writers.
+
+  shards  writer-active runs (events/s)       median
+       1  281379 / 296939 / 181306            281379
+       2  580348 / 600611 / 553492            580348
+       4  929005 / 401732 / 1003979           929005
+       8  1922822 / 1941164 / 1855520        1922822
+
+The one-shard probe was affected by a severe machine/checkpoint outlier; retain
+312431 as the accepted single-writer reference. Two shards scale close to 2x.
+Four shards show useful scaling but one severe tail-latency outlier. Eight
+shards exceed the 1.5M persistence-capacity target in all three runs, with a
+1.92M median, despite a deliberately difficult 20-symbol distribution.
+
+Eight-shard instrumented run:
+  decode:              759.59 ms  (658250 events/s serialized capacity)
+  persistence enqueue: 149.27 ms (3349635 events/s serialized capacity)
+  in-memory projection:800.21 ms  (624836 events/s serialized capacity)
+  final durable wait:  384.74 ms
+  writer active:       1772847 events/s aggregate
+
+Interpretation:
+- Eight indexed SQLite shards make the persistence target plausible without
+  weakening durability or query indexes.
+- Serial decoding and projection are each only about 0.63-0.66M events/s, so
+  they become the next hard limits.
+- Production sharding must coordinate checkpoints and surface any individual
+  shard failure as a global persistence fault.
+- Events must be partitioned consistently by stable instrument id so trades,
+  corrections, scanner state, and historical queries remain on one shard.

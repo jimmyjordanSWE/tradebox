@@ -5,8 +5,10 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -52,6 +54,29 @@ int Fail(const std::string& message) {
     return 1;
 }
 
+std::string_view InstrumentId(
+    const tradebox::core::MarketDataEvent& event) {
+    return std::visit(
+        [](const auto& typed) -> std::string_view {
+            using T = std::decay_t<decltype(typed)>;
+            if constexpr (std::is_same_v<
+                              T,
+                              tradebox::core::QuoteReceived>)
+                return typed.quote.instrument_id;
+            else if constexpr (std::is_same_v<
+                                   T,
+                                   tradebox::core::TradeReceived>)
+                return typed.trade.instrument_id;
+            else if constexpr (requires {
+                                   typed.instrument_id;
+                               })
+                return typed.instrument_id;
+            else
+                return {};
+        },
+        event);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -69,6 +94,7 @@ int main(int argc, char** argv) {
     const std::size_t expected_instruments =
         argc > 5 ? std::stoull(argv[5]) : 10;
     bool profile_phases = false;
+    std::size_t database_shards = 1;
     auto json_backend =
         tradebox::broker::alpaca::
             MarketJsonBackend::DirectWithRapidFallback;
@@ -89,6 +115,13 @@ int main(int argc, char** argv) {
                 tradebox::broker::alpaca::
                     MarketJsonBackend::RapidJsonSax;
             json_backend_name = option;
+        } else if (option.starts_with("db-shards=")) {
+            database_shards = std::stoull(
+                std::string(option.substr(10)));
+            if (database_shards == 0 ||
+                database_shards > 16)
+                return Fail(
+                    "db-shards must be between 1 and 16");
         } else {
             return Fail(
                 "unknown benchmark option: " +
@@ -139,10 +172,25 @@ int main(int argc, char** argv) {
     std::chrono::steady_clock::time_point ingestion_start;
     std::chrono::steady_clock::time_point ingestion_end;
     {
-        Database database;
-        std::string error;
-        if (!database.OpenAt(temporary.path, error))
-            return Fail("database open failed: " + error);
+        std::vector<std::unique_ptr<Database>> databases;
+        databases.reserve(database_shards);
+        for (std::size_t shard = 0;
+             shard < database_shards; ++shard) {
+            auto database = std::make_unique<Database>();
+            std::string error;
+            const std::filesystem::path path =
+                shard == 0
+                    ? temporary.path
+                    : temporary.directory /
+                          ("shard-" +
+                           std::to_string(shard)) /
+                          "application.db";
+            if (!database->OpenAt(path, error))
+                return Fail(
+                    "database shard open failed: " +
+                    error);
+            databases.push_back(std::move(database));
+        }
         market_data.Ingest(
             tradebox::core::MarketStreamChanged{
                 .status =
@@ -179,11 +227,17 @@ int main(int argc, char** argv) {
                     std::chrono::steady_clock::now() -
                     decode_start;
             control_events += frame.controls.size();
-            std::vector<QueuedMarketDataEvent>
-                persistence_events;
+            std::vector<
+                std::vector<QueuedMarketDataEvent>>
+                persistence_events(database_shards);
             std::vector<tradebox::core::MarketDataEventPtr>
                 projection_events;
-            persistence_events.reserve(frame.items.size());
+            for (auto& shard_events :
+                 persistence_events)
+                shard_events.reserve(
+                    frame.items.size() /
+                        database_shards +
+                    1);
             projection_events.reserve(frame.items.size());
             for (auto& item : frame.items) {
                 ++decoded_events;
@@ -198,7 +252,12 @@ int main(int argc, char** argv) {
                         *item.market_event))
                     ++cancellation_events;
                 if (item.market_tick) {
-                    persistence_events.push_back({
+                    const std::size_t shard =
+                        std::hash<std::string_view>{}(
+                            InstrumentId(
+                                *item.market_event)) %
+                        database_shards;
+                    persistence_events[shard].push_back({
                         .source_event_id =
                             std::move(item.source_event_id),
                         .event = item.market_event,
@@ -213,10 +272,15 @@ int main(int argc, char** argv) {
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::
                           time_point{};
-            if (!database.QueueMarketDataEvents(
-                    feed_name,
-                    std::move(persistence_events)))
-                persistence_rejected = true;
+            for (std::size_t shard = 0;
+                 shard < database_shards; ++shard) {
+                if (!databases[shard]
+                         ->QueueMarketDataEvents(
+                             feed_name,
+                             std::move(
+                                 persistence_events[shard])))
+                    persistence_rejected = true;
+            }
             if (profile_phases)
                 persistence_enqueue_elapsed +=
                     std::chrono::steady_clock::now() -
@@ -278,14 +342,47 @@ int main(int argc, char** argv) {
             profile_phases
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
-        const auto flushed = database.FlushQueuedWrites();
+        std::expected<void, std::string> flushed;
+        for (const auto& database : databases) {
+            const auto shard_flushed =
+                database->FlushQueuedWrites();
+            if (!shard_flushed && flushed)
+                flushed = std::unexpected(
+                    shard_flushed.error());
+        }
         if (profile_phases)
             flush_elapsed =
                 std::chrono::steady_clock::now() - flush_start;
         if (!flushed)
             return Fail(
                 "persistence flush failed: " + flushed.error());
-        writer = database.WriterTelemetry();
+        for (const auto& database : databases) {
+            const auto shard =
+                database->WriterTelemetry();
+            writer.pending_events +=
+                shard.pending_events;
+            writer.high_water_events +=
+                shard.high_water_events;
+            writer.accepted_events +=
+                shard.accepted_events;
+            writer.dequeued_events +=
+                shard.dequeued_events;
+            writer.event_write_batches +=
+                shard.event_write_batches;
+            writer.event_write_nanoseconds =
+                std::max(
+                    writer.event_write_nanoseconds,
+                    shard.event_write_nanoseconds);
+            writer.dropped_market_events +=
+                shard.dropped_market_events;
+            writer.dropped_timeline_events +=
+                shard.dropped_timeline_events;
+            writer.write_failures +=
+                shard.write_failures;
+            if (!shard.last_write_error.empty())
+                writer.last_write_error =
+                    shard.last_write_error;
+        }
         if (persistence_rejected ||
             writer.dropped_market_events != 0 ||
             writer.dropped_timeline_events != 0)
@@ -328,12 +425,22 @@ int main(int argc, char** argv) {
     }
 
     std::uint64_t persisted_rows = 0;
-    {
+    for (std::size_t shard = 0;
+         shard < database_shards; ++shard) {
         Database database;
         std::string error;
-        if (!database.OpenAt(temporary.path, error))
-            return Fail("database reopen failed: " + error);
-        persisted_rows =
+        const std::filesystem::path path =
+            shard == 0
+                ? temporary.path
+                : temporary.directory /
+                      ("shard-" +
+                       std::to_string(shard)) /
+                      "application.db";
+        if (!database.OpenAt(path, error))
+            return Fail(
+                "database shard reopen failed: " +
+                error);
+        persisted_rows +=
             database.LoadMarketDataStorageUsage().tick_rows;
     }
     if (persisted_rows != decoded_events)
@@ -346,6 +453,13 @@ int main(int argc, char** argv) {
         decoded_events, ingestion_end - ingestion_start);
     const double end_to_end_rate = EventsPerSecond(
         decoded_events, total_end - total_start);
+    const double writer_active_rate =
+        writer.event_write_nanoseconds == 0
+            ? 0.0
+            : static_cast<double>(writer.dequeued_events) *
+                  1'000'000'000.0 /
+                  static_cast<double>(
+                      writer.event_write_nanoseconds);
     const double target_ingestion_events_per_second =
         sip_soak ? 90'000 : 120'000;
     constexpr double kTargetEndToEndEventsPerSecond = 90'000;
@@ -357,6 +471,8 @@ int main(int argc, char** argv) {
               << " | decode+store+enqueue " << ingestion_rate
               << " events/s | including durable flush "
               << end_to_end_rate
+              << " events/s | writer active "
+              << writer_active_rate
               << " events/s | corrections "
               << correction_events
               << " | cancellations "
@@ -366,6 +482,7 @@ int main(int argc, char** argv) {
               << " | feed " << feed_name
               << " | json " << json_backend_name
               << " | instruments " << expected_instruments
+              << " | db shards " << database_shards
               << '\n';
     if (profile_phases) {
         const auto milliseconds = [](const auto elapsed) {
@@ -404,6 +521,10 @@ int main(int argc, char** argv) {
                     << ingestion_rate << ",\n"
                     << "  \"durable_events_per_second\": "
                     << end_to_end_rate << ",\n"
+                    << "  \"writer_active_events_per_second\": "
+                    << writer_active_rate << ",\n"
+                    << "  \"writer_batches\": "
+                    << writer.event_write_batches << ",\n"
                     << "  \"release_target_met\": "
                     << (release_target_met ? "true" : "false")
                     << ",\n"
@@ -420,6 +541,8 @@ int main(int argc, char** argv) {
                     << "\",\n"
                     << "  \"instruments\": "
                     << expected_instruments << ",\n"
+                    << "  \"database_shards\": "
+                    << database_shards << ",\n"
                     << "  \"stale_reconnect_recovered\": "
                     << (sip_soak ? "true" : "false")
                     << "\n"

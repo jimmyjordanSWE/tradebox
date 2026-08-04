@@ -43,6 +43,8 @@ struct DatabaseWriterTelemetry {
     std::uint64_t high_water_events = 0;
     std::uint64_t accepted_events = 0;
     std::uint64_t dequeued_events = 0;
+    std::uint64_t event_write_batches = 0;
+    std::uint64_t event_write_nanoseconds = 0;
     std::uint64_t dropped_market_events = 0;
     std::uint64_t dropped_timeline_events = 0;
     std::uint64_t pending_bar_batches = 0;
@@ -213,6 +215,8 @@ private:
     std::uint64_t queue_high_water_ = 0;
     std::uint64_t accepted_events_ = 0;
     std::uint64_t dequeued_events_ = 0;
+    std::uint64_t event_write_batches_ = 0;
+    std::uint64_t event_write_nanoseconds_ = 0;
     std::uint64_t dropped_market_events_ = 0;
     std::uint64_t dropped_timeline_events_ = 0;
     std::uint64_t bar_high_water_ = 0;
