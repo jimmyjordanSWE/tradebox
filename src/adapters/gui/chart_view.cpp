@@ -89,7 +89,8 @@ void PlotVolumeBars(const std::vector<double>& timestamps,
 void RenderChartView(std::string_view plot_id,
                      std::string_view timeframe,
                      const ChartViewSeries& series,
-                     int visible_bars,
+                     int& visible_bars,
+                     bool& reset_x_range,
                      ChartViewDataState state,
                      const ChartViewOptions& options) {
     ImGui::TextDisabled("%s", ChartViewDataStateLabel(state));
@@ -107,6 +108,10 @@ void RenderChartView(std::string_view plot_id,
     }
 
     const int count = static_cast<int>(series.bars.size());
+    const bool apply_reset_x_range = reset_x_range;
+    // Consume this frame's request. A wheel movement later in the frame can
+    // set it again for the following frame.
+    reset_x_range = false;
     const int visible_count = std::min(std::max(visible_bars, 1), count);
     const int visible_first = count - visible_count;
     std::vector<double> timestamps;
@@ -169,8 +174,12 @@ void RenderChartView(std::string_view plot_id,
     const double price_padding = std::max(
         (initial_high - initial_low) * 0.08,
         std::max(std::abs(initial_high), 1.0) * 0.002);
+    // A chart zoom is anchored to the last timestamp.  This is deliberately
+    // unlike ImPlot's default mouse-centred zoom: the right edge stays put and
+    // zooming reveals more or fewer bars to its left, as in TradingView.
     ImPlot::SetNextAxisLimits(ImAxis_X1, initial_x_min, initial_x_max,
-                              ImPlotCond_Once);
+                              apply_reset_x_range ? ImPlotCond_Always
+                                                   : ImPlotCond_Once);
     const ImPlotFlags price_flags =
         ImPlotFlags_NoLegend | ImPlotFlags_NoMenus |
         (options.show_crosshair ? ImPlotFlags_Crosshairs : ImPlotFlags_None);
@@ -190,10 +199,22 @@ void RenderChartView(std::string_view plot_id,
         ? ImVec4(0.20f, 0.82f, 0.52f, 1.0f)
         : ImVec4(0.93f, 0.31f, 0.38f, 1.0f);
     ImPlot::TagY(closes.back(), last_price_color, "%.2f", closes.back());
+    // Dear ImGui exposes wheel movement per frame.  We own regular-wheel zoom
+    // so the last visible timestamp is the anchor; Ctrl+wheel remains ImPlot's
+    // free mouse-centred inspection zoom.
+    if (ImPlot::IsPlotHovered() && ImGui::GetIO().MouseWheel != 0.0f) {
+        const int prior_visible = visible_bars;
+        if (ImGui::GetIO().MouseWheel > 0.0f)
+            visible_bars = std::max(30, visible_bars / 2);
+        else
+            visible_bars = std::min(count, visible_bars * 2);
+        reset_x_range = reset_x_range || visible_bars != prior_visible;
+    }
     ImPlot::EndPlot();
     }
     ImPlot::SetNextAxisLimits(ImAxis_X1, initial_x_min, initial_x_max,
-                              ImPlotCond_Once);
+                              apply_reset_x_range ? ImPlotCond_Always
+                                                   : ImPlotCond_Once);
     if (options.show_volume &&
         ImPlot::BeginPlot("##volume", ImVec2(0, 0),
                           ImPlotFlags_NoLegend | ImPlotFlags_NoMenus)) {

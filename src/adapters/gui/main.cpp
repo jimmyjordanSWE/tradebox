@@ -93,6 +93,7 @@ struct Chart {
         tradebox::ui::ChartViewDataState::Loading;
     tradebox::ui::ChartViewOptions view_options;
     int visible_bars = 120;
+    bool reset_x_range = true;
     std::string data_message;
     bool history_loaded = false;
     bool window_open = false;
@@ -2543,6 +2544,7 @@ void DrawChartCanvas(Chart& chart) {
                                 chart.timeframe;
     tradebox::ui::RenderChartView(plot_id, chart.timeframe,
                                   chart.view_series, chart.visible_bars,
+                                  chart.reset_x_range,
                                   chart.view_state, chart.view_options);
 }
 
@@ -2560,30 +2562,56 @@ void DrawCharts(App& app) {
             app.workspace.EndWindow("chart." + symbol);
             continue;
         }
-        const char* timeframes[] = {"1Day", "1Hour", "1Min"};
-        int timeframe_index =
-            chart.timeframe == "1Hour"
-                ? 1
-                : chart.timeframe == "1Min"
-                      ? 2 : 0;
-        if (ImGui::Combo("Timeframe", &timeframe_index, timeframes, 3)) {
-            chart.timeframe = timeframes[timeframe_index];
-            chart.core_snapshot = {};
-            chart.requested_range = {};
-            chart.bars.clear();
-            chart.view_series.bars.clear();
-            chart.view_state = tradebox::ui::ChartViewDataState::Loading;
-            chart.history_loaded = false;
-            RequestChartData(app, chart);
+        // Compact chart toolbar.  The range controls intentionally act on
+        // bars, not pixels, so a zoom keeps the right-hand (latest) time fixed.
+        const auto select_timeframe = [&app, &chart](const char* label,
+                                                      const char* timeframe) {
+            if (ImGui::Button(label)) {
+                chart.timeframe = timeframe;
+                chart.core_snapshot = {};
+                chart.requested_range = {};
+                chart.bars.clear();
+                chart.view_series.bars.clear();
+                chart.view_state = tradebox::ui::ChartViewDataState::Loading;
+                chart.history_loaded = false;
+                chart.reset_x_range = true;
+                RequestChartData(app, chart);
+            }
+        };
+        select_timeframe("1m", "1Min");
+        ImGui::SameLine();
+        select_timeframe("1h", "1Hour");
+        ImGui::SameLine();
+        select_timeframe("1D", "1Day");
+        ImGui::SameLine();
+        if (ImGui::Button("-##zoom-out")) {
+            chart.visible_bars = std::min(2'000, chart.visible_bars * 2);
+            chart.reset_x_range = true;
         }
+        ImGui::SetItemTooltip("Zoom out: show earlier bars while keeping the latest time fixed");
         ImGui::SameLine();
-        ImGui::Checkbox("Volume", &chart.view_options.show_volume);
+        if (ImGui::Button("+##zoom-in")) {
+            chart.visible_bars = std::max(30, chart.visible_bars / 2);
+            chart.reset_x_range = true;
+        }
+        ImGui::SetItemTooltip("Zoom in: keep the latest time fixed");
         ImGui::SameLine();
-        ImGui::Checkbox("Crosshair", &chart.view_options.show_crosshair);
+        if (ImGui::Button("Reset##chart-range")) {
+            chart.visible_bars = 120;
+            chart.reset_x_range = true;
+        }
+        ImGui::SetItemTooltip("Reset chart range");
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(72.0f);
-        ImGui::DragInt("Bars", &chart.visible_bars, 1.0f, 30, 2'000,
-                       "%d", ImGuiSliderFlags_AlwaysClamp);
+        if (ImGui::Button(chart.view_options.show_volume ? "Vol" : "Vol off"))
+            chart.view_options.show_volume = !chart.view_options.show_volume;
+        ImGui::SetItemTooltip("Show or hide volume");
+        ImGui::SameLine();
+        if (ImGui::Button(chart.view_options.show_crosshair ? "Cross" : "Cross off"))
+            chart.view_options.show_crosshair = !chart.view_options.show_crosshair;
+        ImGui::SetItemTooltip("Show or hide crosshair");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s  |  %d bars", chart.timeframe.c_str(),
+                            chart.visible_bars);
         if (!chart.view_series.bars.empty()) {
             const Bar& latest = chart.view_series.bars.back();
             const ImVec4 color = latest.close >= latest.open
@@ -3117,6 +3145,9 @@ int RunApplication(const LaunchOptions& options) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImPlot::CreateContext();
+    // Chart wheel zoom is applied in RenderChartView with the latest time as
+    // its anchor. Keep ImPlot's mouse-centred zoom available behind Ctrl.
+    ImPlot::GetInputMap().ZoomMod = ImGuiMod_Ctrl;
     ImGui::StyleColorsDark();
     ImGuiIO& io = ImGui::GetIO();
     // Recoverable ImGui diagnostics must never take mouse focus away from a

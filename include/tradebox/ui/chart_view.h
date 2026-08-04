@@ -39,7 +39,8 @@ struct ChartViewOptions {
 void RenderChartView(std::string_view plot_id,
                      std::string_view timeframe,
                      const ChartViewSeries& series,
-                     int visible_bars,
+                     int& visible_bars,
+                     bool& reset_x_range,
                      ChartViewDataState state,
                      const ChartViewOptions& options = {});
 
