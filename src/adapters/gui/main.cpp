@@ -2525,14 +2525,32 @@ void DrawCharts(App& app) {
         ImGui::Checkbox("Volume", &chart.view_options.show_volume);
         ImGui::SameLine();
         ImGui::Checkbox("Crosshair", &chart.view_options.show_crosshair);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(72.0f);
+        ImGui::DragInt("Bars", &chart.visible_bars, 1.0f, 30, 2'000,
+                       "%d", ImGuiSliderFlags_AlwaysClamp);
         if (!chart.view_series.bars.empty()) {
             const Bar& latest = chart.view_series.bars.back();
             const ImVec4 color = latest.close >= latest.open
                                      ? ImVec4(0.25f, 0.9f, 0.58f, 1)
                                      : ImVec4(0.96f, 0.38f, 0.43f, 1);
+            ImGui::TextDisabled("O");
+            ImGui::SameLine();
+            ImGui::Text("%.2f", latest.open);
+            ImGui::SameLine();
+            ImGui::TextDisabled("H");
+            ImGui::SameLine();
+            ImGui::Text("%.2f", latest.high);
+            ImGui::SameLine();
+            ImGui::TextDisabled("L");
+            ImGui::SameLine();
+            ImGui::Text("%.2f", latest.low);
+            ImGui::SameLine();
+            ImGui::TextDisabled("C");
+            ImGui::SameLine();
             ImGui::TextColored(color, "%.2f", latest.close);
             ImGui::SameLine();
-            ImGui::TextDisabled("%zu bars | mouse wheel zoom",
+            ImGui::TextDisabled("%zu bars | wheel zoom | drag pan",
                                 chart.view_series.bars.size());
         } else {
             ImGui::TextDisabled("%s / IEX", chart.timeframe.c_str());

@@ -2,10 +2,14 @@
 
 ## Current contract
 
-The current chart adapter draws OHLC candles and a linked volume subplot from a
-copied immutable `BarSeriesSnapshot`. It uses ImPlot's time scale and optional
-crosshair, and it renders the core-owned forming candle and previous-session
-reference without rebuilding bars in the GUI.
+The current chart adapter draws a TradingView-style OHLC surface and linked
+volume subplot from a copied immutable `BarSeriesSnapshot`. It opens around the
+latest configurable number of bars while retaining the loaded history for
+mouse-drag panning. The chart uses ImPlot's time scale, right-hand price and
+volume axes, color-matched volume bars, a current-price tag, optional
+crosshair, and built-in wheel zoom. The header exposes timeframe, volume,
+crosshair, visible-bar count, and current OHLC values without rebuilding bars
+in the GUI.
 
 The chart is a view over application data. It owns camera/interaction state
 and draw geometry only. It must not read SQLite in the render loop, consume
