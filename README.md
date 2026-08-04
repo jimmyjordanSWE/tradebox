@@ -1,6 +1,6 @@
 # TradeBox
 
-TradeBox is a C++23 trading core with a native SDL/OpenGL/ImGui workstation.
+TradeBox is a C++23 trading core with a native SDL/DirectX 11/ImGui workstation.
 V1 connects to Alpaca for market data and broker operations while keeping
 broker reality, durable recovery, and user-visible safety state inside the
 headless core.
@@ -72,7 +72,7 @@ compile, and run the framebuffer smoke test before accepting a new version.
 
 Application data is stored in `%LOCALAPPDATA%\TradeBox`, outside this OneDrive
 source directory. SDL owns the native window/event loop, Dear ImGui renders
-through OpenGL, and WinHTTP provides HTTPS and WebSocket transport.
+through DirectX 11, and WinHTTP provides HTTPS and WebSocket transport.
 
 From a Visual Studio x64 developer shell:
 
@@ -87,8 +87,8 @@ The opt-in Alpaca Paper contract test is documented in
 
 ## Framebuffer captures
 
-The **Screenshot** button in the custom title bar reads the OpenGL back buffer
-into an SDL surface and saves a BMP under
+The **Screenshot** button in the custom title bar reads the DirectX 11 back
+buffer through a staging texture into an SDL surface and saves a BMP under
 `%LOCALAPPDATA%\TradeBox\screenshots`.
 
 Automated visual smoke tests use the same path without capturing the Windows

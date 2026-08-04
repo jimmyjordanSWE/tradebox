@@ -162,6 +162,21 @@ core::CoreSnapshot TradingApplication::Snapshot() const {
     return impl_->core.Snapshot();
 }
 
+ApplicationUiSnapshot TradingApplication::SnapshotForUi(
+    const UiSnapshotQuery& query) const {
+    ApplicationUiSnapshot result;
+    result.core = Snapshot();
+    result.markets.reserve(query.market_symbols.size());
+    for (const std::string& symbol : query.market_symbols)
+        result.markets.push_back(MarketData(symbol));
+
+    result.charts.reserve(query.charts.size());
+    for (const UiChartQuery& chart : query.charts)
+        result.charts.push_back(
+            BarsForSymbol(chart.symbol, chart.timeframe, chart.range));
+    return result;
+}
+
 std::optional<core::CoreSnapshot> TradingApplication::SnapshotAfter(
     std::uint64_t revision) const {
     return impl_->core.SnapshotAfter(revision);
@@ -254,7 +269,31 @@ core::BarSeriesSnapshot TradingApplication::Bars(
         }
     }
     core::ConvergeLiveBar(snapshot, live, base_minutes);
+    const std::int64_t current_ns =
+        snapshot.latest_price
+            ? snapshot.latest_price->event_time_ns
+            : snapshot.current_bar
+                  ? snapshot.current_bar->start_ns
+                  : 0;
+    if (current_ns > 0) {
+        constexpr std::int64_t day_ns =
+            24LL * 60 * 60 * 1'000'000'000;
+        const std::int64_t current_day = current_ns / day_ns;
+        for (auto bar = snapshot.bars.rbegin();
+             bar != snapshot.bars.rend(); ++bar) {
+            if (bar->start_ns / day_ns < current_day) {
+                snapshot.previous_session_close = bar->close;
+                break;
+            }
+        }
+    }
     return snapshot;
+}
+
+core::BarSeriesSnapshot TradingApplication::BarsForSymbol(
+    const std::string& symbol, const std::string& timeframe,
+    core::BarRange range) const {
+    return Bars(impl_->broker.ResolveBarSeriesKey(symbol, timeframe), range);
 }
 
 core::ChangedBarSeriesBatch TradingApplication::ChangedBarSeries(

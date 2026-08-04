@@ -94,6 +94,10 @@ struct BarSeriesSnapshot {
     // from finalized/revised bars and is not specific to one minute.
     std::optional<MarketBar> current_bar;
     std::optional<CanonicalMarketPrice> latest_price;
+    // Previous calendar-session close for the requested series, when the
+    // series contains enough history to identify it. This is supplied by the
+    // application projection so consumers do not infer it independently.
+    std::optional<Decimal> previous_session_close;
     std::vector<BarRange> missing_ranges;
     std::uint64_t revision = 0;
 };

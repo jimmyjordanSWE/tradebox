@@ -90,10 +90,13 @@ SubscriptionRecovery EvaluateSubscription(
     const std::vector<std::string>& acknowledged_quotes,
     const std::vector<std::string>& acknowledged_statuses,
     std::size_t consecutive_mismatches) {
+    // Trades and quotes drive price, position valuation, and order safety.
+    // Trading-status data is supplemental: Alpaca may omit its wildcard from
+    // a subscription acknowledgement, which must not falsely disable a live
+    // quote/trade stream or mark every live valuation stale.
+    static_cast<void>(acknowledged_statuses);
     if (Normalize(desired) == Normalize(acknowledged_trades) &&
-        Normalize(desired) == Normalize(acknowledged_quotes) &&
-        Normalize(acknowledged_statuses) ==
-            std::vector<std::string>{"*"})
+        Normalize(desired) == Normalize(acknowledged_quotes))
         return SubscriptionRecovery::Ready;
     return consecutive_mismatches >= 3
                ? SubscriptionRecovery::Restart

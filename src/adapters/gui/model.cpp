@@ -1,12 +1,10 @@
 #include "tradebox/ui/model.h"
+#include "tradebox/core/order_projection.h"
 
 #include <algorithm>
-#include <cctype>
 
 namespace {
 using namespace tradebox::core;
-
-bool Empty(const std::string& value) { return value.empty(); }
 
 std::optional<Decimal> Parse(const std::string& value) {
     if (value.empty()) return std::nullopt;
@@ -81,24 +79,57 @@ const char* OperationalSeverityLabel(OperationalSeverity severity) {
 
 std::vector<UiValidationMessage> ValidateOrderEntry(
     const OrderEntryDraft& draft) {
-    std::vector<UiValidationMessage> result;
-    if (draft.symbol.empty()) result.push_back({"symbol", "Symbol is required"});
-    if (draft.amount.empty()) result.push_back({"amount", "Quantity or notional is required"});
-    else if (!Parse(draft.amount) || *Parse(draft.amount) <= Decimal::Zero())
-        result.push_back({"amount", "Amount must be a positive decimal"});
-    if (draft.type == "Limit" || draft.type == "Stop-limit") {
-        if (!Parse(draft.limit_price) || *Parse(draft.limit_price) <= Decimal::Zero())
-            result.push_back({"limit_price", "A positive limit price is required"});
+    std::vector<UiValidationMessage> errors;
+    const auto request = BuildNativeOrderRequest(draft, errors);
+    if (!request) return errors;
+    for (const auto& error : tradebox::core::ValidateOrder(*request))
+        errors.push_back({error.field, error.message});
+    return errors;
+}
+
+std::optional<tradebox::core::NativeOrderRequest>
+BuildNativeOrderRequest(const OrderEntryDraft& draft,
+                        std::vector<UiValidationMessage>& errors) {
+    NativeOrderRequest request;
+    request.asset_class = AssetClass::Equity;
+    request.symbol = draft.symbol;
+    request.side = draft.side == "Sell" ? OrderSide::Sell : OrderSide::Buy;
+    request.type = draft.type == "Limit"
+                       ? OrderType::Limit
+                       : draft.type == "Stop"
+                             ? OrderType::Stop
+                             : draft.type == "Stop-limit"
+                                   ? OrderType::StopLimit
+                                   : OrderType::Market;
+    request.time_in_force = draft.time_in_force == "Gtc"
+                                ? TimeInForce::Gtc
+                                : TimeInForce::Day;
+    request.extended_hours = draft.extended_hours;
+
+    const auto amount = Parse(draft.amount);
+    if (!amount && !draft.amount.empty()) {
+        errors.push_back({"amount", draft.amount.empty()
+                                      ? "quantity or notional is required"
+                                      : "must be a valid decimal"});
+    } else if (amount && draft.amount_is_notional) {
+        request.notional = *amount;
+    } else if (amount) {
+        request.qty = *amount;
     }
-    if (draft.type == "Stop" || draft.type == "Stop-limit") {
-        if (!Parse(draft.stop_price) || *Parse(draft.stop_price) <= Decimal::Zero())
-            result.push_back({"stop_price", "A positive stop price is required"});
-    }
-    if (draft.amount_is_notional && draft.type != "Market")
-        result.push_back({"amount", "Notional orders must use Market"});
-    if (draft.extended_hours && draft.time_in_force != "Day")
-        result.push_back({"time_in_force", "Extended hours requires Day"});
-    return result;
+
+    const auto parse_price = [&errors](const std::string& value,
+                                       const char* field)
+        -> std::optional<Decimal> {
+        if (value.empty()) return std::nullopt;
+        const auto parsed = Decimal::Parse(value);
+        if (!parsed)
+            errors.push_back({field, "must be a valid decimal"});
+        return *parsed;
+    };
+    request.limit_price = parse_price(draft.limit_price, "limit_price");
+    request.stop_price = parse_price(draft.stop_price, "stop_price");
+    if (!errors.empty()) return std::nullopt;
+    return request;
 }
 
 std::string UiOrderStateLabel(UiOrderState state) {
@@ -119,17 +150,14 @@ UiOrderState UiOrderStateFromCore(const OrderState& order,
                                   const CoreSnapshot& snapshot,
                                   bool command_indeterminate) {
     if (command_indeterminate) return UiOrderState::Indeterminate;
-    if (snapshot.safety_status == SafetyStatus::Reconciling)
-        return UiOrderState::Reconciling;
-    if (snapshot.safety_status == SafetyStatus::Stale)
-        return UiOrderState::Stale;
-    std::string status = order.status;
-    std::transform(status.begin(), status.end(), status.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    if (status == "filled") return UiOrderState::Filled;
-    if (status == "canceled" || status == "cancelled") return UiOrderState::Canceled;
-    if (status == "rejected" || status == "expired") return UiOrderState::Rejected;
-    if (status == "new" || status == "accepted" || status == "partially_filled")
-        return UiOrderState::Accepted;
+    static_cast<void>(snapshot);
+    switch (ProjectOrder(order).lifecycle) {
+    case OrderLifecycleState::Pending: return UiOrderState::Pending;
+    case OrderLifecycleState::Accepted: return UiOrderState::Accepted;
+    case OrderLifecycleState::Rejected: return UiOrderState::Rejected;
+    case OrderLifecycleState::Canceled: return UiOrderState::Canceled;
+    case OrderLifecycleState::Filled: return UiOrderState::Filled;
+    case OrderLifecycleState::Unknown: return UiOrderState::Indeterminate;
+    }
     return UiOrderState::Indeterminate;
 }

@@ -103,6 +103,37 @@ TEST(TradingCore, StartsDisconnected) {
     EXPECT_FALSE(snapshot.reconciled);
 }
 
+TEST(TradingCore, RetainsAdvancedOrderLegsFromAuthoritativeSnapshot) {
+    MemoryJournal journal;
+    FixedClock clock;
+    TradingCore core(journal, clock);
+
+    ASSERT_TRUE(core.Ingest(
+        Event(BrokerEventKind::ConnectionAttemptStarted, 1)));
+    OrderState parent;
+    parent.id = "entry";
+    parent.status = "filled";
+    parent.order_class = "bracket";
+    OrderState target;
+    target.id = "target";
+    target.parent_order_id = "entry";
+    target.status = "new";
+    OrderState stop;
+    stop.id = "stop";
+    stop.parent_order_id = "entry";
+    stop.status = "held";
+
+    ASSERT_TRUE(core.Ingest(OrdersEvent(1, {parent, target, stop})));
+    const CoreSnapshot snapshot = core.Snapshot();
+    ASSERT_EQ(snapshot.orders.size(), 3U);
+    const auto target_found = std::ranges::find_if(
+        snapshot.orders, [](const OrderState& order) {
+            return order.id == "target";
+        });
+    ASSERT_NE(target_found, snapshot.orders.end());
+    EXPECT_EQ(target_found->parent_order_id, "entry");
+}
+
 TEST(TradingCore, AvoidsCopyingUnchangedSnapshots) {
     MemoryJournal journal;
     FixedClock clock;

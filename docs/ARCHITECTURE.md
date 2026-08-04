@@ -5,9 +5,6 @@ This document records the durable V1 boundary. Detailed command shapes live in
 semantics live in [ORDER_MODEL.md](ORDER_MODEL.md) and
 [ORDER_POSITION_STATE_MACHINE.md](ORDER_POSITION_STATE_MACHINE.md).
 
-The current post-V1 live-watchlist implementation sequence is specified in
-[LUNA_LIVE_WATCHLIST_CORE_HANDOFF.md](LUNA_LIVE_WATCHLIST_CORE_HANDOFF.md).
-
 ## Authority boundaries
 
 - Alpaca is authoritative for account, order, execution, and position state.
@@ -19,6 +16,20 @@ The current post-V1 live-watchlist implementation sequence is specified in
 - Remote payloads are parsed and validated at adapter boundaries. Unknown,
   malformed, contradictory, stale-generation, or unsupported input becomes a
   typed error or safety condition instead of being silently accepted.
+
+## Presentation boundary
+
+The application assembles immutable UI read models from core snapshots. The
+GUI may keep ephemeral widget state such as an open-window set, chart camera,
+selected symbol, and unsent order draft. It may translate that draft into a
+typed command, but it must not validate broker rules, aggregate trades into
+bars, derive account or position state, query SQLite during rendering, or call
+Alpaca directly.
+
+The current GUI surface uses public Dear ImGui APIs, SDL3 event/frame
+integration, and ImPlot for chart presentation. Library contexts and
+`Begin`/`End` lifetimes are adapter concerns; their semantics must not leak
+into the core model.
 
 ## Account and command flow
 

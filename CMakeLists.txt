@@ -76,13 +76,13 @@ add_library(imgui STATIC
   ${dear_imgui_SOURCE_DIR}/imgui_tables.cpp
   ${dear_imgui_SOURCE_DIR}/imgui_widgets.cpp
   ${dear_imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
-  ${dear_imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+  ${dear_imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
 )
 target_include_directories(imgui PUBLIC
   ${dear_imgui_SOURCE_DIR}
   ${dear_imgui_SOURCE_DIR}/backends
 )
-target_link_libraries(imgui PUBLIC SDL3::SDL3-static opengl32)
+target_link_libraries(imgui PUBLIC SDL3::SDL3-static d3d11 dxgi)
 
 function(tradebox_enable_strict_warnings target)
   if(MSVC)
@@ -115,6 +115,7 @@ add_library(tradebox_core STATIC
   src/core/bar_series.cpp
   src/core/bar_store.cpp
   src/core/market_data_store.cpp
+  src/core/order_projection.cpp
   src/core/order_request.cpp
   src/core/system_clock.cpp
   src/core/trade_pressure.cpp
@@ -208,29 +209,10 @@ target_link_libraries(tradebox_gui PRIVATE
   tradebox_implot
   nlohmann_json::nlohmann_json
   SDL3::SDL3-static
-  opengl32
+  d3d11
+  dxgi
   psapi
 )
-
-add_executable(tradebox_dummy_ui WIN32
-  src/adapters/gui_dummy/main.cpp
-  src/adapters/gui/workspace.cpp
-)
-set_target_properties(tradebox_dummy_ui PROPERTIES OUTPUT_NAME TradeBoxDummyUI)
-target_compile_features(tradebox_dummy_ui PRIVATE cxx_std_23)
-target_include_directories(tradebox_dummy_ui PRIVATE include)
-target_compile_definitions(tradebox_dummy_ui PRIVATE
-  WIN32_LEAN_AND_MEAN
-  NOMINMAX
-  _WIN32_WINNT=0x0A00
-)
-target_link_libraries(tradebox_dummy_ui PRIVATE
-  imgui
-  SDL3::SDL3-static
-  opengl32
-)
-tradebox_enable_windows_api(tradebox_dummy_ui)
-tradebox_enable_strict_warnings(tradebox_dummy_ui)
 
 include(CTest)
 option(
@@ -255,6 +237,7 @@ if(BUILD_TESTING)
     tests/unit/decimal_tests.cpp
     tests/unit/market_data_store_tests.cpp
     tests/unit/order_request_tests.cpp
+    tests/unit/order_projection_tests.cpp
     tests/unit/trading_core_tests.cpp
     tests/unit/trade_pressure_tests.cpp
   )

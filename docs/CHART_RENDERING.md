@@ -1,10 +1,23 @@
-# Adaptive-resolution chart concept
+# Chart rendering model
 
-## Intent
+## Current contract
 
-Trade Box should present one continuous chart whose representation becomes more
-granular toward the current moment. It is not a conventional chart with one
-timeframe selected for the entire viewport.
+The current chart adapter draws OHLC candles and a linked volume subplot from a
+copied immutable `BarSeriesSnapshot`. It uses ImPlot's time scale and optional
+crosshair, and it renders the core-owned forming candle and previous-session
+reference without rebuilding bars in the GUI.
+
+The chart is a view over application data. It owns camera/interaction state
+and draw geometry only. It must not read SQLite in the render loop, consume
+raw broker events, aggregate trades, or decide whether data is current.
+
+## Future adaptive-resolution design
+
+Trade Box may eventually present one continuous chart whose representation
+becomes more granular toward the current moment. This is not implemented yet;
+the core data contract must exist before the GUI can consume it.
+
+### Future data contract
 
 The right edge is a live market-state head. Moving left through history may
 transition through trades or quotes, one-second bars, five-second bars,
@@ -27,18 +40,19 @@ tick band is also possible: its horizontal coordinate represents event order
 rather than elapsed time. Such a band must be visually identified because it
 is not a linear time scale.
 
-The first slice consumes trades and best bid/ask quotes. When the subscribed
-market-data package exposes Level II depth, the same source-neutral event model
-can feed it into this region. The chart therefore calls the region the live
-market-state head: full depth is an optional input, while the trade/quote
-microstructure view remains useful without it.
+If this design is implemented, the first adaptive slice can consume trades and
+best bid/ask quotes. When the subscribed market-data package exposes Level II
+depth, the same source-neutral event model can feed it into this region. The
+chart therefore calls the region the live market-state head: full depth is an
+optional input, while the trade/quote microstructure view remains useful
+without it.
 
 ## One chart, one renderer
 
 An ImGui chart window is a logical clipped region inside the application's one
-SDL/OpenGL framebuffer. It is not a separate OpenGL context or native canvas.
-The chart emits draw commands into an ImGui draw list, and the OpenGL backend
-renders the resulting vertices, indices, textures, and clip rectangles.
+SDL/DirectX 11 framebuffer. It is not a separate DirectX device or native
+canvas. The chart emits draw commands into an ImGui draw list, and the DirectX
+backend renders the resulting vertices, indices, textures, and clip rectangles.
 
 The renderer should not shift a framebuffer by one pixel for each update.
 Instead, it evaluates a view transform against in-memory data and emits the
@@ -69,6 +83,12 @@ separate concerns:
 
 The same renderer accepts either the wall clock or the replay clock. No chart
 logic should need to know whether it is live or replaying.
+
+## Future interaction layers
+
+The following sections describe the intended extension points, not current
+GUI behavior. They become implementation requirements only when the core
+snapshot contract and focused tests exist.
 
 ## Multiresolution data pyramid
 
@@ -134,7 +154,7 @@ Drawing
 
 A ray or infinitely extended line is clipped mathematically to the visible
 chart rectangle. Thick lines are rendered as anti-aliased triangle geometry;
-OpenGL wide-line behavior is not relied upon.
+Backend-specific wide-line behavior is not relied upon.
 
 Supported primitives can grow from:
 
@@ -190,5 +210,5 @@ measure CPU event processing, chart geometry generation, buffer upload, and GPU
 render time separately.
 
 Framebuffer-based smoke tests can render a fixed replay clock and view
-configuration, then capture `GL_BACK`. This makes adaptive-chart output
+configuration, then capture the DirectX swap-chain back buffer. This makes adaptive-chart output
 deterministic and testable without capturing the Windows desktop.

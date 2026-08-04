@@ -3,6 +3,8 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include <optional>
+
 namespace {
 
 using namespace tradebox;
@@ -58,6 +60,29 @@ TEST(AlpacaOrderCodec, SerializesMultilegNetCreditWithoutParentSide) {
     EXPECT_FALSE(json.contains("side"));
     EXPECT_EQ(json.at("limit_price"), "-1.25");
     EXPECT_EQ(json.at("legs").size(), 2U);
+}
+
+TEST(AlpacaOrderCodec, SerializesOcoExitAsNestedProfitAndStopLegs) {
+    core::NativeOrderRequest request{
+        .asset_class = core::AssetClass::Equity,
+        .symbol = "AAPL",
+        .qty = D("10"),
+        .side = core::OrderSide::Sell,
+        .type = core::OrderType::Limit,
+        .time_in_force = core::TimeInForce::Gtc,
+        .order_class = core::OrderClass::Oco,
+        .take_profit = core::TakeProfit{D("210.00")},
+        .stop_loss = core::StopLoss{D("195.00"), std::nullopt},
+    };
+
+    const auto encoded = broker::alpaca::SerializeOrder(request);
+
+    ASSERT_TRUE(encoded);
+    const auto json = nlohmann::json::parse(*encoded);
+    EXPECT_EQ(json.at("order_class"), "oco");
+    EXPECT_EQ(json.at("take_profit").at("limit_price"), "210");
+    EXPECT_EQ(json.at("stop_loss").at("stop_price"), "195");
+    EXPECT_FALSE(json.contains("limit_price"));
 }
 
 TEST(AlpacaOrderCodec, SerializesReplacementFieldsOnly) {

@@ -97,6 +97,9 @@ struct AccountState {
 
 struct OrderState {
     std::string id;
+    // Empty for a root order. Advanced broker orders are represented as a
+    // linked tree, but stored as individually reconcilable order states.
+    std::string parent_order_id;
     std::string client_order_id;
     std::string asset_id;
     std::string symbol;

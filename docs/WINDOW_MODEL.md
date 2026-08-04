@@ -5,7 +5,7 @@ surface as an interchangeable floating panel.
 
 ## Application chrome
 
-The custom title bar owns a reserved strip at the top of the SDL/OpenGL
+The custom title bar owns a reserved strip at the top of the SDL/DirectX 11
 viewport. It contains workstation menus, global connection identity, and native
 window controls. It is not part of the saved workspace layout.
 
@@ -44,6 +44,55 @@ Examples: the Menu, Account selector, and `+` creation menu.
 
 Popovers are transient children of application chrome. They have no persistent
 geometry and close when their action is completed or focus moves away.
+
+The current floating-workspace implementation uses a normal ImGui window
+anchored to the SDL viewport for the custom title bar. The work rectangle is
+passed explicitly to the workspace below that bar; it does not depend on
+`BeginViewportSideBar()` or other docking-only APIs.
+
+The current layout is persisted in `workspace-layout-v2.ini`. The versioned
+filename is intentional: it gives the non-overlapping default arrangement its
+own migration boundary while preserving the previous layout file for recovery.
+The Menu > Reset window layout action resets registered windows to those
+defaults without deleting user data.
+
+## Current window inventory
+
+The current workspace uses stable IDs for singleton tools and stable
+symbol-qualified IDs for chart documents. The implemented surfaces are:
+
+- `tool.account`, `tool.watchlist`, `tool.event_log`, `tool.positions`,
+  `tool.orders`, and `tool.order_management`;
+- `tool.quick_order`, `tool.oco_order`, and `tool.time_sales`;
+- one document window per open chart, keyed by its symbol and chart identity.
+
+The `+` menu and table context menus emit presentation actions such as opening
+or focusing a surface. They do not perform domain work. The workspace owns
+geometry, open state, stable IDs, and layout reset; the application/core owns
+the data and command results rendered inside those windows.
+
+Interactive movement and resizing remain native ImGui behavior. The workspace
+may apply legal minimum/maximum size constraints, but it does not rewrite the
+size selected by the user during a resize interaction.
+
+## Reusable UI primitives
+
+The existing `Workspace::BeginWindow` entry point is the canonical wrapper for
+normal workspace windows. The next useful abstractions are presentation-only:
+
+- `WindowSpec`: kind, stable ID, title, default/minimum geometry, and UI
+  settings;
+- `WindowCommand`: open, close, reset, focus, or create-document actions;
+- `ColumnSpec`: stable column ID, default visibility/width, and a renderer for
+  a value already present in the snapshot;
+- a chart view snapshot containing series, data health, and future indicator
+  layers supplied by the application.
+
+These primitives must not become a second domain model. A column renderer may
+format a value or emit a command, but it must not calculate a broker decision
+or mutate core-owned data. ImGui's built-in hide/reorder column context menu is
+the preferred behavior for tables whose complete predefined column set is
+available.
 
 ## Future lock surface
 

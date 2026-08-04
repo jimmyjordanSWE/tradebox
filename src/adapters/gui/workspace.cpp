@@ -16,10 +16,12 @@ bool Contains(const std::vector<std::string>& values,
     return std::find(values.begin(), values.end(), value) != values.end();
 }
 
-bool RangesOverlap(float first_min, float first_max, float second_min,
-                   float second_max, float padding) {
-    return first_max + padding >= second_min &&
-           second_max + padding >= first_min;
+WorkspaceWindow* FindWindow(std::vector<WorkspaceWindow>& windows,
+                            std::string_view id) {
+    const auto found = std::find_if(
+        windows.begin(), windows.end(),
+        [id](const WorkspaceWindow& window) { return window.id == id; });
+    return found == windows.end() ? nullptr : &*found;
 }
 
 }  // namespace
@@ -78,16 +80,21 @@ void Workspace::BeginFrame(ImVec2 work_position, ImVec2 work_size,
         known_windows_.end());
     current_window_ids_.clear();
 
-    ImDrawList* draw = ImGui::GetBackgroundDrawList();
-    const ImVec2 work_end(work_position_.x + work_size_.x,
-                          work_position_.y + work_size_.y);
-    draw->AddRectFilled(work_position_, work_end, IM_COL32(10, 14, 21, 255));
-    draw->AddRect(work_position_, work_end, IM_COL32(55, 68, 88, 255), 0.0f,
-                  0, 1.0f);
 }
 
 void Workspace::SetUiScale(float scale) {
     ui_scale_ = std::clamp(scale, 0.70f, 2.00f);
+}
+
+void Workspace::SetSnapPixels(int pixels) {
+    snap_pixels_ = std::clamp(pixels, 1, 1'000);
+}
+
+void Workspace::ConstrainNextWindowSize(ImVec2 minimum, ImVec2 maximum) {
+    // Let Dear ImGui own interactive resizing. The workspace may constrain a
+    // window's legal range, but it must not rewrite the size selected by the
+    // user while the native resize interaction is in progress.
+    ImGui::SetNextWindowSizeConstraints(minimum, maximum);
 }
 
 bool Workspace::BeginWindow(WorkspaceWindow& window) {
@@ -115,33 +122,81 @@ bool Workspace::BeginWindow(WorkspaceWindow& window) {
     return ImGui::Begin(label.c_str(), &window.open);
 }
 
+bool Workspace::BeginWindow(std::string_view id, std::string_view title,
+                            bool* open, ImVec2 default_offset,
+                            ImVec2 default_size) {
+    if (open == nullptr) return false;
+    WorkspaceWindow* window = FindWindow(known_windows_, id);
+    if (window == nullptr) {
+        known_windows_.push_back(WorkspaceWindow{
+            .title = std::string(title),
+            .id = std::string(id),
+            .default_offset = default_offset,
+            .default_size = default_size,
+        });
+        window = &known_windows_.back();
+    }
+    window->title = std::string(title);
+    window->default_offset = default_offset;
+    window->default_size = default_size;
+    window->open_binding = open;
+    window->open = *open;
+    if (!window->open) return false;
+    const bool visible = BeginWindow(*window);
+    if (!visible) *open = window->open;
+    return visible;
+}
+
+void Workspace::EndWindow(std::string_view id) {
+    const std::string window_id(id);
+    if (!Contains(current_window_ids_, window_id))
+        current_window_ids_.push_back(window_id);
+
+    auto known = std::find_if(
+        known_windows_.begin(), known_windows_.end(),
+        [&window_id](const WorkspaceWindow& candidate) {
+            return candidate.id == window_id;
+        });
+    if (known == known_windows_.end()) {
+        known_windows_.push_back(WorkspaceWindow{
+            .title = window_id,
+            .id = window_id,
+        });
+        known = known_windows_.end() - 1;
+    }
+    EndWindow(*known);
+}
+
 void Workspace::EndWindow(WorkspaceWindow& window) {
     const ImVec2 position = ImGui::GetWindowPos();
     const ImVec2 size = ImGui::GetWindowSize();
     const ImGuiIO& io = ImGui::GetIO();
-    const bool focused =
-        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
-    const bool dragging =
-        focused && ImGui::IsMouseDragging(ImGuiMouseButton_Left);
-    const bool position_changed =
-        !window.has_last_position || Different(position, window.last_position);
-
-    if (dragging && io.KeyCtrl) window.snap_modifier_seen = true;
-    if (window.was_dragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
-        position_changed && ((snap_enabled_ && window.snap_enabled) ||
-                             window.snap_modifier_seen)) {
-        const ImVec2 snapped = SnapPosition(window.id, position, size);
+    const bool moving = ImGui::IsWindowHovered() &&
+                        ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+    const bool resizing = false;
+    if (moving && io.KeyCtrl) window.snap_modifier_seen = true;
+    ImVec2 final_position = position;
+    ImVec2 final_size = size;
+    if ((snap_enabled_ && window.snap_enabled) ||
+        window.snap_modifier_seen) {
+        const ImVec2 snapped = SnapPosition(position, final_size);
         if (Different(position, snapped)) {
             window.pending_position = snapped;
             window.has_pending_position = true;
+            ImGui::SetWindowPos(snapped, ImGuiCond_Always);
+            final_position = snapped;
         }
-        window.snap_modifier_seen = false;
+        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+            window.snap_modifier_seen = false;
     }
 
-    window.was_dragging = dragging;
-    window.last_position = position;
-    window.last_size = size;
+    window.was_dragging = moving;
+    window.was_resizing = resizing;
+    window.last_position = final_position;
+    window.last_size = final_size;
     window.has_last_position = true;
+    if (window.open_binding != nullptr)
+        *window.open_binding = window.open;
 
     const auto known = std::find_if(
         known_windows_.begin(), known_windows_.end(),
@@ -162,62 +217,35 @@ void Workspace::EndFrame() {
 void Workspace::ResetWindow(WorkspaceWindow& window) {
     window.initialized = false;
     window.was_dragging = false;
+    window.was_resizing = false;
     window.snap_modifier_seen = false;
     window.has_last_position = false;
     window.last_size = ImVec2(0.0f, 0.0f);
     window.has_pending_position = false;
 }
 
-ImVec2 Workspace::SnapPosition(const std::string& current_id,
-                               ImVec2 position, ImVec2 window_size) const {
+void Workspace::ResetAll() {
+    for (WorkspaceWindow& window : known_windows_)
+        ResetWindow(window);
+}
+
+ImVec2 Workspace::SnapPosition(ImVec2 position,
+                               ImVec2 window_size) const {
     const float left = work_position_.x;
     const float top = work_position_.y;
-    const float right = work_position_.x + work_size_.x;
-    const float bottom = work_position_.y + work_size_.y;
-
-    float x_delta = snap_distance_ + 0.01f;
-    float y_delta = snap_distance_ + 0.01f;
-    auto consider_x = [&x_delta](float current_edge, float target_edge) {
-        const float delta = target_edge - current_edge;
-        if (std::fabs(delta) <= std::fabs(x_delta)) x_delta = delta;
+    const float step = static_cast<float>(snap_pixels_);
+    const auto snap_axis = [step](float value, float origin,
+                                  float canvas_length,
+                                  float size) {
+        const float available = std::max(0.0f, canvas_length - size);
+        const int last_cell = static_cast<int>(std::floor(available / step));
+        const int cell = std::clamp(
+            static_cast<int>(std::lround((value - origin) / step)), 0,
+            last_cell);
+        return origin + static_cast<float>(cell) * step;
     };
-    auto consider_y = [&y_delta](float current_edge, float target_edge) {
-        const float delta = target_edge - current_edge;
-        if (std::fabs(delta) <= std::fabs(y_delta)) y_delta = delta;
-    };
-
-    consider_x(position.x, left);
-    consider_x(position.x + window_size.x, right);
-    consider_y(position.y, top);
-    consider_y(position.y + window_size.y, bottom);
-
-    for (const WorkspaceWindow& other : known_windows_) {
-        if (other.id == current_id || !other.open ||
-            !other.has_last_position)
-            continue;
-
-        const ImVec2 other_position = other.last_position;
-        const ImVec2 other_size = other.last_size;
-        const float other_right = other_position.x + other_size.x;
-        const float other_bottom = other_position.y + other_size.y;
-        if (RangesOverlap(position.y, position.y + window_size.y,
-                          other_position.y, other_bottom, snap_distance_)) {
-            consider_x(position.x, other_position.x);
-            consider_x(position.x, other_right);
-            consider_x(position.x + window_size.x, other_position.x);
-            consider_x(position.x + window_size.x, other_right);
-        }
-        if (RangesOverlap(position.x, position.x + window_size.x,
-                          other_position.x, other_right, snap_distance_)) {
-            consider_y(position.y, other_position.y);
-            consider_y(position.y, other_bottom);
-            consider_y(position.y + window_size.y, other_position.y);
-            consider_y(position.y + window_size.y, other_bottom);
-        }
-    }
-
-    if (std::fabs(x_delta) <= snap_distance_) position.x += x_delta;
-    if (std::fabs(y_delta) <= snap_distance_) position.y += y_delta;
+    position.x = snap_axis(position.x, left, work_size_.x, window_size.x);
+    position.y = snap_axis(position.y, top, work_size_.y, window_size.y);
     return position;
 }
 

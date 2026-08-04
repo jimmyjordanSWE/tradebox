@@ -117,10 +117,25 @@ std::vector<OrderValidationError> ValidateOrder(
                      "fractional equity orders require day time in force"});
             if (request.extended_hours &&
                 (request.type != OrderType::Limit ||
-                 request.time_in_force != TimeInForce::Day))
+                 (request.time_in_force != TimeInForce::Day &&
+                  request.time_in_force != TimeInForce::Gtc)))
                 errors.push_back(
                     {"extended_hours",
-                     "extended-hours equities require a day limit order"});
+                     "extended-hours equities require a day or gtc limit order"});
+            if ((request.time_in_force == TimeInForce::Ioc ||
+                 request.time_in_force == TimeInForce::Fok ||
+                 request.time_in_force == TimeInForce::Opg ||
+                 request.time_in_force == TimeInForce::Cls) &&
+                request.type != OrderType::Market &&
+                request.type != OrderType::Limit)
+                errors.push_back(
+                    {"time_in_force",
+                     "ioc, fok, opg, and cls equities require market or limit"});
+            if (request.type == OrderType::TrailingStop &&
+                (request.time_in_force != TimeInForce::Day &&
+                 request.time_in_force != TimeInForce::Gtc))
+                errors.push_back(
+                    {"time_in_force", "trailing_stop requires day or gtc"});
             break;
         case AssetClass::Crypto:
             if (request.order_class != OrderClass::Simple)
@@ -179,17 +194,66 @@ std::vector<OrderValidationError> ValidateOrder(
     }
 
     if (request.order_class == OrderClass::Bracket) {
+        if (request.notional)
+            errors.push_back({"notional", "bracket requires quantity"});
+        if (request.time_in_force != TimeInForce::Day &&
+            request.time_in_force != TimeInForce::Gtc)
+            errors.push_back(
+                {"time_in_force", "bracket requires day or gtc"});
+        if (request.extended_hours)
+            errors.push_back(
+                {"extended_hours", "bracket does not support extended hours"});
         if (!request.take_profit || !request.stop_loss)
             errors.push_back(
                 {"order_class",
                  "bracket requires take_profit and stop_loss"});
+        else if (request.side == OrderSide::Buy &&
+                 request.take_profit->limit_price <=
+                     request.stop_loss->stop_price)
+            errors.push_back(
+                {"take_profit.limit_price",
+                 "must be above stop_loss.stop_price for a buy bracket"});
+        else if (request.side == OrderSide::Sell &&
+                 request.take_profit->limit_price >=
+                     request.stop_loss->stop_price)
+            errors.push_back(
+                {"take_profit.limit_price",
+                 "must be below stop_loss.stop_price for a sell bracket"});
     } else if (request.order_class == OrderClass::Oco) {
+        if (request.notional)
+            errors.push_back({"notional", "oco requires quantity"});
+        if (request.time_in_force != TimeInForce::Day &&
+            request.time_in_force != TimeInForce::Gtc)
+            errors.push_back({"time_in_force", "oco requires day or gtc"});
+        if (request.extended_hours)
+            errors.push_back(
+                {"extended_hours", "oco does not support extended hours"});
         if (request.type != OrderType::Limit || !request.take_profit ||
             !request.stop_loss)
             errors.push_back(
                 {"order_class",
                  "oco requires limit type, take_profit, and stop_loss"});
+        else if (request.side == OrderSide::Sell &&
+                 request.take_profit->limit_price <=
+                     request.stop_loss->stop_price)
+            errors.push_back(
+                {"take_profit.limit_price",
+                 "must be above stop_loss.stop_price for a sell OCO exit"});
+        else if (request.side == OrderSide::Buy &&
+                 request.take_profit->limit_price >=
+                     request.stop_loss->stop_price)
+            errors.push_back(
+                {"take_profit.limit_price",
+                 "must be below stop_loss.stop_price for a buy OCO exit"});
     } else if (request.order_class == OrderClass::Oto) {
+        if (request.notional)
+            errors.push_back({"notional", "oto requires quantity"});
+        if (request.time_in_force != TimeInForce::Day &&
+            request.time_in_force != TimeInForce::Gtc)
+            errors.push_back({"time_in_force", "oto requires day or gtc"});
+        if (request.extended_hours)
+            errors.push_back(
+                {"extended_hours", "oto does not support extended hours"});
         if (request.take_profit.has_value() ==
             request.stop_loss.has_value())
             errors.push_back(
@@ -200,6 +264,11 @@ std::vector<OrderValidationError> ValidateOrder(
             {"order_class",
              "take_profit and stop_loss require bracket, oco, or oto"});
     }
+
+    if (request.type == OrderType::TrailingStop &&
+        request.order_class != OrderClass::Simple)
+        errors.push_back(
+            {"order_class", "trailing_stop is supported only as a simple order"});
 
     for (const OrderLeg& leg : request.legs) {
         if (leg.symbol.empty())

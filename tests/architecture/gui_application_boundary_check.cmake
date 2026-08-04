@@ -11,6 +11,12 @@ set(BANNED_PATTERNS
   "AlpacaService"
   "\\.core\\.Submit"
   "\\.alpaca\\."
+  "MarketDataChanges\\("
+  "ChangedMarketInstruments\\("
+  "ApplyTrade\\("
+  "UpsertDailyBar\\("
+  "BuildOrderRequest\\("
+  "ValidateOrderEntry\\("
 )
 
 foreach(BANNED_PATTERN IN LISTS BANNED_PATTERNS)
@@ -21,5 +27,12 @@ foreach(BANNED_PATTERN IN LISTS BANNED_PATTERNS)
     )
   endif()
 endforeach()
+
+string(REGEX MATCH "SnapshotForUi" SNAPSHOT_MATCH "${CONTENTS}")
+if(NOT SNAPSHOT_MATCH)
+  message(FATAL_ERROR
+    "GUI does not consume the application-owned UI snapshot"
+  )
+endif()
 
 message(STATUS "GUI uses the application-service boundary")

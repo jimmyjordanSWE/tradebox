@@ -284,9 +284,13 @@ std::string StablePayloadId(std::string_view payload) {
     return result.str();
 }
 
-tradebox::core::OrderState ParseCoreOrder(const json& value) {
+tradebox::core::OrderState ParseCoreOrder(
+    const json& value, std::string parent_order_id = {}) {
     tradebox::core::OrderState order;
     order.id = String(value, "id");
+    order.parent_order_id = String(value, "parent_order_id");
+    if (order.parent_order_id.empty())
+        order.parent_order_id = std::move(parent_order_id);
     order.client_order_id = String(value, "client_order_id");
     order.asset_id = String(value, "asset_id");
     order.symbol = String(value, "symbol");
@@ -316,6 +320,20 @@ tradebox::core::OrderState ParseCoreOrder(const json& value) {
     order.submitted_at_ms = ParseTimestampMs(order.submitted_at);
     order.updated_at_ms = ParseTimestampMs(order.updated_at);
     return order;
+}
+
+// `nested=true` returns advanced orders as roots with recursive `legs`.
+// Flatten them for the core while retaining their broker relationship.
+void ParseCoreOrderTree(const json& value,
+                        std::vector<tradebox::core::OrderState>& orders,
+                        const std::string& parent_order_id = {}) {
+    tradebox::core::OrderState order =
+        ParseCoreOrder(value, parent_order_id);
+    const std::string order_id = order.id;
+    orders.push_back(std::move(order));
+    if (!value.contains("legs") || !value["legs"].is_array()) return;
+    for (const json& leg : value["legs"])
+        if (leg.is_object()) ParseCoreOrderTree(leg, orders, order_id);
 }
 
 bool SendText(HINTERNET socket, const std::string& message,
@@ -565,6 +583,16 @@ std::string AlpacaService::InstrumentIdForSymbol(
                : found->second;
 }
 
+tradebox::core::BarSeriesKey AlpacaService::ResolveBarSeriesKey(
+    const std::string& symbol, const std::string& timeframe) const {
+    return {
+        .instrument_id = InstrumentIdForSymbol(symbol),
+        .feed = market_data_feed_,
+        .timeframe = timeframe,
+        .adjustment = tradebox::core::BarAdjustment::All,
+    };
+}
+
 void AlpacaService::Connect(AlpacaCredentials credentials,
                             const std::vector<std::string>& symbols,
                             tradebox::core::MarketDataFeed feed) {
@@ -597,6 +625,7 @@ void AlpacaService::Connect(AlpacaCredentials credentials,
         orders_dirty_ = true;
         positions_dirty_ = true;
         activities_dirty_ = true;
+        activities_identity_deferred_reported_ = false;
         account_dirty_ = true;
         workers_.emplace_back(&AlpacaService::AccountRefreshLoop, this);
         workers_.emplace_back(&AlpacaService::MarketClockLoop, this);
@@ -1740,7 +1769,7 @@ void AlpacaService::FetchOrders() {
         try {
             const json value = json::parse(result.body);
             for (const auto& item : value) {
-                core_orders.push_back(ParseCoreOrder(item));
+                ParseCoreOrderTree(item, core_orders);
                 raw_orders.push_back(item);
             }
             if (value.size() < 500 || value.empty()) break;
@@ -1775,9 +1804,12 @@ void AlpacaService::FetchAccountActivities() {
                           : L"api.alpaca.markets";
     const tradebox::core::CoreSnapshot snapshot = core_.Snapshot();
     if (!snapshot.account || snapshot.account->id.empty()) {
-        events_.Push({UiEventType::Status, {},
-                      "Account activities deferred until account identity "
-                      "is available"});
+        if (!activities_identity_deferred_reported_) {
+            events_.Push({UiEventType::Status, {},
+                          "Account activities deferred until account "
+                          "identity is available"});
+            activities_identity_deferred_reported_ = true;
+        }
         activities_dirty_ = true;
         return;
     }

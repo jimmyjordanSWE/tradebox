@@ -73,6 +73,10 @@ TEST(AlpacaStreamSupervision,
         SubscriptionRecovery::Repair);
     EXPECT_EQ(
         EvaluateSubscription(
+            desired, {"AMD", "MSFT"}, {"AMD", "MSFT"}, {}, 3),
+        SubscriptionRecovery::Ready);
+    EXPECT_EQ(
+        EvaluateSubscription(
             desired, {"AMD"}, {"AMD"}, {}, 3),
         SubscriptionRecovery::Restart);
 }

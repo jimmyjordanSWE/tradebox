@@ -2,7 +2,9 @@
 
 #include "imgui.h"
 
+#include <cfloat>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace tradebox::ui {
@@ -15,10 +17,12 @@ struct WorkspaceWindow {
     ImVec2 default_offset{24.0f, 24.0f};
     ImVec2 default_size{420.0f, 280.0f};
     bool open = true;
+    bool* open_binding = nullptr;
     bool snap_enabled = true;
 
     bool initialized = false;
     bool was_dragging = false;
+    bool was_resizing = false;
     bool snap_modifier_seen = false;
     bool has_last_position = false;
     bool has_pending_position = false;
@@ -43,27 +47,33 @@ private:
 
 class Workspace {
 public:
-    explicit Workspace(float snap_distance = 10.0f)
-        : snap_distance_(snap_distance) {}
-
     void BeginFrame(ImVec2 work_position, ImVec2 work_size,
                     bool snap_enabled);
     void EndFrame();
     void SetUiScale(float scale);
+    void SetSnapPixels(int pixels);
+    void ConstrainNextWindowSize(ImVec2 minimum = ImVec2(0.0f, 0.0f),
+                                 ImVec2 maximum = ImVec2(FLT_MAX, FLT_MAX));
     [[nodiscard]] bool BeginWindow(WorkspaceWindow& window);
+    [[nodiscard]] bool BeginWindow(std::string_view id,
+                                   std::string_view title,
+                                   bool* open,
+                                   ImVec2 default_offset = ImVec2(24.0f, 24.0f),
+                                   ImVec2 default_size = ImVec2(420.0f, 280.0f));
+    void EndWindow(std::string_view id);
     void EndWindow(WorkspaceWindow& window);
     void ResetWindow(WorkspaceWindow& window);
+    void ResetAll();
 
-    [[nodiscard]] float SnapDistance() const { return snap_distance_; }
+    [[nodiscard]] int SnapPixels() const { return snap_pixels_; }
 
 private:
-    [[nodiscard]] ImVec2 SnapPosition(const std::string& current_id,
-                                      ImVec2 position,
+    [[nodiscard]] ImVec2 SnapPosition(ImVec2 position,
                                       ImVec2 window_size) const;
 
     ImVec2 work_position_{};
     ImVec2 work_size_{};
-    float snap_distance_ = 10.0f;
+    int snap_pixels_ = 10;
     bool snap_enabled_ = true;
     float ui_scale_ = 1.0f;
     std::vector<WorkspaceWindow> known_windows_;

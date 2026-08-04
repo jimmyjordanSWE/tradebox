@@ -111,6 +111,9 @@ enum class UiOrderState {
 
 [[nodiscard]] std::vector<UiValidationMessage> ValidateOrderEntry(
     const OrderEntryDraft& draft);
+[[nodiscard]] std::optional<tradebox::core::NativeOrderRequest>
+BuildNativeOrderRequest(const OrderEntryDraft& draft,
+                        std::vector<UiValidationMessage>& errors);
 [[nodiscard]] std::string UiOrderStateLabel(UiOrderState state);
 [[nodiscard]] UiOrderState UiOrderStateFromCore(
     const tradebox::core::OrderState& order,

@@ -6,6 +6,7 @@
 #include "tradebox/core/market_data.h"
 #include "tradebox/core/types.h"
 #include "tradebox/core/rest_health.h"
+#include "tradebox/application/ui_snapshot.h"
 
 #include <expected>
 #include <future>
@@ -40,6 +41,8 @@ public:
     TradingApplication& operator=(const TradingApplication&) = delete;
 
     [[nodiscard]] core::CoreSnapshot Snapshot() const;
+    [[nodiscard]] ApplicationUiSnapshot SnapshotForUi(
+        const UiSnapshotQuery& query) const;
     [[nodiscard]] std::optional<core::CoreSnapshot> SnapshotAfter(
         std::uint64_t revision) const;
     [[nodiscard]] core::MarketDataSnapshot MarketData(
@@ -52,6 +55,9 @@ public:
         std::size_t maximum_instruments = 4096) const;
     [[nodiscard]] core::BarSeriesSnapshot Bars(
         const core::BarSeriesKey& key,
+        core::BarRange range) const;
+    [[nodiscard]] core::BarSeriesSnapshot BarsForSymbol(
+        const std::string& symbol, const std::string& timeframe,
         core::BarRange range) const;
     [[nodiscard]] core::ChangedBarSeriesBatch ChangedBarSeries(
         std::uint64_t after_sequence,

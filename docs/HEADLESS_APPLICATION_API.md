@@ -74,5 +74,11 @@ timeframe-specific candlestick series. `ChangedMarketInstruments`,
 `MarketDataChanges`, and `ChangedBarSeries` provide bounded incremental reads
 for clients that do not need to copy a complete snapshot every frame.
 
+Market snapshots may also include the optional, replayable trade-pressure
+projection. It is derived from normalized trade and quote events, carries its
+classification method and freshness, and can be ignored without losing market
+truth. Pressure is not a broker fact and clients decide how to present its
+direction, color, intensity, and neutral/stale states.
+
 Rendering policy, chart zoom, colors, and order-form drafts belong to interface
 adapters and are not part of this API.

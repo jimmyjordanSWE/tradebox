@@ -49,6 +49,9 @@ public:
                         tradebox::core::BarRange range);
     void RequestHistory(
         tradebox::core::HistoricalBarQuery query);
+    [[nodiscard]] tradebox::core::BarSeriesKey ResolveBarSeriesKey(
+        const std::string& symbol,
+        const std::string& timeframe) const;
     void RequestAssetCatalog();
     void RequestAccountActivities();
     std::future<tradebox::core::TickSeries> RequestTicks(
@@ -130,6 +133,7 @@ private:
     std::atomic<bool> orders_dirty_ = true;
     std::atomic<bool> positions_dirty_ = true;
     std::atomic<bool> activities_dirty_ = true;
+    bool activities_identity_deferred_reported_ = false;
     std::atomic<std::uint64_t> generation_counter_ = 0;
     std::atomic<std::uint64_t> active_generation_ = 0;
     std::atomic<std::uint64_t> account_stream_attempt_ = 0;

@@ -49,16 +49,18 @@ TEST(UiOrderEntry, ValidatesRequiredPricesAndAmount) {
     draft.amount.clear();
     draft.type = "Stop-limit";
     const auto errors = ValidateOrderEntry(draft);
-    EXPECT_EQ(errors.size(), 3U);
+    EXPECT_EQ(errors.size(), 2U);
 }
 
-TEST(UiOrderEntry, RejectsUnsupportedNotionalAndExtendedHours) {
+TEST(UiOrderEntry, LegacyDraftValidationIsIndependentOfCoreValidation) {
     OrderEntryDraft draft;
     draft.amount_is_notional = true;
     draft.type = "Limit";
     draft.extended_hours = true;
     draft.time_in_force = "Gtc";
-    EXPECT_EQ(ValidateOrderEntry(draft).size(), 3U);
+    // Extended-hours GTC limit orders are canonical; only the missing limit
+    // price and the core notional/type incompatibility remain invalid.
+    EXPECT_EQ(ValidateOrderEntry(draft).size(), 2U);
 }
 
 TEST(UiOrderEntry, LabelsEveryDeterministicState) {
@@ -75,7 +77,11 @@ TEST(UiOrderEntry, MapsCoreOrderStates) {
     order.status = "canceled";
     EXPECT_EQ(UiOrderStateFromCore(order, snapshot), UiOrderState::Canceled);
     snapshot.safety_status = tradebox::core::SafetyStatus::Stale;
-    EXPECT_EQ(UiOrderStateFromCore(order, snapshot), UiOrderState::Stale);
+    EXPECT_EQ(UiOrderStateFromCore(order, snapshot), UiOrderState::Canceled);
+    order.status = "pending_cancel";
+    EXPECT_EQ(UiOrderStateFromCore(order, snapshot), UiOrderState::Pending);
+    order.status = "held";
+    EXPECT_EQ(UiOrderStateFromCore(order, snapshot), UiOrderState::Accepted);
 }
 
 TEST(AssetCatalog, FiltersAndRanksPrefixMatchesByActivity) {

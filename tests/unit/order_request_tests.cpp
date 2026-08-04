@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <optional>
 #include <string_view>
 
 namespace {
@@ -48,6 +49,38 @@ TEST(OrderRequest, RejectsFractionalEquityWithGtc) {
     EXPECT_TRUE(HasError(ValidateOrder(request), "time_in_force"));
 }
 
+TEST(OrderRequest, AcceptsExtendedHoursGtcEquityLimitOrder) {
+    NativeOrderRequest request{
+        .asset_class = AssetClass::Equity,
+        .symbol = "AAPL",
+        .qty = D("10"),
+        .side = OrderSide::Buy,
+        .type = OrderType::Limit,
+        .time_in_force = TimeInForce::Gtc,
+        .limit_price = D("201.25"),
+        .extended_hours = true,
+    };
+
+    EXPECT_TRUE(ValidateOrder(request).empty());
+}
+
+TEST(OrderRequest, RejectsExtendedHoursAdvancedEquityOrder) {
+    NativeOrderRequest request{
+        .asset_class = AssetClass::Equity,
+        .symbol = "AAPL",
+        .qty = D("10"),
+        .side = OrderSide::Buy,
+        .type = OrderType::Market,
+        .time_in_force = TimeInForce::Gtc,
+        .order_class = OrderClass::Bracket,
+        .take_profit = TakeProfit{D("220")},
+        .stop_loss = StopLoss{D("190"), std::nullopt},
+        .extended_hours = true,
+    };
+
+    EXPECT_TRUE(HasError(ValidateOrder(request), "extended_hours"));
+}
+
 TEST(OrderRequest, AcceptsFourLegOptionsStrategy) {
     NativeOrderRequest request{
         .asset_class = AssetClass::Option,
@@ -85,6 +118,22 @@ TEST(OrderRequest, ValidatesOcoShape) {
     };
 
     EXPECT_TRUE(ValidateOrder(request).empty());
+}
+
+TEST(OrderRequest, RejectsOcoExitWithReversedPriceLegs) {
+    NativeOrderRequest request{
+        .asset_class = AssetClass::Equity,
+        .symbol = "AAPL",
+        .qty = D("10"),
+        .side = OrderSide::Sell,
+        .type = OrderType::Limit,
+        .time_in_force = TimeInForce::Gtc,
+        .order_class = OrderClass::Oco,
+        .take_profit = TakeProfit{D("190")},
+        .stop_loss = StopLoss{D("220"), std::nullopt},
+    };
+
+    EXPECT_TRUE(HasError(ValidateOrder(request), "take_profit.limit_price"));
 }
 
 TEST(OrderReplacement, RejectsNonIpoNotionalOrderChanges) {
