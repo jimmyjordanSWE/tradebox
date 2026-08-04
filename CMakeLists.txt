@@ -195,6 +195,16 @@ add_executable(tradebox_gui WIN32
   src/adapters/gui/chart_view_data.cpp
 )
 set_target_properties(tradebox_gui PROPERTIES OUTPUT_NAME TradeBoxNative)
+add_custom_command(TARGET tradebox_gui POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory
+    "$<TARGET_FILE_DIR:tradebox_gui>/assets/fonts"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/B612-Regular.ttf"
+    "$<TARGET_FILE_DIR:tradebox_gui>/assets/fonts/B612-Regular.ttf"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/B612Mono-Regular.ttf"
+    "$<TARGET_FILE_DIR:tradebox_gui>/assets/fonts/B612Mono-Regular.ttf"
+)
 target_compile_features(tradebox_gui PRIVATE cxx_std_23)
 target_compile_definitions(tradebox_gui PRIVATE
   WIN32_LEAN_AND_MEAN

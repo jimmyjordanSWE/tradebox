@@ -5,12 +5,21 @@ surface as an interchangeable floating panel.
 
 ## Application chrome
 
-The custom title bar owns a reserved strip at the top of the SDL/DirectX 11
-viewport. It contains workstation menus, global connection identity, and native
-window controls. It is not part of the saved workspace layout.
+The operating system owns the native title bar, including drag, resize,
+minimize, maximize, and close behavior. Dear ImGui's canonical main menu bar
+owns the reserved application strip below it. It contains workstation menus
+and global connection identity and is not part of the saved workspace layout.
 
 No workspace window may move into or behind this strip. Ordinary windows are
 clamped to the viewport work rectangle below it.
+
+## Typography
+
+The workstation packages B612 and B612 Mono with the executable instead of
+depending on a locally installed system font. B612 Regular is the active global
+face at a 12 logical-pixel base size; display DPI and the user's UI-scale
+setting determine its final rendered size. B612 Mono remains available for
+future dense numeric views.
 
 ## Singleton tool windows
 
@@ -45,14 +54,14 @@ Examples: the Menu, Account selector, and `+` creation menu.
 Popovers are transient children of application chrome. They have no persistent
 geometry and close when their action is completed or focus moves away.
 
-The current floating-workspace implementation uses a normal ImGui window
-anchored to the SDL viewport for the custom title bar. The work rectangle is
-passed explicitly to the workspace below that bar; it does not depend on
-`BeginViewportSideBar()` or other docking-only APIs.
+The current floating-workspace implementation uses `BeginMainMenuBar()` and
+passes the viewport rectangle below its measured current-frame height to the
+workspace. Measuring it directly also keeps first-launch geometry out from
+under the bar before Dear ImGui publishes the next frame's work inset.
 
-The current layout is persisted in `workspace-layout-v2.ini`. The versioned
+The current layout is persisted in `workspace-layout-v7.ini`. The versioned
 filename is intentional: it gives the non-overlapping default arrangement its
-own migration boundary while preserving the previous layout file for recovery.
+own migration boundary while preserving previous layout files for recovery.
 The Menu > Reset window layout action resets registered windows to those
 defaults without deleting user data.
 
@@ -61,8 +70,9 @@ defaults without deleting user data.
 The current workspace uses stable IDs for singleton tools and stable
 symbol-qualified IDs for chart documents. The implemented surfaces are:
 
-- `tool.account`, `tool.watchlist`, `tool.event_log`, `tool.positions`,
-  `tool.orders`, and `tool.order_management`;
+- `tool.account`, `tool.watchlist`, `tool.activity`, and
+  `tool.order_management`. The Activity surface contains Positions, Orders,
+  and Events as reorderable tabs;
 - `tool.quick_order`, `tool.oco_order`, and `tool.time_sales`;
 - one document window per open chart, keyed by its symbol and chart identity.
 

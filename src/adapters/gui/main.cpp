@@ -44,8 +44,6 @@
 
 namespace {
 
-int g_title_bar_height = 30;
-constexpr int kResizeBorder = 6;
 using Microsoft::WRL::ComPtr;
 
 struct Dx11Renderer {
@@ -56,10 +54,6 @@ struct Dx11Renderer {
     int width = 0;
     int height = 0;
 };
-constexpr int kInteractiveTitleBarWidth = 190;
-constexpr int kWindowControlsWidth = 126;
-constexpr int kTitleStatusWidth = 460;
-
 enum class ConnectionState {
     Disconnected,
     Connecting,
@@ -123,11 +117,9 @@ struct App {
     bool credentials_open = false;
     bool show_account = true;
     bool show_watchlist = true;
-    bool show_event_log = true;
-    bool show_orders = true;
+    bool show_activity = true;
     bool show_active_orders = true;
     bool show_filled_orders = true;
-    bool show_positions = true;
     bool show_time_sales = true;
     bool show_quick_order = true;
     bool show_oco_order = true;
@@ -215,9 +207,7 @@ bool LoadWindowVisible(App& app, const char* key, bool fallback) {
 void LoadWindowVisibility(App& app) {
     app.show_account = LoadWindowVisible(app, "ui.window.account", true);
     app.show_watchlist = LoadWindowVisible(app, "ui.window.watchlist", true);
-    app.show_event_log = LoadWindowVisible(app, "ui.window.event_log", true);
-    app.show_orders = LoadWindowVisible(app, "ui.window.orders", true);
-    app.show_positions = LoadWindowVisible(app, "ui.window.positions", true);
+    app.show_activity = LoadWindowVisible(app, "ui.window.activity", true);
     app.show_time_sales =
         LoadWindowVisible(app, "ui.window.time_sales", true);
     app.show_quick_order =
@@ -244,9 +234,7 @@ void SaveWindowVisibility(const App& app) {
     };
     save("ui.window.account", app.show_account);
     save("ui.window.watchlist", app.show_watchlist);
-    save("ui.window.event_log", app.show_event_log);
-    save("ui.window.orders", app.show_orders);
-    save("ui.window.positions", app.show_positions);
+    save("ui.window.activity", app.show_activity);
     save("ui.window.time_sales", app.show_time_sales);
     save("ui.window.quick_order", app.show_quick_order);
     save("ui.window.oco_order", app.show_oco_order);
@@ -378,6 +366,19 @@ std::int64_t SystemNowMs() {
 }
 
 std::string FormatDelay(std::int64_t milliseconds);
+
+std::filesystem::path ApplicationAssetPath(
+    const std::filesystem::path& relative_path) {
+    std::array<wchar_t, 32'768> executable_path{};
+    const DWORD length = GetModuleFileNameW(
+        nullptr, executable_path.data(),
+        static_cast<DWORD>(executable_path.size()));
+    if (length == 0 ||
+        length >= static_cast<DWORD>(executable_path.size()))
+        return {};
+    return std::filesystem::path(executable_path.data()).parent_path() /
+           relative_path;
+}
 
 std::filesystem::path DefaultScreenshotPath(const Database& database) {
     const auto now = std::chrono::system_clock::now();
@@ -1346,7 +1347,7 @@ void DrawTimeSales(App& app) {
     app.workspace.ConstrainNextWindowSize();
     if (!app.workspace.BeginWindow("tool.time_sales", "TIME & SALES",
                                    &app.show_time_sales,
-                                   ImVec2(10.0f, 650.0f),
+                                   ImVec2(10.0f, 750.0f),
                                    ImVec2(560.0f, 420.0f))) {
         app.workspace.EndWindow("tool.time_sales");
         return;
@@ -1475,15 +1476,6 @@ void DrawConnectionBadge(const App& app) {
         "%s", label);
 }
 
-void UpdateTitleBarHeight() {
-    const ImGuiStyle& style = ImGui::GetStyle();
-    g_title_bar_height = std::max(
-        30, static_cast<int>(std::ceil(
-                style.FontSizeBase * style.FontScaleDpi *
-                    style.FontScaleMain +
-                10.0f)));
-}
-
 void ConnectSavedAccount(App& app, bool paper) {
     AlpacaCredentials credentials;
     std::string error;
@@ -1557,11 +1549,11 @@ void DisconnectAccount(App& app) {
 
 void DrawAccount(App& app) {
     if (!app.show_account) return;
-    app.workspace.ConstrainNextWindowSize();
+    app.workspace.ConstrainNextWindowSize(ImVec2(320.0f, 260.0f));
     if (!app.workspace.BeginWindow("tool.account", "ACCOUNT",
                                    &app.show_account,
                                    ImVec2(10.0f, 10.0f),
-                                   ImVec2(420.0f, 280.0f))) {
+                                   ImVec2(420.0f, 420.0f))) {
         app.workspace.EndWindow("tool.account");
         return;
     }
@@ -1623,36 +1615,6 @@ void DrawAccount(App& app) {
         ImGui::TextDisabled("Use Menu > Account to connect.");
     }
     app.workspace.EndWindow("tool.account");
-}
-
-SDL_HitTestResult SDLCALL WindowHitTest(SDL_Window* window,
-                                        const SDL_Point* area, void*) {
-    int width = 0;
-    int height = 0;
-    SDL_GetWindowSize(window, &width, &height);
-    const bool maximized =
-        (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
-    if (!maximized) {
-        const bool left = area->x < kResizeBorder;
-        const bool right = area->x >= width - kResizeBorder;
-        const bool top = area->y < kResizeBorder;
-        const bool bottom = area->y >= height - kResizeBorder;
-        if (top && left) return SDL_HITTEST_RESIZE_TOPLEFT;
-        if (top && right) return SDL_HITTEST_RESIZE_TOPRIGHT;
-        if (bottom && left) return SDL_HITTEST_RESIZE_BOTTOMLEFT;
-        if (bottom && right) return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
-        if (left) return SDL_HITTEST_RESIZE_LEFT;
-        if (right) return SDL_HITTEST_RESIZE_RIGHT;
-        if (top) return SDL_HITTEST_RESIZE_TOP;
-        if (bottom) return SDL_HITTEST_RESIZE_BOTTOM;
-    }
-    if (area->y < g_title_bar_height &&
-        area->x >= kInteractiveTitleBarWidth &&
-        area->x <
-            width - kWindowControlsWidth - kTitleStatusWidth) {
-        return SDL_HITTEST_DRAGGABLE;
-    }
-    return SDL_HITTEST_NORMAL;
 }
 
 enum class IndicatorVisual {
@@ -1922,60 +1884,6 @@ void DrawPerformanceOverlay(const App& app) {
     }
 }
 
-enum class WindowControlIcon {
-    Minimize,
-    Maximize,
-    Restore,
-    Close
-};
-
-bool DrawWindowControlButton(const char* id, const char* tooltip,
-                             WindowControlIcon icon) {
-    ImGui::PushID(id);
-    const ImVec2 start = ImGui::GetCursorScreenPos();
-    const ImVec2 size(40.0f,
-                      static_cast<float>(g_title_bar_height - 8));
-    const bool pressed = ImGui::InvisibleButton("##button", size);
-    const bool hovered = ImGui::IsItemHovered();
-    const bool active = ImGui::IsItemActive();
-    ImDrawList* draw = ImGui::GetWindowDrawList();
-    if (hovered || active) {
-        const ImU32 background =
-            icon == WindowControlIcon::Close
-                ? IM_COL32(210, 35, 48, active ? 255 : 225)
-                : IM_COL32(72, 82, 101, active ? 210 : 150);
-        draw->AddRectFilled(start, ImVec2(start.x + size.x, start.y + size.y),
-                            background);
-    }
-
-    const ImU32 color = IM_COL32(220, 225, 234, 255);
-    const float cx = start.x + size.x * 0.5f;
-    const float cy = start.y + size.y * 0.5f;
-    constexpr float thickness = 1.5f;
-    if (icon == WindowControlIcon::Minimize) {
-        draw->AddLine(ImVec2(cx - 5, cy + 3), ImVec2(cx + 5, cy + 3), color,
-                      thickness);
-    } else if (icon == WindowControlIcon::Maximize) {
-        draw->AddRect(ImVec2(cx - 5, cy - 5), ImVec2(cx + 5, cy + 5), color,
-                      1.0f, 0, thickness);
-    } else if (icon == WindowControlIcon::Restore) {
-        draw->AddRect(ImVec2(cx - 3, cy - 5), ImVec2(cx + 5, cy + 3), color,
-                      1.0f, 0, thickness);
-        draw->AddLine(ImVec2(cx - 5, cy - 2), ImVec2(cx - 5, cy + 5), color,
-                      thickness);
-        draw->AddLine(ImVec2(cx - 5, cy + 5), ImVec2(cx + 2, cy + 5), color,
-                      thickness);
-    } else {
-        draw->AddLine(ImVec2(cx - 5, cy - 5), ImVec2(cx + 5, cy + 5), color,
-                      thickness);
-        draw->AddLine(ImVec2(cx + 5, cy - 5), ImVec2(cx - 5, cy + 5), color,
-                      thickness);
-    }
-    if (hovered) ImGui::SetTooltip("%s", tooltip);
-    ImGui::PopID();
-    return pressed;
-}
-
 void DrawConnectionLight(const App& app, float height) {
     const std::int64_t now = SystemNowMs();
     const std::int64_t account_age =
@@ -2055,27 +1963,11 @@ void DrawConnectionLight(const App& app, float height) {
     ImGui::PopID();
 }
 
-bool DrawTitleBar(App& app, SDL_Window* window) {
-    ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4, 4));
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.055f, 0.067f, 0.09f, 1));
-    const ImGuiWindowFlags flags =
-        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
-    ImGui::SetNextWindowPos(viewport->Pos, ImGuiCond_Always);
-    ImGui::SetNextWindowSize(
-        ImVec2(viewport->Size.x, static_cast<float>(g_title_bar_height)),
-        ImGuiCond_Always);
-    ImGui::Begin("##trade-box-title-bar", nullptr, flags);
+float DrawMainMenuBar(App& app) {
+    if (!ImGui::BeginMainMenuBar()) return 0.0f;
 
-    const float title_control_height =
-        static_cast<float>(g_title_bar_height - 8);
-    if (ImGui::Button("Menu", ImVec2(0, title_control_height)))
-        ImGui::OpenPopup("workstation-menu");
-    ImGui::SetNextWindowSizeConstraints(ImVec2(280, 0), ImVec2(420, 520));
-    if (ImGui::BeginPopup("workstation-menu")) {
+    const float title_control_height = ImGui::GetFrameHeight();
+    if (ImGui::BeginMenu("Menu")) {
         const bool connected =
             app.connection_state == ConnectionState::AccountAuthenticated ||
             app.connection_state == ConnectionState::Streaming;
@@ -2150,9 +2042,7 @@ bool DrawTitleBar(App& app, SDL_Window* window) {
                 app.show_time_sales = true;
             if (ImGui::MenuItem("Watchlist")) app.show_watchlist = true;
             if (ImGui::MenuItem("Account")) app.show_account = true;
-            if (ImGui::MenuItem("Orders")) app.show_orders = true;
-            if (ImGui::MenuItem("Positions")) app.show_positions = true;
-            if (ImGui::MenuItem("Event log")) app.show_event_log = true;
+            if (ImGui::MenuItem("Activity")) app.show_activity = true;
             ImGui::EndMenu();
         }
         ImGui::Separator();
@@ -2167,14 +2057,13 @@ bool DrawTitleBar(App& app, SDL_Window* window) {
             app.capture_path = DefaultScreenshotPath(app.database);
             app.capture_requested = true;
         }
-        ImGui::EndPopup();
+        ImGui::EndMenu();
     }
 
     ImGui::SameLine(0, 4);
     DrawConnectionLight(app, title_control_height);
 
-    const float controls_x = std::max(
-        0.0f, ImGui::GetWindowWidth() - static_cast<float>(kWindowControlsWidth));
+    const float right_edge = std::max(0.0f, ImGui::GetWindowWidth() - 8.0f);
     std::string account_identity;
     if (app.has_account) {
         std::ostringstream summary;
@@ -2193,13 +2082,13 @@ bool DrawTitleBar(App& app, SDL_Window* window) {
         ImGui::CalcTextSize(account_identity.c_str()).x;
     const float status_x =
         std::max(ImGui::GetCursorPosX() + 12.0f,
-                 controls_x - identity_width - 12.0f);
+                 right_edge - identity_width - 12.0f);
     ImGui::SameLine(status_x);
     const ImVec2 title_bar_position = ImGui::GetWindowPos();
     ImGui::PushClipRect(
         ImVec2(title_bar_position.x + status_x, title_bar_position.y),
-        ImVec2(title_bar_position.x + controls_x - 4.0f,
-               title_bar_position.y + g_title_bar_height),
+        ImVec2(title_bar_position.x + right_edge,
+               title_bar_position.y + ImGui::GetWindowHeight()),
         true);
     ImGui::AlignTextToFramePadding();
     ImGui::TextColored(
@@ -2223,32 +2112,9 @@ bool DrawTitleBar(App& app, SDL_Window* window) {
     }
     ImGui::PopClipRect();
 
-    bool close_requested = false;
-    ImGui::SetCursorPos(ImVec2(controls_x, 4));
-    if (DrawWindowControlButton("minimize", "Minimize",
-                                WindowControlIcon::Minimize))
-        SDL_MinimizeWindow(window);
-    ImGui::SameLine(0, 0);
-    const bool maximized =
-        (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
-    if (DrawWindowControlButton(
-            "maximize", maximized ? "Restore" : "Maximize",
-            maximized ? WindowControlIcon::Restore
-                      : WindowControlIcon::Maximize)) {
-        if (maximized)
-            SDL_RestoreWindow(window);
-        else
-            SDL_MaximizeWindow(window);
-    }
-    ImGui::SameLine(0, 0);
-    if (DrawWindowControlButton("close", "Close", WindowControlIcon::Close))
-        close_requested = true;
-
-    ImGui::SetWindowFocus();
-    ImGui::End();
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar(3);
-    return close_requested;
+    const float height = ImGui::GetWindowHeight();
+    ImGui::EndMainMenuBar();
+    return height;
 }
 
 void ForgetSavedCredentials(App& app, bool paper) {
@@ -2469,7 +2335,7 @@ void DrawWatchlist(App& app) {
         ImVec2(320, 160), ImGui::GetMainViewport()->WorkSize);
     if (!app.workspace.BeginWindow("tool.watchlist", "WATCHLIST",
                                    &app.show_watchlist,
-                                   ImVec2(10.0f, 280.0f),
+                                   ImVec2(10.0f, 440.0f),
                                    ImVec2(420.0f, 300.0f))) {
         app.workspace.EndWindow("tool.watchlist");
         return;
@@ -2678,19 +2544,9 @@ void DrawCharts(App& app) {
     }
 }
 
-void DrawPositions(App& app) {
-    if (!app.show_positions) return;
-    app.workspace.ConstrainNextWindowSize();
-    if (!app.workspace.BeginWindow("tool.positions", "POSITIONS",
-                                   &app.show_positions,
-                                   ImVec2(400.0f, 10.0f),
-                                   ImVec2(920.0f, 310.0f))) {
-        app.workspace.EndWindow("tool.positions");
-        return;
-    }
+void DrawPositionsContent(App& app) {
     if (!app.has_account) {
         ImGui::TextDisabled("Connect an Alpaca account to load positions.");
-        app.workspace.EndWindow("tool.positions");
         return;
     }
     const bool live_valuation = !app.positions.empty() &&
@@ -2775,7 +2631,6 @@ void DrawPositions(App& app) {
         }
         ImGui::EndTable();
     }
-    app.workspace.EndWindow("tool.positions");
 }
 
 void DrawOrderManagement(App& app) {
@@ -2783,7 +2638,7 @@ void DrawOrderManagement(App& app) {
     app.workspace.ConstrainNextWindowSize();
     if (!app.workspace.BeginWindow("tool.order_management", "ORDER MANAGEMENT",
                                    &app.show_order_management,
-                                   ImVec2(400.0f, 700.0f),
+                                   ImVec2(440.0f, 700.0f),
                                    ImVec2(760.0f, 290.0f))) {
         app.workspace.EndWindow("tool.order_management");
         return;
@@ -2880,19 +2735,9 @@ void DrawOrderManagement(App& app) {
     app.workspace.EndWindow("tool.order_management");
 }
 
-void DrawOrders(App& app) {
-    if (!app.show_orders) return;
-    app.workspace.ConstrainNextWindowSize();
-    if (!app.workspace.BeginWindow("tool.orders", "ORDERS",
-                                   &app.show_orders,
-                                   ImVec2(400.0f, 330.0f),
-                                   ImVec2(980.0f, 360.0f))) {
-        app.workspace.EndWindow("tool.orders");
-        return;
-    }
+void DrawOrdersContent(App& app) {
     if (!app.has_account) {
         ImGui::TextDisabled("Connect an Alpaca account to load order history.");
-        app.workspace.EndWindow("tool.orders");
         return;
     }
     const tradebox::core::SafetyStatus safety =
@@ -3021,26 +2866,43 @@ void DrawOrders(App& app) {
         }
         ImGui::EndTable();
     }
-    app.workspace.EndWindow("tool.orders");
 }
 
-void DrawLog(App& app) {
-    if (!app.show_event_log) return;
-    app.workspace.ConstrainNextWindowSize();
-    if (!app.workspace.BeginWindow("tool.event_log", "EVENT LOG",
-                                   &app.show_event_log,
-                                   ImVec2(10.0f, 1080.0f),
-                                   ImVec2(520.0f, 260.0f))) {
-        app.workspace.EndWindow("tool.event_log");
-        return;
-    }
+void DrawEventLogContent(App& app) {
     ImGui::TextDisabled("Source events are recorded on the replay timeline.");
     ImGui::Separator();
     for (const std::string& message : app.messages)
         ImGui::TextWrapped("%s", message.c_str());
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4)
         ImGui::SetScrollHereY(1.0f);
-    app.workspace.EndWindow("tool.event_log");
+}
+
+void DrawActivity(App& app) {
+    if (!app.show_activity) return;
+    app.workspace.ConstrainNextWindowSize(ImVec2(620.0f, 360.0f));
+    if (!app.workspace.BeginWindow("tool.activity", "ACTIVITY",
+                                   &app.show_activity,
+                                   ImVec2(440.0f, 10.0f),
+                                   ImVec2(980.0f, 680.0f))) {
+        app.workspace.EndWindow("tool.activity");
+        return;
+    }
+    if (ImGui::BeginTabBar("activity-tabs", ImGuiTabBarFlags_Reorderable)) {
+        if (ImGui::BeginTabItem("Positions")) {
+            DrawPositionsContent(app);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Orders")) {
+            DrawOrdersContent(app);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Events")) {
+            DrawEventLogContent(app);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    app.workspace.EndWindow("tool.activity");
 }
 
 int RunApplication(const LaunchOptions& options) {
@@ -3080,7 +2942,12 @@ int RunApplication(const LaunchOptions& options) {
     SDL_SetBooleanProperty(window_properties,
                            SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
     SDL_SetBooleanProperty(window_properties,
-                           SDL_PROP_WINDOW_CREATE_BORDERLESS_BOOLEAN, true);
+                           SDL_PROP_WINDOW_CREATE_BORDERLESS_BOOLEAN, false);
+    // Do not expose the native window until DirectX has presented real UI
+    // content. Windows otherwise paints a temporary blank client surface
+    // while database/UI initialization is still in progress.
+    SDL_SetBooleanProperty(window_properties,
+                           SDL_PROP_WINDOW_CREATE_HIDDEN_BOOLEAN, true);
     SDL_SetBooleanProperty(
         window_properties,
         SDL_PROP_WINDOW_CREATE_HIGH_PIXEL_DENSITY_BOOLEAN, true);
@@ -3090,7 +2957,6 @@ int RunApplication(const LaunchOptions& options) {
         SDL_Quit();
         return 1;
     }
-    SDL_SetWindowHitTest(window, WindowHitTest, nullptr);
     if (placement.maximized) SDL_MaximizeWindow(window);
     Dx11Renderer renderer;
     std::string renderer_error;
@@ -3111,19 +2977,20 @@ int RunApplication(const LaunchOptions& options) {
     // trading surface. Application and broker errors are reported in EVENT LOG.
     io.ConfigErrorRecoveryEnableAssert = false;
     io.ConfigErrorRecoveryEnableTooltip = false;
-    io.Fonts->AddFontDefaultVector();
-    ImGui::GetStyle().FontSizeBase = 14.0f;
+    const std::filesystem::path font_path = ApplicationAssetPath(
+        "assets/fonts/B612-Regular.ttf");
+    if (io.Fonts->AddFontFromFileTTF(font_path.string().c_str(), 12.0f) ==
+        nullptr) {
+        // Keep a usable application surface if an incomplete manual install
+        // omits the packaged font assets.
+        io.Fonts->AddFontDefaultVector();
+    }
+    ImGui::GetStyle().FontSizeBase = 12.0f;
     ImGui::GetStyle().FontScaleDpi = SDL_GetWindowDisplayScale(window);
-    g_title_bar_height = std::max(
-        30, static_cast<int>(std::ceil(
-                ImGui::GetStyle().FontSizeBase *
-                    ImGui::GetStyle().FontScaleDpi +
-                10.0f)));
-    // Layout v2 intentionally starts with the non-overlapping workspace
-    // defaults introduced by the workspace registry refactor. Keeping the
-    // old file intact avoids silently rewriting a user's previous layout.
+    // Layout v7 adds the grouped Activity surface. Older layout files remain
+    // available for manual recovery.
     const std::string ini_path =
-        (database.DataDirectory() / "workspace-layout-v2.ini").string();
+        (database.DataDirectory() / "workspace-layout-v7.ini").string();
     io.IniFilename = ini_path.c_str();
     ImGui_ImplSDL3_InitForD3D(window);
     ImGui_ImplDX11_Init(renderer.device.Get(), renderer.context.Get());
@@ -3133,9 +3000,9 @@ int RunApplication(const LaunchOptions& options) {
     app.ui_scale.CaptureBaseline();
     if (const auto value = database.LoadAppSetting("ui.scale"))
         app.ui_scale.SetScale(std::strtof(value->c_str(), nullptr));
+    app.workspace.SetUiScale(app.ui_scale.Scale());
     if (const auto value = database.LoadAppSetting("ui.window_snap_pixels"))
         app.workspace.SetSnapPixels(std::atoi(value->c_str()));
-    UpdateTitleBarHeight();
     if (app.show_order_entry) app.order_tickets.emplace_back();
     AddMessage(app, "DirectX 11 renderer initialized");
     if (const auto value = database.LoadAppSetting("ui.vsync"))
@@ -3198,6 +3065,7 @@ int RunApplication(const LaunchOptions& options) {
     bool remember_maximized = placement.maximized;
     bool placement_dirty = false;
     Uint64 placement_changed_at = 0;
+    bool window_shown = false;
     bool done = false;
     while (!done) {
         SDL_Event event;
@@ -3272,24 +3140,25 @@ int RunApplication(const LaunchOptions& options) {
         ImGui::NewFrame();
 
         if (app.ui_scale.HandleShortcuts()) {
-            UpdateTitleBarHeight();
+            app.workspace.SetUiScale(app.ui_scale.Scale());
             database.SaveAppSetting("ui.scale",
                                     std::to_string(app.ui_scale.Scale()));
         }
 
-        if (DrawTitleBar(app, window)) done = true;
+        const float menu_bar_height = DrawMainMenuBar(app);
         const ImGuiViewport* viewport = ImGui::GetMainViewport();
-        const ImVec2 workspace_pos(
-            viewport->Pos.x,
-            viewport->Pos.y + static_cast<float>(g_title_bar_height));
+        // BeginMainMenuBar reports its work inset for the following frame.
+        // Use its measured height now so first-use window geometry cannot be
+        // persisted underneath the menu bar on the first rendered frame.
+        const ImVec2 workspace_pos(viewport->Pos.x,
+                                   viewport->Pos.y + menu_bar_height);
         const ImVec2 workspace_size(
             viewport->Size.x,
-            std::max(0.0f, viewport->Size.y -
-                               static_cast<float>(g_title_bar_height)));
+            std::max(0.0f, viewport->Size.y - menu_bar_height));
         app.workspace.BeginFrame(workspace_pos, workspace_size, true);
         DrawAccount(app);
         DrawWatchlist(app);
-        DrawLog(app);
+        DrawActivity(app);
         DrawCredentials(app, window);
         DrawOrderEntry(app);
         DrawQuickOrder(app);
@@ -3297,8 +3166,6 @@ int RunApplication(const LaunchOptions& options) {
         DrawOrderManagement(app);
         DrawTimeSales(app);
         DrawCharts(app);
-        DrawPositions(app);
-        DrawOrders(app);
         DrawPerformanceOverlay(app);
         app.workspace.EndFrame();
 
@@ -3351,6 +3218,10 @@ int RunApplication(const LaunchOptions& options) {
             }
         }
         renderer.swap_chain->Present(app.vsync_requested ? 1 : 0, 0);
+        if (!window_shown) {
+            SDL_ShowWindow(window);
+            window_shown = true;
+        }
         if (app.presentation_rearm_frames > 0 &&
             --app.presentation_rearm_frames == 0) {
             ApplyPresentationSettings(app, window, false);

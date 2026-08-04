@@ -21,6 +21,7 @@ struct WorkspaceWindow {
     bool snap_enabled = true;
 
     bool initialized = false;
+    bool reset_geometry = false;
     bool was_dragging = false;
     bool was_resizing = false;
     bool snap_modifier_seen = false;

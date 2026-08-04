@@ -1,5 +1,14 @@
 # Third-party notices
 
+## B612 and B612 Mono
+
+Trade Box packages B612 Regular and B612 Mono Regular. B612 was designed and
+tested for aircraft cockpit displays. Copyright (c) 2012, AIRBUS and the B612
+Project Authors. Source: <https://github.com/polarsys/b612>.
+
+SIL Open Font License, Version 1.1. The complete license text is available at
+<https://openfontlicense.org/open-font-license-official-text/>.
+
 ## Lucide Icons 1.27.0
 
 The native window-control line geometry is adapted from the Lucide icon

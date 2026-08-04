@@ -24,6 +24,13 @@ WorkspaceWindow* FindWindow(std::vector<WorkspaceWindow>& windows,
     return found == windows.end() ? nullptr : &*found;
 }
 
+bool IsResizeCursor(ImGuiMouseCursor cursor) {
+    return cursor == ImGuiMouseCursor_ResizeNS ||
+           cursor == ImGuiMouseCursor_ResizeEW ||
+           cursor == ImGuiMouseCursor_ResizeNESW ||
+           cursor == ImGuiMouseCursor_ResizeNWSE;
+}
+
 }  // namespace
 
 void UiScaleController::CaptureBaseline() {
@@ -104,15 +111,18 @@ bool Workspace::BeginWindow(WorkspaceWindow& window) {
         current_window_ids_.push_back(window.id);
 
     if (!window.initialized) {
+        const ImGuiCond geometry_condition =
+            window.reset_geometry ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
         ImGui::SetNextWindowPos(
             ImVec2(work_position_.x + window.default_offset.x * ui_scale_,
                    work_position_.y + window.default_offset.y * ui_scale_),
-            ImGuiCond_Always);
+            geometry_condition);
         ImGui::SetNextWindowSize(
             ImVec2(window.default_size.x * ui_scale_,
                    window.default_size.y * ui_scale_),
-            ImGuiCond_Always);
+            geometry_condition);
         window.initialized = true;
+        window.reset_geometry = false;
     } else if (window.has_pending_position) {
         ImGui::SetNextWindowPos(window.pending_position, ImGuiCond_Always);
         window.has_pending_position = false;
@@ -171,29 +181,36 @@ void Workspace::EndWindow(WorkspaceWindow& window) {
     const ImVec2 position = ImGui::GetWindowPos();
     const ImVec2 size = ImGui::GetWindowSize();
     const ImGuiIO& io = ImGui::GetIO();
-    const bool moving = ImGui::IsWindowHovered() &&
-                        ImGui::IsMouseDragging(ImGuiMouseButton_Left);
-    const bool resizing = false;
+    const bool focused =
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    const bool dragging =
+        focused && ImGui::IsMouseDragging(ImGuiMouseButton_Left);
+    const bool resizing = dragging && IsResizeCursor(ImGui::GetMouseCursor());
+    const bool moving = dragging && !resizing;
+    const bool position_changed =
+        !window.has_last_position || Different(position, window.last_position);
+
     if (moving && io.KeyCtrl) window.snap_modifier_seen = true;
-    ImVec2 final_position = position;
-    ImVec2 final_size = size;
-    if ((snap_enabled_ && window.snap_enabled) ||
-        window.snap_modifier_seen) {
-        const ImVec2 snapped = SnapPosition(position, final_size);
+
+    // Snap only after a move completes. Applying SetWindowPos every frame
+    // while the mouse is down interferes with native ImGui resize handling.
+    if (window.was_dragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+        position_changed &&
+        ((snap_enabled_ && window.snap_enabled) ||
+         window.snap_modifier_seen)) {
+        const ImVec2 snapped = SnapPosition(position, size);
         if (Different(position, snapped)) {
             window.pending_position = snapped;
             window.has_pending_position = true;
-            ImGui::SetWindowPos(snapped, ImGuiCond_Always);
-            final_position = snapped;
         }
-        if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))
-            window.snap_modifier_seen = false;
     }
+    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+        window.snap_modifier_seen = false;
 
     window.was_dragging = moving;
     window.was_resizing = resizing;
-    window.last_position = final_position;
-    window.last_size = final_size;
+    window.last_position = position;
+    window.last_size = size;
     window.has_last_position = true;
     if (window.open_binding != nullptr)
         *window.open_binding = window.open;
@@ -215,7 +232,11 @@ void Workspace::EndFrame() {
 }
 
 void Workspace::ResetWindow(WorkspaceWindow& window) {
+    // The next BeginWindow uses ImGuiCond_Always once, which intentionally
+    // overrides any persisted geometry for an explicit layout reset. Normal
+    // startup uses ImGuiCond_FirstUseEver so persisted user geometry wins.
     window.initialized = false;
+    window.reset_geometry = true;
     window.was_dragging = false;
     window.was_resizing = false;
     window.snap_modifier_seen = false;
