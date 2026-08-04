@@ -5,6 +5,9 @@ This document records the durable V1 boundary. Detailed command shapes live in
 semantics live in [ORDER_MODEL.md](ORDER_MODEL.md) and
 [ORDER_POSITION_STATE_MACHINE.md](ORDER_POSITION_STATE_MACHINE.md).
 
+The current post-V1 live-watchlist implementation sequence is specified in
+[LUNA_LIVE_WATCHLIST_CORE_HANDOFF.md](LUNA_LIVE_WATCHLIST_CORE_HANDOFF.md).
+
 ## Authority boundaries
 
 - Alpaca is authoritative for account, order, execution, and position state.
