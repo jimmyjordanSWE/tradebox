@@ -48,6 +48,12 @@ struct DatabaseStartupResult {
     std::string error;
 };
 
+struct ChromeMetrics {
+    int title_bar_height = 32;
+    int control_width = 44;
+    int menu_width = 180;
+};
+
 DatabaseStartupResult OpenDatabaseInBackground() {
     auto database = std::make_unique<Database>();
     std::string error;
@@ -119,6 +125,113 @@ bool CreateRenderer(SDL_Window* window, Dx11Renderer& renderer) {
 
     SDL_GetWindowSizeInPixels(window, &renderer.width, &renderer.height);
     return CreateRenderTarget(renderer);
+}
+
+SDL_HitTestResult SDLCALL HitTestChrome(
+    SDL_Window* window, const SDL_Point* area, void* data) {
+    if (area == nullptr || data == nullptr) return SDL_HITTEST_NORMAL;
+    const auto& metrics = *static_cast<const ChromeMetrics*>(data);
+    const SDL_WindowFlags flags = SDL_GetWindowFlags(window);
+    const bool maximized = (flags & SDL_WINDOW_MAXIMIZED) != 0;
+
+    int width = 0;
+    int height = 0;
+    SDL_GetWindowSize(window, &width, &height);
+    constexpr int kResizeBorder = 8;
+    if (!maximized) {
+        if (area->x < kResizeBorder) {
+            if (area->y < kResizeBorder) return SDL_HITTEST_RESIZE_TOPLEFT;
+            if (area->y >= height - kResizeBorder)
+                return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+            return SDL_HITTEST_RESIZE_LEFT;
+        }
+        if (area->x >= width - kResizeBorder) {
+            if (area->y < kResizeBorder) return SDL_HITTEST_RESIZE_TOPRIGHT;
+            if (area->y >= height - kResizeBorder)
+                return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+            return SDL_HITTEST_RESIZE_RIGHT;
+        }
+        if (area->y >= height - kResizeBorder)
+            return SDL_HITTEST_RESIZE_BOTTOM;
+        if (area->y < kResizeBorder) return SDL_HITTEST_RESIZE_TOP;
+    }
+
+    const int controls_width = metrics.control_width * 3;
+    const bool in_title_bar = area->y < metrics.title_bar_height;
+    const bool in_menu = area->x < metrics.menu_width;
+    const bool in_controls = area->x >= width - controls_width;
+    if (in_title_bar && !in_menu && !in_controls)
+        return SDL_HITTEST_DRAGGABLE;
+    return SDL_HITTEST_NORMAL;
+}
+
+void DrawApplicationChrome(
+    SDL_Window* window, ChromeMetrics& metrics,
+    tradebox::ui::Workspace& workspace, bool& done) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoNavFocus |
+        ImGuiWindowFlags_MenuBar;
+    ImGui::SetNextWindowPos(viewport->Pos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(viewport->Size, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    if (ImGui::Begin("##tradebox_chrome", nullptr, flags)) {
+        metrics.title_bar_height = static_cast<int>(
+            std::ceil(ImGui::GetFrameHeight()));
+        metrics.control_width = std::max(
+            44, static_cast<int>(std::ceil(ImGui::GetFrameHeight() * 1.35f)));
+        if (ImGui::BeginMenuBar()) {
+            if (ImGui::BeginMenu("File")) {
+                static_cast<void>(ImGui::MenuItem("New research window"));
+                if (ImGui::MenuItem("Exit")) done = true;
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("View")) {
+                if (ImGui::MenuItem("Reset layout")) {
+                    workspace.ResetAll();
+                    workspace.MarkDirty();
+                }
+                ImGui::EndMenu();
+            }
+
+            const float title_width = ImGui::CalcTextSize("Trade Box").x;
+            const float centered_x =
+                (ImGui::GetWindowWidth() - title_width) * 0.5f;
+            if (centered_x > ImGui::GetCursorPosX())
+                ImGui::SameLine(centered_x);
+            ImGui::TextUnformatted("Trade Box");
+
+            const float controls_width =
+                static_cast<float>(metrics.control_width * 3);
+            ImGui::SameLine(ImGui::GetWindowWidth() - controls_width);
+            if (ImGui::Button("_##minimize",
+                              ImVec2(static_cast<float>(metrics.control_width), 0)))
+                static_cast<void>(SDL_MinimizeWindow(window));
+            ImGui::SameLine();
+            const bool maximized =
+                (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
+            if (ImGui::Button(
+                    maximized ? "[]##restore" : "[]##maximize",
+                    ImVec2(static_cast<float>(metrics.control_width), 0))) {
+                if (maximized)
+                    static_cast<void>(SDL_RestoreWindow(window));
+                else
+                    static_cast<void>(SDL_MaximizeWindow(window));
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("X##close",
+                              ImVec2(static_cast<float>(metrics.control_width), 0)))
+                done = true;
+            ImGui::EndMenuBar();
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
 }
 
 LaunchOptions ParseLaunchOptions(int argc, char* argv[]) {
@@ -196,7 +309,8 @@ int RunApplication(const LaunchOptions& options) {
         480, static_cast<int>(native_window.bounds.height));
     SDL_Window* window = SDL_CreateWindow(
         "Trade Box", initial_width, initial_height,
-        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS |
+            SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) {
         SDL_Quit();
         return 1;
@@ -205,6 +319,14 @@ int RunApplication(const LaunchOptions& options) {
                           static_cast<int>(native_window.bounds.x),
                           static_cast<int>(native_window.bounds.y));
     if (native_window.maximized) SDL_MaximizeWindow(window);
+    ChromeMetrics chrome_metrics;
+    if (!SDL_SetWindowHitTest(window, HitTestChrome, &chrome_metrics)) {
+        MessageBoxA(nullptr, SDL_GetError(), "Trade Box window error",
+                    MB_OK | MB_ICONERROR);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
 
     Dx11Renderer renderer;
     if (!CreateRenderer(window, renderer)) {
@@ -281,12 +403,19 @@ int RunApplication(const LaunchOptions& options) {
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
 
+        DrawApplicationChrome(window, chrome_metrics, workspace, done);
+
         if (ui_scale.HandleShortcuts()) {
             workspace.SetUiScale(ui_scale.Scale());
             workstation_state.application.ui_scale = ui_scale.Scale();
         }
         const ImGuiViewport* viewport = ImGui::GetMainViewport();
-        workspace.BeginFrame(viewport->Pos, viewport->Size, false);
+        const float chrome_height =
+            static_cast<float>(chrome_metrics.title_bar_height);
+        workspace.BeginFrame(
+            {viewport->Pos.x, viewport->Pos.y + chrome_height},
+            {viewport->Size.x, std::max(0.0f, viewport->Size.y - chrome_height)},
+            false);
         // Intentionally no windows, menus, controls, or overlays yet. New
         // surfaces should be created through Workspace so their state enters
         // the active .tbw profile automatically.
