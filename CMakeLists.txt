@@ -280,11 +280,15 @@ if(BUILD_TESTING)
   gtest_discover_tests(tradebox_order_pipeline_tests)
 
   add_executable(tradebox_workstation_tests
+    tests/unit/native_chrome_layout_tests.cpp
     tests/unit/workstation_state_tests.cpp
     tests/unit/workspace_dirty_tests.cpp
     src/adapters/gui/workspace.cpp
   )
   target_compile_features(tradebox_workstation_tests PRIVATE cxx_std_23)
+  target_include_directories(tradebox_workstation_tests PRIVATE
+    src/adapters/gui
+  )
   target_link_libraries(tradebox_workstation_tests PRIVATE
     tradebox_workstation
     imgui

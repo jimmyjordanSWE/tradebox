@@ -1,8 +1,9 @@
 #include "tradebox/application/trading_application.h"
 #include "tradebox/persistence/database.h"
 #include "tradebox/ui/model.h"
-#include "tradebox/ui/workspace.h"
 #include "tradebox/workstation/profile_store.h"
+
+#include "native_chrome_layout.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -11,17 +12,15 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <future>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
@@ -30,6 +29,9 @@
 namespace {
 
 using Microsoft::WRL::ComPtr;
+
+constexpr float kTitleFontSize = 18.0f;
+constexpr float kToolIconSize = 24.0f;
 
 struct Dx11Renderer {
     ComPtr<ID3D11Device> device;
@@ -51,24 +53,24 @@ struct DatabaseStartupResult {
     std::string error;
 };
 
-struct ChromeMetrics {
-    // These dimensions mirror VS Code's desktop custom titlebar: a compact
-    // 35px row and a fixed 46px slot for each window control.
-    int title_bar_height = 35;
-    int control_width = 46;
-    int menu_width = 180;
+struct MarketTimeZone {
+    DYNAMIC_TIME_ZONE_INFORMATION value{};
+    bool available = false;
 };
 
-struct IconEntry {
-    std::string name;
-    unsigned int codepoint = 0;
+struct ChromeMetrics {
+    int title_bar_height = 35;
+    int control_width = 46;
+    int tool_width = 40;
+    int interactive_left_width = 0;
 };
 
 struct GuiFonts {
     ImFont* regular = nullptr;
-    ImFont* mono = nullptr;
+    ImFont* title = nullptr;
     ImFont* icons = nullptr;
-    std::vector<ImWchar> icon_ranges;
+    std::array<ImWchar, 5> icon_ranges{
+        0xe8b8, 0xe8b8, 0xf20b, 0xf20b, 0};
 };
 
 DatabaseStartupResult OpenDatabaseInBackground() {
@@ -77,6 +79,37 @@ DatabaseStartupResult OpenDatabaseInBackground() {
     if (!database->Open(error))
         return {nullptr, std::move(error)};
     return {std::move(database), {}};
+}
+
+MarketTimeZone LoadMarketTimeZone() {
+    MarketTimeZone result;
+    for (DWORD index = 0;; ++index) {
+        DYNAMIC_TIME_ZONE_INFORMATION candidate{};
+        const DWORD status =
+            EnumDynamicTimeZoneInformation(index, &candidate);
+        if (status != ERROR_SUCCESS) break;
+        if (std::wstring_view(candidate.TimeZoneKeyName) ==
+            L"Eastern Standard Time") {
+            result.value = candidate;
+            result.available = true;
+            break;
+        }
+    }
+    return result;
+}
+
+std::string MarketTimeText(const MarketTimeZone& time_zone) {
+    if (!time_zone.available) return "--:-- ET";
+    SYSTEMTIME utc{};
+    SYSTEMTIME eastern{};
+    GetSystemTime(&utc);
+    if (!SystemTimeToTzSpecificLocalTimeEx(
+            &time_zone.value, &utc, &eastern))
+        return "--:-- ET";
+    const std::array<char, 6> time =
+        tradebox::ui::win32::FormatHourMinute(
+            eastern.wHour, eastern.wMinute);
+    return std::string(time.data()) + " ET";
 }
 
 bool CreateRenderTarget(Dx11Renderer& renderer) {
@@ -157,74 +190,22 @@ std::filesystem::path AssetPath(std::string_view relative_path) {
     return result;
 }
 
-std::vector<IconEntry> LoadIconCatalog() {
-    std::ifstream input(AssetPath("fonts/MaterialIcons-Regular.codepoints"));
-    std::vector<IconEntry> icons;
-    std::string name;
-    std::string codepoint;
-    while (input >> name >> codepoint) {
-        try {
-            icons.push_back({name, std::stoul(codepoint, nullptr, 16)});
-        } catch (const std::exception&) {
-            icons.clear();
-            break;
-        }
-    }
-    return icons;
-}
-
-bool LoadGuiFonts(GuiFonts& fonts, const std::vector<IconEntry>& icons) {
+bool LoadGuiFonts(GuiFonts& fonts) {
     ImGuiIO& io = ImGui::GetIO();
     fonts.regular = io.Fonts->AddFontFromFileTTF(
         AssetPath("fonts/B612-Regular.ttf").string().c_str(), 16.0f,
         nullptr, io.Fonts->GetGlyphRangesDefault());
-    fonts.mono = io.Fonts->AddFontFromFileTTF(
-        AssetPath("fonts/B612Mono-Regular.ttf").string().c_str(), 16.0f,
-        nullptr, io.Fonts->GetGlyphRangesDefault());
-    std::vector<unsigned int> codepoints;
-    codepoints.reserve(icons.size());
-    for (const IconEntry& icon : icons) codepoints.push_back(icon.codepoint);
-    std::sort(codepoints.begin(), codepoints.end());
-    codepoints.erase(std::unique(codepoints.begin(), codepoints.end()),
-                     codepoints.end());
-    for (const unsigned int codepoint : codepoints) {
-        if (fonts.icon_ranges.empty() ||
-            codepoint > static_cast<unsigned int>(fonts.icon_ranges.back()) + 1) {
-            fonts.icon_ranges.push_back(static_cast<ImWchar>(codepoint));
-            fonts.icon_ranges.push_back(static_cast<ImWchar>(codepoint));
-        } else {
-            fonts.icon_ranges.back() = static_cast<ImWchar>(codepoint);
-        }
-    }
-    fonts.icon_ranges.push_back(0);
+    fonts.title = io.Fonts->AddFontFromFileTTF(
+        AssetPath("fonts/B612-Regular.ttf").string().c_str(),
+        kTitleFontSize, nullptr, io.Fonts->GetGlyphRangesDefault());
     fonts.icons = io.Fonts->AddFontFromFileTTF(
-        AssetPath("fonts/MaterialIcons-Regular.ttf").string().c_str(),
-        18.0f, nullptr, fonts.icon_ranges.data());
-    if (fonts.regular == nullptr || fonts.mono == nullptr ||
+        AssetPath("fonts/MaterialSymbolsRounded.ttf").string().c_str(),
+        kToolIconSize, nullptr, fonts.icon_ranges.data());
+    if (fonts.regular == nullptr || fonts.title == nullptr ||
         fonts.icons == nullptr)
         return false;
     io.FontDefault = fonts.regular;
     return true;
-}
-
-std::string Utf8Codepoint(unsigned int codepoint) {
-    std::string result;
-    if (codepoint <= 0x7f) {
-        result.push_back(static_cast<char>(codepoint));
-    } else if (codepoint <= 0x7ff) {
-        result.push_back(static_cast<char>(0xc0 | (codepoint >> 6)));
-        result.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
-    } else if (codepoint <= 0xffff) {
-        result.push_back(static_cast<char>(0xe0 | (codepoint >> 12)));
-        result.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
-        result.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
-    } else {
-        result.push_back(static_cast<char>(0xf0 | (codepoint >> 18)));
-        result.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3f)));
-        result.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
-        result.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
-    }
-    return result;
 }
 
 SDL_HitTestResult SDLCALL HitTestChrome(
@@ -256,64 +237,154 @@ SDL_HitTestResult SDLCALL HitTestChrome(
         if (area->y < kResizeBorder) return SDL_HITTEST_RESIZE_TOP;
     }
 
-    const int controls_width = metrics.control_width * 3;
-    const bool in_title_bar = area->y < metrics.title_bar_height;
-    const bool in_menu = area->x < metrics.menu_width;
-    const bool in_controls = area->x >= width - controls_width;
-    if (in_title_bar && !in_menu && !in_controls)
+    if (tradebox::ui::win32::IsTitleBarDragPoint(
+            area->x, area->y, metrics.title_bar_height,
+            metrics.interactive_left_width, width,
+            metrics.control_width * 3 + metrics.tool_width * 2))
         return SDL_HITTEST_DRAGGABLE;
     return SDL_HITTEST_NORMAL;
 }
 
-bool DrawChromeIconButton(const char* id, unsigned int codepoint,
-                          ImFont* icon_font, ImVec2 size,
-                          const char* tooltip, bool close_button = false) {
+enum class ChromeButtonSymbol {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+};
+
+void DrawChromeButtonSymbol(
+    ImDrawList& draw_list, const ImVec2& button_min, const ImVec2& button_size,
+    ChromeButtonSymbol symbol, ImU32 color) {
+    constexpr float kSymbolSize = 10.0f;
+    constexpr float kStrokeWidth = 1.0f;
+    constexpr float kCornerRadius = 1.5f;
+    constexpr float kSeparation = 2.0f;
+    const float left = std::floor(
+        button_min.x + (button_size.x - kSymbolSize) * 0.5f) + 0.5f;
+    const float top = std::floor(
+        button_min.y + (button_size.y - kSymbolSize) * 0.5f) + 0.5f;
+    const float right = left + kSymbolSize - 1.0f;
+    const float bottom = top + kSymbolSize - 1.0f;
+
+    switch (symbol) {
+        case ChromeButtonSymbol::Minimize: {
+            const float middle = std::floor((top + bottom) * 0.5f) + 0.5f;
+            draw_list.AddLine({left, middle}, {right, middle}, color,
+                              kStrokeWidth);
+            break;
+        }
+        case ChromeButtonSymbol::Maximize:
+            draw_list.AddRect({left, top}, {right, bottom}, color,
+                              kCornerRadius, ImDrawFlags_RoundCornersAll,
+                              kStrokeWidth);
+            break;
+        case ChromeButtonSymbol::Restore:
+            draw_list.AddLine(
+                {left + kSeparation, top}, {right, top}, color, kStrokeWidth);
+            draw_list.AddLine(
+                {right, top}, {right, bottom - kSeparation}, color,
+                kStrokeWidth);
+            draw_list.AddRect(
+                {left, top + kSeparation},
+                {right - kSeparation, bottom}, color, kCornerRadius,
+                ImDrawFlags_RoundCornersAll, kStrokeWidth);
+            break;
+        case ChromeButtonSymbol::Close:
+            draw_list.AddLine({left, top}, {right, bottom}, color,
+                              kStrokeWidth);
+            draw_list.AddLine({right, top}, {left, bottom}, color,
+                              kStrokeWidth);
+            break;
+    }
+}
+
+bool DrawChromeButton(
+    const char* id, ChromeButtonSymbol symbol, ImVec2 size) {
     const bool clicked = ImGui::InvisibleButton(id, size);
-    const ImVec2 min = ImGui::GetItemRectMin();
-    const ImVec2 max = ImGui::GetItemRectMax();
+    const ImVec2 minimum = ImGui::GetItemRectMin();
+    const ImVec2 maximum = ImGui::GetItemRectMax();
     const bool hovered = ImGui::IsItemHovered();
     const bool active = ImGui::IsItemActive();
-    ImU32 background = active
-                           ? ImGui::GetColorU32(ImGuiCol_ButtonActive)
-                           : hovered
-                                 ? ImGui::GetColorU32(ImGuiCol_ButtonHovered)
-                                 : IM_COL32(0, 0, 0, 0);
-    if (close_button && hovered)
-        background = IM_COL32(196, 60, 60, 255);
+    const bool close = symbol == ChromeButtonSymbol::Close;
 
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    draw_list->AddRectFilled(min, max, background);
-    const std::string glyph = Utf8Codepoint(codepoint);
-    ImGui::PushFont(icon_font);
-    const ImVec2 glyph_size = ImGui::CalcTextSize(glyph.c_str());
-    const ImVec2 glyph_position{
-        min.x + (size.x - glyph_size.x) * 0.5f,
-        min.y + (size.y - glyph_size.y) * 0.5f};
-    draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize(), glyph_position,
-                       ImGui::GetColorU32(ImGuiCol_Text), glyph.c_str());
-    ImGui::PopFont();
-    if (hovered && tooltip != nullptr) ImGui::SetTooltip("%s", tooltip);
+    ImDrawList& draw_list = *ImGui::GetWindowDrawList();
+    if (hovered || active) {
+        ImU32 background = 0;
+        if (close) {
+            background = active ? IM_COL32(232, 17, 35, 0x98)
+                                : IM_COL32(232, 17, 35, 0xff);
+        } else {
+            const ImVec4 foreground = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+            background = ImGui::ColorConvertFloat4ToU32(
+                {foreground.x, foreground.y, foreground.z,
+                 active ? 0x33 / 255.0f : 0x1a / 255.0f});
+        }
+        draw_list.AddRectFilled(minimum, maximum, background);
+    }
+
+    const ImU32 symbol_color = close && (hovered || active)
+                                   ? IM_COL32(255, 255, 255, 255)
+                                   : ImGui::GetColorU32(ImGuiCol_Text);
+    DrawChromeButtonSymbol(
+        draw_list, minimum, size, symbol, symbol_color);
     return clicked;
+}
+
+std::array<char, 4> Utf8BmpGlyph(unsigned int codepoint) {
+    return {
+        static_cast<char>(0xe0U | (codepoint >> 12U)),
+        static_cast<char>(0x80U | ((codepoint >> 6U) & 0x3fU)),
+        static_cast<char>(0x80U | (codepoint & 0x3fU)),
+        '\0'};
+}
+
+void DrawTitleBarToolButton(
+    const char* id, unsigned int codepoint,
+    ImFont* icon_font, ImVec2 size) {
+    static_cast<void>(ImGui::InvisibleButton(id, size));
+    const ImVec2 minimum = ImGui::GetItemRectMin();
+    const ImVec2 maximum = ImGui::GetItemRectMax();
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    ImDrawList& draw_list = *ImGui::GetWindowDrawList();
+
+    if (hovered || active) {
+        const ImVec4 foreground = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+        draw_list.AddRectFilled(
+            minimum, maximum,
+            ImGui::ColorConvertFloat4ToU32(
+                {foreground.x, foreground.y, foreground.z,
+                 active ? 0x33 / 255.0f : 0x1a / 255.0f}));
+    }
+
+    const std::array<char, 4> glyph = Utf8BmpGlyph(codepoint);
+    ImGui::PushFont(icon_font, kToolIconSize);
+    const ImVec2 glyph_size = ImGui::CalcTextSize(glyph.data());
+    draw_list.AddText(
+        ImGui::GetFont(), ImGui::GetFontSize(),
+        {minimum.x + (size.x - glyph_size.x) * 0.5f,
+         minimum.y + (size.y - glyph_size.y) * 0.5f},
+        ImGui::GetColorU32(ImGuiCol_Text), glyph.data());
+    ImGui::PopFont();
+
 }
 
 void DrawApplicationChrome(
     SDL_Window* window, ChromeMetrics& metrics,
-    const GuiFonts& fonts, bool& done) {
+    const GuiFonts& fonts, const MarketTimeZone& market_time_zone,
+    bool& done) {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     metrics.title_bar_height = 35;
     metrics.control_width = 46;
+    metrics.tool_width = 40;
     const float row_height = static_cast<float>(metrics.title_bar_height);
-    const float controls_width =
+    const float caption_controls_width =
         static_cast<float>(metrics.control_width * 3);
-
-    ImGui::PushFont(fonts.regular, 14.0f);
-    const ImGuiStyle& style = ImGui::GetStyle();
-    const float menu_width = ImGui::CalcTextSize("File").x +
-                             style.FramePadding.x * 2.0f;
-    const float right_width = controls_width;
-    ImGui::PopFont();
-
-    metrics.menu_width = static_cast<int>(std::ceil(menu_width));
+    const float tool_controls_width =
+        static_cast<float>(metrics.tool_width * 2);
+    const float right_controls_width =
+        tool_controls_width + caption_controls_width;
+    metrics.interactive_left_width = 0;
 
     const ImGuiWindowFlags flags =
         ImGuiWindowFlags_NoDecoration |
@@ -342,144 +413,53 @@ void DrawApplicationChrome(
             {window_max.x, window_max.y - 1.0f},
             ImGui::GetColorU32(ImGuiCol_Border));
 
-        if (ImGui::BeginTable(
-                "##tradebox_chrome_layout", 3,
-                ImGuiTableFlags_NoSavedSettings |
-                    ImGuiTableFlags_NoBordersInBody |
-                    ImGuiTableFlags_NoPadOuterX)) {
-            ImGui::TableSetupColumn(
-                "##chrome_menu", ImGuiTableColumnFlags_WidthFixed,
-                menu_width);
-            ImGui::TableSetupColumn(
-                "##chrome_center", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn(
-                "##chrome_right", ImGuiTableColumnFlags_WidthFixed,
-                right_width);
-            ImGui::TableNextRow(0, row_height);
-
-            ImGui::TableNextColumn();
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                                ImVec2(8.0f, 3.0f));
-            if (ImGui::BeginMenu("File")) {
-                if (ImGui::MenuItem("Exit")) done = true;
-                ImGui::EndMenu();
-            }
-            ImGui::PopStyleVar();
-
-            ImGui::TableNextColumn();
-            ImGui::PushFont(fonts.regular, 14.0f);
-            const float title_width = ImGui::CalcTextSize("Trade Box").x;
-            const float center_width = ImGui::GetContentRegionAvail().x;
-            if (center_width > title_width)
-                ImGui::SetCursorPosX(
-                    ImGui::GetCursorPosX() +
-                    (center_width - title_width) * 0.5f);
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Trade Box");
-            ImGui::PopFont();
-
-            ImGui::TableNextColumn();
-            if (DrawChromeIconButton(
-                    "##minimize", 0xe931, fonts.icons,
-                    {static_cast<float>(metrics.control_width), row_height},
-                    "Minimize"))
-                static_cast<void>(SDL_MinimizeWindow(window));
-            ImGui::SameLine(0.0f, 0.0f);
-            const bool maximized =
-                (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
-            if (DrawChromeIconButton(
-                    "##maximize", maximized ? 0xe5d1 : 0xe930,
-                    fonts.icons,
-                    {static_cast<float>(metrics.control_width), row_height},
-                    maximized ? "Restore" : "Maximize")) {
-                if (maximized)
-                    static_cast<void>(SDL_RestoreWindow(window));
-                else
-                    static_cast<void>(SDL_MaximizeWindow(window));
-            }
-            ImGui::SameLine(0.0f, 0.0f);
-            if (DrawChromeIconButton(
-                    "##close", 0xe5cd, fonts.icons,
-                    {static_cast<float>(metrics.control_width), row_height},
-                    "Close", true))
-                done = true;
-            ImGui::EndTable();
+        ImGui::SetCursorPos(
+            {window_size.x - right_controls_width, 0.0f});
+        const ImVec2 tool_size{
+            static_cast<float>(metrics.tool_width), row_height};
+        DrawTitleBarToolButton(
+            "##account", 0xf20b, fonts.icons, tool_size);
+        ImGui::SameLine(0.0f, 0.0f);
+        DrawTitleBarToolButton(
+            "##settings", 0xe8b8, fonts.icons, tool_size);
+        ImGui::SameLine(0.0f, 0.0f);
+        const ImVec2 button_size{
+            static_cast<float>(metrics.control_width), row_height};
+        if (DrawChromeButton(
+                "##minimize", ChromeButtonSymbol::Minimize,
+                button_size))
+            static_cast<void>(SDL_MinimizeWindow(window));
+        ImGui::SameLine(0.0f, 0.0f);
+        const bool maximized =
+            (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
+        if (DrawChromeButton(
+                "##maximize",
+                maximized ? ChromeButtonSymbol::Restore
+                          : ChromeButtonSymbol::Maximize,
+                button_size)) {
+            if (maximized)
+                static_cast<void>(SDL_RestoreWindow(window));
+            else
+                static_cast<void>(SDL_MaximizeWindow(window));
         }
+        ImGui::SameLine(0.0f, 0.0f);
+        if (DrawChromeButton(
+                "##close", ChromeButtonSymbol::Close,
+                button_size))
+            done = true;
+
+        ImGui::PushFont(fonts.title, kTitleFontSize);
+        const std::string title = MarketTimeText(market_time_zone);
+        const ImVec2 title_size = ImGui::CalcTextSize(title.c_str());
+        draw_list->AddText(
+            ImGui::GetFont(), ImGui::GetFontSize(),
+            {window_min.x + (window_size.x - title_size.x) * 0.5f,
+             window_min.y + (row_height - title_size.y) * 0.5f},
+            ImGui::GetColorU32(ImGuiCol_Text), title.c_str());
+        ImGui::PopFont();
     }
     ImGui::End();
     ImGui::PopStyleVar(3);
-}
-
-void DrawFontSpecimen(tradebox::ui::Workspace& workspace, const GuiFonts& fonts,
-                      tradebox::ui::WorkspaceWindow& window) {
-    const bool visible = workspace.BeginWindow(window);
-    if (visible) {
-        ImGui::TextUnformatted(
-            "B612 Regular and B612 Mono, rendered at 8 through 16 px");
-        ImGui::Separator();
-        for (int size = 8; size <= 16; ++size) {
-            ImGui::PushFont(fonts.regular, static_cast<float>(size));
-            ImGui::Text("Regular %2d px  The quick brown fox jumps over 0123456789",
-                        size);
-            ImGui::PopFont();
-
-            ImGui::PushFont(fonts.mono, static_cast<float>(size));
-            ImGui::Text("Mono    %2d px  AAPL  187.42  +1.23%%  10,000.00",
-                        size);
-            ImGui::PopFont();
-        }
-        ImGui::Separator();
-        ImGui::TextUnformatted(
-            "Use regular text for labels and mono text for aligned market data.");
-    }
-    workspace.EndWindow(window);
-}
-
-void DrawIconGallery(tradebox::ui::Workspace& workspace, const GuiFonts& fonts,
-                     const std::vector<IconEntry>& icons,
-                     tradebox::ui::WorkspaceWindow& window) {
-    const bool visible = workspace.BeginWindow(window);
-    if (visible) {
-        ImGui::Text("Material Icons: %zu glyphs", icons.size());
-        ImGui::TextUnformatted("The gallery is virtualized; scroll to inspect the set.");
-        if (ImGui::BeginTable(
-                "##material_icon_gallery", 6,
-                ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg |
-                    ImGuiTableFlags_SizingStretchSame)) {
-            constexpr int columns = 6;
-            const int rows = static_cast<int>((icons.size() + columns - 1) /
-                                              columns);
-            ImGuiListClipper clipper;
-            clipper.Begin(rows);
-            while (clipper.Step()) {
-                for (int row = clipper.DisplayStart; row < clipper.DisplayEnd;
-                     ++row) {
-                    ImGui::TableNextRow();
-                    for (int column = 0; column < columns; ++column) {
-                        const std::size_t index =
-                            static_cast<std::size_t>(row * columns + column);
-                        ImGui::TableSetColumnIndex(column);
-                        if (index >= icons.size()) continue;
-                        const IconEntry& icon = icons[index];
-                        const std::string glyph = Utf8Codepoint(icon.codepoint);
-                        ImGui::PushFont(fonts.icons, 24.0f);
-                        const float glyph_width =
-                            ImGui::CalcTextSize(glyph.c_str()).x;
-                        const float cell_width = ImGui::GetContentRegionAvail().x;
-                        if (cell_width > glyph_width)
-                            ImGui::SetCursorPosX(
-                                ImGui::GetCursorPosX() +
-                                (cell_width - glyph_width) * 0.5f);
-                        ImGui::TextUnformatted(glyph.c_str());
-                        ImGui::PopFont();
-                        ImGui::TextWrapped("%s", icon.name.c_str());
-                    }
-                }
-            }
-            ImGui::EndTable();
-        }
-    }
-    workspace.EndWindow(window);
 }
 
 LaunchOptions ParseLaunchOptions(int argc, char* argv[]) {
@@ -587,9 +567,8 @@ int RunApplication(const LaunchOptions& options) {
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
     ImGui::GetIO().IniFilename = nullptr;
-    const std::vector<IconEntry> icon_catalog = LoadIconCatalog();
     GuiFonts gui_fonts;
-    if (icon_catalog.empty() || !LoadGuiFonts(gui_fonts, icon_catalog)) {
+    if (!LoadGuiFonts(gui_fonts)) {
         MessageBoxA(nullptr,
                     "Trade Box could not load its bundled UI assets.",
                     "Trade Box asset error", MB_OK | MB_ICONERROR);
@@ -611,30 +590,10 @@ int RunApplication(const LaunchOptions& options) {
     std::unique_ptr<Database> database;
     std::unique_ptr<tradebox::application::TradingApplication> application;
 
-    tradebox::ui::UiScaleController ui_scale;
-    tradebox::ui::Workspace workspace;
-    workspace.SetPersistentState(&workstation_state.workspace);
-    tradebox::ui::WorkspaceWindow font_specimen_window{
-        .title = "Font specimen",
-        .id = "debug.font_specimen",
-        .default_offset = {24.0f, 24.0f},
-        .default_size = {700.0f, 620.0f},
-    };
-    tradebox::ui::WorkspaceWindow icon_gallery_window{
-        .title = "Icon gallery",
-        .id = "debug.icon_gallery",
-        .default_offset = {748.0f, 24.0f},
-        .default_size = {700.0f, 620.0f},
-    };
-    workspace.SetSnapPixels(
-        workstation_state.application.window_snap_pixels);
-    workspace.SetUiScale(workstation_state.application.ui_scale);
-    ui_scale.SetScale(workstation_state.application.ui_scale);
-    ui_scale.CaptureBaseline();
-    static_cast<void>(workspace.ConsumeDirty());
     if (!profile_existed) profile_store.MarkDirty();
 
     bool done = false;
+    const MarketTimeZone market_time_zone = LoadMarketTimeZone();
     const Uint64 started_at = SDL_GetTicks();
     while (!done) {
         SDL_Event event;
@@ -674,32 +633,12 @@ int RunApplication(const LaunchOptions& options) {
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
 
-        if (ui_scale.HandleShortcuts()) {
-            workspace.SetUiScale(ui_scale.Scale());
-            workstation_state.application.ui_scale = ui_scale.Scale();
-        }
-        const ImGuiViewport* viewport = ImGui::GetMainViewport();
-        const float chrome_height =
-            static_cast<float>(chrome_metrics.title_bar_height);
-        workspace.BeginFrame(
-            {viewport->Pos.x, viewport->Pos.y + chrome_height},
-            {viewport->Size.x,
-             std::max(0.0f, viewport->Size.y - chrome_height)},
-            false);
-        DrawFontSpecimen(workspace, gui_fonts, font_specimen_window);
-        DrawIconGallery(workspace, gui_fonts, icon_catalog, icon_gallery_window);
-        workspace.EndFrame();
-        DrawApplicationChrome(window, chrome_metrics, gui_fonts, done);
+        DrawApplicationChrome(
+            window, chrome_metrics, gui_fonts, market_time_zone, done);
 
         const bool native_window_changed =
             CaptureNativeWindowState(window, workstation_state.native_window);
-        const int snap_pixels = workspace.SnapPixels();
-        const bool snap_pixels_changed =
-            workstation_state.application.window_snap_pixels != snap_pixels;
-        workstation_state.application.window_snap_pixels = snap_pixels;
-        const bool workspace_changed = workspace.ConsumeDirty();
-        if (native_window_changed || snap_pixels_changed || workspace_changed)
-            profile_store.MarkDirty();
+        if (native_window_changed) profile_store.MarkDirty();
         std::string save_error;
         if (!profile_store.FlushIfDue(workstation_state, save_error)) {
             MessageBoxA(nullptr, save_error.c_str(),
