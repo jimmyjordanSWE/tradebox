@@ -23,6 +23,23 @@ drawings, orders, annotations, multiple panes beyond price/volume, renderer
 registries, plugin systems, undo/redo, custom DirectX rendering, or TradingView
 feature parity.
 
+## Dear ImGui implementation references
+
+Use these to inspect established Dear ImGui patterns and runnable examples:
+
+- Interactive explorer with browsable C++ examples:
+  <https://pthom.github.io/imgui_explorer/>
+- Explorer and example source repository:
+  <https://github.com/pthom/imgui_bundle>
+
+Use them as API and interaction references, not as TradeBox architecture. Do
+not add ImGui Bundle, Hello ImGui, ImPlot, or another dependency for this task.
+Do not import their application lifecycle, persistence, docking, or state
+ownership. Adapt only the relevant Dear ImGui technique to TradeBox's existing
+`Workspace`, workstation profile, application snapshot, SDL3, and DirectX 11
+systems. The pinned Dear ImGui version in `CMakeLists.txt` remains authoritative
+for APIs available in this repository.
+
 ## Existing systems that must be used
 
 Do not replace or work around these:
