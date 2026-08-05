@@ -31,6 +31,7 @@ struct WorkspaceWindow {
     ImVec2 last_position{};
     ImVec2 last_size{};
     ImVec2 pending_position{};
+    bool began_this_frame = false;
 };
 
 class UiScaleController {
@@ -78,6 +79,7 @@ public:
     [[nodiscard]] int SnapPixels() const { return snap_pixels_; }
 
 private:
+    void KeepWindowInsideWorkArea();
     [[nodiscard]] ImVec2 SnapPosition(ImVec2 position,
                                       ImVec2 window_size) const;
 

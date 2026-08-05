@@ -74,6 +74,35 @@ TEST(WorkspaceDirty, ClosingWindowMarksPersistedStateDirty) {
     EXPECT_FALSE(state.workspace.windows.at("tool.test").open);
 }
 
+TEST(WorkspaceWindow, RestoresClosedStateAndPairsEndSafely) {
+    ImGuiContext context;
+    workstation::WorkstationState state = workstation::WorkstationState::Defaults();
+    state.workspace.windows.emplace(
+        "tool.test",
+        workstation::WindowInstanceState{
+            .id = "tool.test",
+            .kind = "tool",
+            .title = "TEST",
+            .open = false,
+            .bounds = {24.0f, 24.0f, 420.0f, 280.0f}});
+
+    Workspace workspace;
+    workspace.SetPersistentState(&state.workspace);
+    WorkspaceWindow window{
+        .title = "TEST",
+        .id = "tool.test",
+    };
+
+    ImGui::NewFrame();
+    workspace.BeginFrame({0.0f, 0.0f}, {1000.0f, 800.0f}, false);
+    EXPECT_FALSE(workspace.BeginWindow(window));
+    EXPECT_FALSE(window.open);
+    workspace.EndWindow(window);
+    ImGui::Render();
+
+    EXPECT_FALSE(workspace.ConsumeDirty());
+}
+
 TEST(WorkspaceDirty, PersistedScaleChangeMarksStateDirty) {
     ImGuiContext context;
     workstation::WorkstationState state = workstation::WorkstationState::Defaults();

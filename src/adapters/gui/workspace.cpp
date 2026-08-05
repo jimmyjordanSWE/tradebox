@@ -92,9 +92,41 @@ void Workspace::ConstrainNextWindowSize(ImVec2 minimum, ImVec2 maximum) {
     ImGui::SetNextWindowSizeConstraints(minimum, maximum);
 }
 
+void Workspace::KeepWindowInsideWorkArea() {
+    const ImVec2 window_size = ImGui::GetWindowSize();
+    const ImVec2 current_position = ImGui::GetWindowPos();
+    const ImVec2 minimum_position = work_position_;
+    const ImVec2 maximum_position{
+        std::max(minimum_position.x,
+                 work_position_.x + work_size_.x - window_size.x),
+        std::max(minimum_position.y,
+                 work_position_.y + work_size_.y - window_size.y)};
+    const ImVec2 constrained_position{
+        std::clamp(current_position.x, minimum_position.x, maximum_position.x),
+        std::clamp(current_position.y, minimum_position.y, maximum_position.y)};
+    if (Different(current_position, constrained_position))
+        ImGui::SetWindowPos(constrained_position, ImGuiCond_Always);
+}
+
 bool Workspace::BeginWindow(WorkspaceWindow& window) {
-    return BeginWindow(window.id, window.title, &window.open, window.default_offset,
-                       window.default_size);
+    window.began_this_frame = false;
+    if (!window.initialized) {
+        if (persistent_state_ != nullptr) {
+            if (auto found = persistent_state_->windows.find(window.id);
+                found != persistent_state_->windows.end())
+                window.open = found->second.open;
+        }
+        window.initialized = true;
+    }
+    if (!window.open) {
+        static_cast<void>(BeginWindow(window.id, window.title, &window.open,
+                                      window.default_offset, window.default_size));
+        return false;
+    }
+    const bool visible = BeginWindow(window.id, window.title, &window.open,
+                                     window.default_offset, window.default_size);
+    window.began_this_frame = true;
+    return visible;
 }
 
 bool Workspace::BeginWindow(std::string_view id, std::string_view title, bool* open,
@@ -138,6 +170,7 @@ bool Workspace::BeginWindow(std::string_view id, std::string_view title, bool* o
     const std::string label = std::string(title) + "###" + std::string(id);
     const bool open_before = state->open;
     const bool visible = ImGui::Begin(label.c_str(), &state->open);
+    KeepWindowInsideWorkArea();
     if (state->open != open_before) dirty_ = true;
     *open = state->open;
     return visible;
@@ -165,6 +198,7 @@ void Workspace::EndWindow(std::string_view id) {
 }
 
 void Workspace::EndWindow(WorkspaceWindow& window) {
+    if (!window.began_this_frame) return;
     const ImVec2 position = ImGui::GetWindowPos();
     const ImVec2 size = ImGui::GetWindowSize();
     if (persistent_state_ != nullptr) {
@@ -187,6 +221,7 @@ void Workspace::EndWindow(WorkspaceWindow& window) {
         }
     }
     ImGui::End();
+    window.began_this_frame = false;
 }
 
 void Workspace::ResetWindow(WorkspaceWindow& window) {
