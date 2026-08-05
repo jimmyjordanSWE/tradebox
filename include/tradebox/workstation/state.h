@@ -1,7 +1,10 @@
 #pragma once
 
+#include "tradebox/core/indicator.h"
+
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -60,15 +63,79 @@ struct WindowInstanceState {
     std::map<std::string, PersistentTableState, std::less<>> tables;
 };
 
-struct ChartDocumentState {
-    std::string id;
-    std::string instrument_id;
-    std::string symbol;
+struct ChartIndicatorState {
+    core::IndicatorDefinition definition;
+    std::string label;
+    bool visible = true;
+    std::uint32_t color_rgba = 0x4aa3d8ffU;
+    float line_width = 1.5f;
+
+    bool operator==(const ChartIndicatorState&) const = default;
+};
+
+struct ChartDefaultsState {
     std::string timeframe = "1Min";
+    core::MarketDataFeed feed = core::MarketDataFeed::Iex;
+    core::BarAdjustment adjustment = core::BarAdjustment::Raw;
     int visible_bars = 120;
     bool show_volume = true;
     bool show_close_line = false;
     bool show_crosshair = true;
+    std::vector<ChartIndicatorState> indicators;
+};
+
+struct ChartDocumentState {
+    std::string id;
+    std::string instrument_id;
+    std::string symbol;
+    // Editable ticker text is persisted independently from a resolved asset.
+    // It may be partial while instrument_id and symbol remain empty.
+    std::string ticker_input;
+    std::string timeframe = "1Min";
+    core::MarketDataFeed feed = core::MarketDataFeed::Iex;
+    core::BarAdjustment adjustment = core::BarAdjustment::Raw;
+    int visible_bars = 120;
+    bool show_volume = true;
+    bool show_close_line = false;
+    bool show_crosshair = true;
+    // Zero means follow the latest available market-data anchor. A non-zero
+    // value is the persisted viewport anchor selected by the user.
+    std::int64_t range_anchor_ns = 0;
+    std::vector<ChartIndicatorState> indicators;
+};
+
+struct IndicatorSuiteState {
+    std::string id;
+    std::string name;
+    std::vector<ChartIndicatorState> indicators;
+};
+
+enum class ChartDrawingKind {
+    HorizontalLine,
+    VerticalLine,
+    TrendLine,
+    Ray,
+    Rectangle,
+};
+
+struct ChartDrawingAnchorState {
+    std::int64_t time_ns = 0;
+    core::Decimal price;
+
+    bool operator==(const ChartDrawingAnchorState&) const = default;
+};
+
+struct ChartDrawingState {
+    std::string id;
+    // Drawings are shared by every chart displaying this stable instrument.
+    std::string instrument_id;
+    ChartDrawingKind kind = ChartDrawingKind::TrendLine;
+    ChartDrawingAnchorState first;
+    std::optional<ChartDrawingAnchorState> second;
+    std::string label;
+    bool visible = true;
+    std::uint32_t color_rgba = 0xd8d8d8ffU;
+    float line_width = 1.5f;
 };
 
 struct OrderTicketState {
@@ -107,7 +174,10 @@ struct WorkspaceState {
     float quick_short_buying_power_percent = 80.0f;
     std::map<std::string, BracketDraftState, std::less<>> bracket_drafts;
     std::map<std::string, WindowInstanceState, std::less<>> windows;
+    ChartDefaultsState chart_defaults;
     std::vector<ChartDocumentState> charts;
+    std::vector<IndicatorSuiteState> indicator_suites;
+    std::vector<ChartDrawingState> chart_drawings;
     std::vector<OrderTicketState> order_tickets;
 };
 
@@ -128,4 +198,3 @@ struct WorkstationState {
 };
 
 }  // namespace tradebox::workstation
-

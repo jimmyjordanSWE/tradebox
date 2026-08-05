@@ -511,13 +511,16 @@ AlpacaService::AlpacaService(UiEventQueue& events, Database& database,
                              tradebox::core::ITradingCore& core,
                              tradebox::core::IMarketDataSink& market_data,
                              tradebox::core::IMarketDataView& market_data_view,
-                             tradebox::core::IBarDataSink& bars)
+                             tradebox::core::IBarDataSink& bars,
+                             tradebox::broker::IHistoryRequestStatusSink*
+                                 history_status)
     : events_(events),
       database_(database),
       core_(core),
       market_data_(market_data),
       market_data_view_(market_data_view),
-      bars_(bars) {
+      bars_(bars),
+      history_status_(history_status) {
     for (std::size_t index = 0; index < 3; ++index)
         background_workers_.emplace_back(
             &AlpacaService::BackgroundWorkerLoop, this);
@@ -697,8 +700,19 @@ void AlpacaService::RequestHistory(
 
 void AlpacaService::RequestHistory(
     tradebox::core::HistoricalBarQuery query) {
-    if (!running_) return;
+    if (!running_) {
+        if (history_status_)
+            history_status_->Publish({
+                .key = query.key,
+                .range = query.range,
+                .state = tradebox::broker::HistoryRequestState::Failed,
+                .message = "History is unavailable while disconnected",
+            });
+        return;
+    }
     const std::string request_symbol = query.symbol;
+    const tradebox::core::BarSeriesKey request_key = query.key;
+    const tradebox::core::BarRange request_range = query.range;
     if (!SubmitBackground(
         [this, query = std::move(query)] {
             const auto& key = query.key;
@@ -716,6 +730,14 @@ void AlpacaService::RequestHistory(
                     "History request has no resolved instrument "
                     "identity or valid range",
                 });
+                if (history_status_)
+                    history_status_->Publish({
+                        .key = key,
+                        .range = range,
+                        .state = tradebox::broker::HistoryRequestState::Failed,
+                        .message =
+                            "History request has no resolved instrument identity or valid range",
+                    });
                 return;
             }
             const StoredBarSeries stored =
@@ -727,13 +749,36 @@ void AlpacaService::RequestHistory(
                 in_flight_bar_ranges_.Reserve(key, missing);
             if (reserved.empty()) {
                 PublishCachedHistory(symbol, key, range);
+                if (history_status_)
+                    history_status_->Publish({
+                        .key = key,
+                        .range = range,
+                        .state = missing.empty()
+                                     ? tradebox::broker::HistoryRequestState::Succeeded
+                                     : tradebox::broker::HistoryRequestState::Loading,
+                    });
                 return;
             }
+            if (history_status_)
+                history_status_->Publish({
+                    .key = key,
+                    .range = range,
+                    .state = tradebox::broker::HistoryRequestState::Loading,
+                });
             FetchHistory(symbol, key, range,
                          std::move(reserved));
-        }))
+        })) {
         events_.Push({UiEventType::Status, request_symbol,
                       "History request rejected: background queue full"});
+        if (history_status_)
+            history_status_->Publish({
+                .key = request_key,
+                .range = request_range,
+                .state = tradebox::broker::HistoryRequestState::Failed,
+                .message =
+                    "History request rejected: background queue full",
+            });
+    }
 }
 
 void AlpacaService::RequestAssetCatalog() {
@@ -1971,6 +2016,8 @@ void AlpacaService::FetchHistory(
     tradebox::core::BarRange requested_range,
     std::vector<tradebox::core::BarRange> reserved_ranges) {
     const AlpacaCredentials credentials = CredentialsSnapshot();
+    bool request_succeeded = true;
+    std::string request_error;
     try {
         for (const tradebox::core::BarRange range :
              reserved_ranges) {
@@ -1993,6 +2040,10 @@ void AlpacaService::FetchHistory(
                     tradebox::broker::alpaca::RestPriority::Interactive);
                 if (response.status != 200) {
                     complete = false;
+                    request_succeeded = false;
+                    request_error = !response.error.empty()
+                                        ? response.error
+                                        : response.body;
                     events_.Push({
                         UiEventType::Status,
                         symbol,
@@ -2011,6 +2062,8 @@ void AlpacaService::FetchHistory(
                             response.body, "bars");
                 if (!envelope) {
                     complete = false;
+                    request_succeeded = false;
+                    request_error = envelope.error();
                     events_.Push({
                         UiEventType::Status,
                         symbol,
@@ -2072,6 +2125,8 @@ void AlpacaService::FetchHistory(
                     database_.StoreProviderBars(page);
                 if (!stored_page) {
                     complete = false;
+                    request_succeeded = false;
+                    request_error = stored_page.error();
                     events_.Push(OperationalEvent(
                         OperationalComponent::Persistence,
                         OperationalState::Failed,
@@ -2088,6 +2143,9 @@ void AlpacaService::FetchHistory(
                 if (!next.empty() &&
                     !seen_tokens.insert(next).second) {
                     complete = false;
+                    request_succeeded = false;
+                    request_error =
+                        "History pagination repeated a page token";
                     events_.Push({
                         UiEventType::Status,
                         symbol,
@@ -2098,7 +2156,11 @@ void AlpacaService::FetchHistory(
                 page_token = next;
             } while (!page_token.empty() && running_);
 
-            if (!running_) complete = false;
+            if (!running_) {
+                complete = false;
+                request_succeeded = false;
+                request_error = "History request was interrupted";
+            }
             if (complete) {
                 tradebox::core::BarUpsertBatch coverage{
                     .key = key,
@@ -2108,6 +2170,8 @@ void AlpacaService::FetchHistory(
                 const auto stored_coverage =
                     database_.StoreProviderBars(coverage);
                 if (!stored_coverage) {
+                    request_succeeded = false;
+                    request_error = stored_coverage.error();
                     events_.Push(OperationalEvent(
                         OperationalComponent::Persistence,
                         OperationalState::Failed,
@@ -2121,11 +2185,22 @@ void AlpacaService::FetchHistory(
             }
         }
     } catch (const std::exception& error) {
+        request_succeeded = false;
+        request_error = error.what();
         events_.Push({UiEventType::Status, symbol,
                       "History JSON error: " + std::string(error.what())});
     }
     in_flight_bar_ranges_.Release(key, reserved_ranges);
     PublishCachedHistory(symbol, key, requested_range);
+    if (history_status_)
+        history_status_->Publish({
+            .key = key,
+            .range = requested_range,
+            .state = request_succeeded
+                         ? tradebox::broker::HistoryRequestState::Succeeded
+                         : tradebox::broker::HistoryRequestState::Failed,
+            .message = std::move(request_error),
+        });
 }
 
 void AlpacaService::PublishCachedHistory(

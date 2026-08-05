@@ -12,6 +12,7 @@ public:
     ImGuiContext() {
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
+        ImGui::GetIO().DisplaySize = {1000.0f, 800.0f};
         unsigned char* pixels = nullptr;
         int width = 0;
         int height = 0;

@@ -30,7 +30,9 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
-constexpr float kTitleFontSize = 18.0f;
+constexpr float kRegularFontSize = 18.0f;
+constexpr float kTitleFontSize = 20.0f;
+constexpr float kMenuFontSize = 18.0f;
 constexpr float kToolIconSize = 24.0f;
 
 struct Dx11Renderer {
@@ -193,7 +195,8 @@ std::filesystem::path AssetPath(std::string_view relative_path) {
 bool LoadGuiFonts(GuiFonts& fonts) {
     ImGuiIO& io = ImGui::GetIO();
     fonts.regular = io.Fonts->AddFontFromFileTTF(
-        AssetPath("fonts/B612-Regular.ttf").string().c_str(), 16.0f,
+        AssetPath("fonts/B612-Regular.ttf").string().c_str(),
+        kRegularFontSize,
         nullptr, io.Fonts->GetGlyphRangesDefault());
     fonts.title = io.Fonts->AddFontFromFileTTF(
         AssetPath("fonts/B612-Regular.ttf").string().c_str(),
@@ -240,7 +243,7 @@ SDL_HitTestResult SDLCALL HitTestChrome(
     if (tradebox::ui::win32::IsTitleBarDragPoint(
             area->x, area->y, metrics.title_bar_height,
             metrics.interactive_left_width, width,
-            metrics.control_width * 3 + metrics.tool_width * 2))
+            metrics.control_width * 3))
         return SDL_HITTEST_DRAGGABLE;
     return SDL_HITTEST_NORMAL;
 }
@@ -338,10 +341,10 @@ std::array<char, 4> Utf8BmpGlyph(unsigned int codepoint) {
         '\0'};
 }
 
-void DrawTitleBarToolButton(
+bool DrawTitleBarToolButton(
     const char* id, unsigned int codepoint,
     ImFont* icon_font, ImVec2 size) {
-    static_cast<void>(ImGui::InvisibleButton(id, size));
+    const bool clicked = ImGui::InvisibleButton(id, size);
     const ImVec2 minimum = ImGui::GetItemRectMin();
     const ImVec2 maximum = ImGui::GetItemRectMax();
     const bool hovered = ImGui::IsItemHovered();
@@ -366,7 +369,40 @@ void DrawTitleBarToolButton(
          minimum.y + (size.y - glyph_size.y) * 0.5f},
         ImGui::GetColorU32(ImGuiCol_Text), glyph.data());
     ImGui::PopFont();
+    return clicked;
+}
 
+void DrawAccordionSection(const char* label, bool default_open) {
+    const ImGuiTreeNodeFlags flags =
+        default_open ? ImGuiTreeNodeFlags_DefaultOpen : 0;
+    if (!ImGui::CollapsingHeader(label, flags)) return;
+
+    ImGui::PushID(label);
+    ImGui::Indent(8.0f);
+    if (ImGui::MenuItem("Option A")) ImGui::CloseCurrentPopup();
+    if (ImGui::MenuItem("Option B")) ImGui::CloseCurrentPopup();
+    if (ImGui::MenuItem("Option C")) ImGui::CloseCurrentPopup();
+    ImGui::Unindent(8.0f);
+    ImGui::PopID();
+}
+
+void DrawTitleBarPopup(ImFont* regular_font, const char* id, ImVec2 anchor,
+                       const char* title,
+                       const char* first_section,
+                       const char* second_section,
+                       const char* third_section) {
+    ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, {0.0f, 0.0f});
+    ImGui::SetNextWindowSizeConstraints({250.0f, 0.0f}, {360.0f, 640.0f});
+    if (!ImGui::BeginPopup(id)) return;
+
+    ImGui::PushFont(regular_font, kMenuFontSize);
+    ImGui::TextUnformatted(title);
+    ImGui::Separator();
+    DrawAccordionSection(first_section, true);
+    DrawAccordionSection(second_section, false);
+    DrawAccordionSection(third_section, false);
+    ImGui::PopFont();
+    ImGui::EndPopup();
 }
 
 void DrawApplicationChrome(
@@ -382,9 +418,7 @@ void DrawApplicationChrome(
         static_cast<float>(metrics.control_width * 3);
     const float tool_controls_width =
         static_cast<float>(metrics.tool_width * 2);
-    const float right_controls_width =
-        tool_controls_width + caption_controls_width;
-    metrics.interactive_left_width = 0;
+    metrics.interactive_left_width = static_cast<int>(tool_controls_width);
 
     const ImGuiWindowFlags flags =
         ImGuiWindowFlags_NoDecoration |
@@ -413,16 +447,28 @@ void DrawApplicationChrome(
             {window_max.x, window_max.y - 1.0f},
             ImGui::GetColorU32(ImGuiCol_Border));
 
-        ImGui::SetCursorPos(
-            {window_size.x - right_controls_width, 0.0f});
+        ImGui::SetCursorPos({0.0f, 0.0f});
         const ImVec2 tool_size{
             static_cast<float>(metrics.tool_width), row_height};
-        DrawTitleBarToolButton(
+        const bool account_clicked = DrawTitleBarToolButton(
             "##account", 0xf20b, fonts.icons, tool_size);
+        const ImVec2 account_anchor = ImGui::GetItemRectMax();
         ImGui::SameLine(0.0f, 0.0f);
-        DrawTitleBarToolButton(
+        const bool settings_clicked = DrawTitleBarToolButton(
             "##settings", 0xe8b8, fonts.icons, tool_size);
-        ImGui::SameLine(0.0f, 0.0f);
+
+        if (account_clicked) ImGui::OpenPopup("##account_menu");
+        if (settings_clicked) ImGui::OpenPopup("##settings_menu");
+        const ImVec2 left_menu_anchor{window_min.x, account_anchor.y};
+        DrawTitleBarPopup(
+            fonts.regular, "##account_menu", left_menu_anchor, "Account",
+            "Overview", "Connection", "Activity");
+        DrawTitleBarPopup(
+            fonts.regular, "##settings_menu", left_menu_anchor, "Settings",
+            "General", "Workspace", "Trading");
+
+        ImGui::SetCursorPos(
+            {window_size.x - caption_controls_width, 0.0f});
         const ImVec2 button_size{
             static_cast<float>(metrics.control_width), row_height};
         if (DrawChromeButton(

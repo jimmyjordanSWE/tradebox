@@ -1,6 +1,7 @@
 #include "tradebox/application/trading_application.h"
 
 #include "tradebox/application/order_execution_service.h"
+#include "tradebox/application/history_request_tracker.h"
 #include "tradebox/broker/alpaca_service.h"
 #include "tradebox/core/system_clock.h"
 #include "tradebox/core/bar_store.h"
@@ -11,6 +12,7 @@
 #include "tradebox/platform/credentials.h"
 
 #include <algorithm>
+#include <ranges>
 #include <type_traits>
 #include <utility>
 
@@ -101,7 +103,7 @@ public:
           valuation_market_data(market_data, core),
           broker(*owned_events, database, core,
                  valuation_market_data,
-                 market_data, bars),
+                 market_data, bars, &history_requests),
           order_execution(core, broker, order_journal, clock,
                           &market_data) {}
 
@@ -115,7 +117,7 @@ public:
           valuation_market_data(market_data, core),
           broker(*owned_events, database, core,
                  valuation_market_data,
-                 market_data, bars),
+                 market_data, bars, &history_requests),
           order_execution(core, broker, external_order_journal, clock,
                           &market_data) {}
 
@@ -127,7 +129,7 @@ public:
           valuation_market_data(market_data, core),
           broker(events, database, core,
                  valuation_market_data,
-                 market_data, bars),
+                 market_data, bars, &history_requests),
           order_execution(core, broker, order_journal, clock,
                           &market_data) {}
 
@@ -140,6 +142,7 @@ public:
     core::MarketDataStore market_data;
     CoreValuationMarketDataSink valuation_market_data;
     core::BarStore bars;
+    HistoryRequestTracker history_requests;
     AlpacaService broker;
     OrderExecutionService order_execution;
 };
@@ -171,9 +174,80 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
         result.markets.push_back(MarketData(symbol));
 
     result.charts.reserve(query.charts.size());
-    for (const UiChartQuery& chart : query.charts)
-        result.charts.push_back(
-            BarsForSymbol(chart.symbol, chart.timeframe, chart.range));
+    for (const UiChartQuery& chart : query.charts) {
+        UiChartSnapshot projected{
+            .document_id = chart.document_id,
+        };
+        if (chart.document_id.empty() ||
+            chart.key.instrument_id.empty() || chart.symbol.empty() ||
+            chart.key.timeframe.empty() ||
+            chart.key.feed == core::MarketDataFeed::Unknown ||
+            chart.range.start_ns < 0 ||
+            chart.range.start_ns >= chart.range.end_ns) {
+            projected.message =
+                "Chart query requires a stable document, instrument, and valid range";
+            result.charts.push_back(std::move(projected));
+            continue;
+        }
+
+        projected.series = Bars(chart.key, chart.range);
+        const auto request = impl_->history_requests.StatusFor(
+            chart.key, chart.range);
+        if (request && request->state ==
+                           broker::HistoryRequestState::Loading) {
+            projected.status = ChartDataStatus::Loading;
+            projected.message = "Loading chart history";
+        } else if (request && request->state ==
+                                  broker::HistoryRequestState::Failed) {
+            projected.status = ChartDataStatus::Failed;
+            projected.message = request->message.empty()
+                                    ? "Chart history request failed"
+                                    : request->message;
+            projected.retryable = true;
+        } else if (!projected.series.missing_ranges.empty()) {
+            projected.status = result.core.authenticated
+                                   ? ChartDataStatus::MissingHistory
+                                   : ChartDataStatus::Unavailable;
+            projected.message = result.core.authenticated
+                                    ? "Chart history is incomplete"
+                                    : "History is unavailable while disconnected";
+            projected.retryable = result.core.authenticated;
+        } else if (projected.series.bars.empty() &&
+                   !projected.series.current_bar) {
+            projected.status = ChartDataStatus::Empty;
+            projected.message = "No bars in this range";
+        } else {
+            projected.status = ChartDataStatus::Ready;
+        }
+
+        std::vector<core::MarketBar> indicator_bars =
+            projected.series.bars;
+        if (projected.series.current_bar) {
+            const auto position = std::ranges::lower_bound(
+                indicator_bars, projected.series.current_bar->start_ns,
+                {}, &core::MarketBar::start_ns);
+            if (position != indicator_bars.end() &&
+                position->start_ns ==
+                    projected.series.current_bar->start_ns)
+                *position = *projected.series.current_bar;
+            else
+                indicator_bars.insert(
+                    position, *projected.series.current_bar);
+        }
+        auto indicators = core::EvaluateIndicators(
+            chart.indicators, indicator_bars);
+        if (indicators)
+            projected.indicators = std::move(*indicators);
+        else
+            projected.indicator_errors.push_back(
+                indicators.error().message);
+        result.charts.push_back(std::move(projected));
+    }
+    if (query.asset_limit != 0) {
+        const auto assets = impl_->database.LoadAssetCatalog();
+        result.assets = core::SearchTradableAssets(
+            assets, query.asset_search, query.asset_limit);
+    }
     return result;
 }
 
@@ -398,6 +472,15 @@ void TradingApplication::RequestMarketHistory(
 void TradingApplication::RequestMarketHistory(
     core::HistoricalBarQuery query) {
     impl_->broker.RequestHistory(std::move(query));
+}
+
+void TradingApplication::RequestMarketHistory(
+    const UiChartQuery& query) {
+    impl_->broker.RequestHistory({
+        .key = query.key,
+        .symbol = query.symbol,
+        .range = query.range,
+    });
 }
 
 std::future<core::TickSeries> TradingApplication::RequestTicks(

@@ -21,6 +21,37 @@ void NormalizeBounds(LogicalRect& bounds, float minimum_width,
     bounds.height = std::clamp(bounds.height, minimum_height, 100000.0f);
 }
 
+bool ValidateIndicators(std::vector<ChartIndicatorState>& indicators,
+                        std::string_view owner, std::string& error) {
+    std::set<std::string, std::less<>> ids;
+    for (ChartIndicatorState& indicator : indicators) {
+        if (indicator.definition.id.empty() ||
+            !ids.insert(indicator.definition.id).second) {
+            error = std::string(owner) +
+                    " contains an invalid or duplicate indicator ID";
+            return false;
+        }
+        std::visit(
+            [](auto& calculation) {
+                calculation.period =
+                    std::clamp(calculation.period, 1U, 10'000U);
+            },
+            indicator.definition.calculation);
+        indicator.line_width =
+            std::clamp(indicator.line_width, 0.5f, 10.0f);
+    }
+    std::vector<core::IndicatorDefinition> definitions;
+    definitions.reserve(indicators.size());
+    for (const ChartIndicatorState& indicator : indicators)
+        definitions.push_back(indicator.definition);
+    const auto evaluated = core::EvaluateIndicators(definitions, {});
+    if (!evaluated) {
+        error = std::string(owner) + ": " + evaluated.error().message;
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
@@ -71,14 +102,75 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
         }
     }
 
+    state.workspace.chart_defaults.visible_bars = std::clamp(
+        state.workspace.chart_defaults.visible_bars, 30, 2000);
+    if (state.workspace.chart_defaults.timeframe.empty())
+        state.workspace.chart_defaults.timeframe = "1Min";
+    if (!ValidateIndicators(
+            state.workspace.chart_defaults.indicators,
+            "Chart defaults", error))
+        return false;
+
     std::set<std::string, std::less<>> chart_ids;
     for (ChartDocumentState& chart : state.workspace.charts) {
-        if (chart.id.empty() || !chart_ids.insert(chart.id).second || chart.symbol.empty()) {
+        if (chart.id.empty() || !chart_ids.insert(chart.id).second ||
+            chart.instrument_id.empty() != chart.symbol.empty()) {
             error = "Chart profile contains an invalid or duplicate document ID";
             return false;
         }
         chart.visible_bars = std::clamp(chart.visible_bars, 30, 2000);
         if (chart.timeframe.empty()) chart.timeframe = "1Min";
+        if (!chart.symbol.empty()) chart.ticker_input = chart.symbol;
+        if (!ValidateIndicators(chart.indicators, "Chart document", error))
+            return false;
+        const auto window = state.workspace.windows.find(chart.id);
+        if (window == state.workspace.windows.end()) {
+            state.workspace.windows.emplace(
+                chart.id,
+                WindowInstanceState{
+                    .id = chart.id,
+                    .kind = "chart",
+                    .title = chart.symbol.empty()
+                                 ? "Chart"
+                                 : chart.symbol + " · " + chart.timeframe,
+                    .open = true,
+                    .bounds = {48.0f, 48.0f, 960.0f, 640.0f},
+                });
+        } else if (window->second.kind != "chart") {
+            error = "Chart document ID is owned by a non-chart window";
+            return false;
+        }
+    }
+
+    std::set<std::string, std::less<>> suite_ids;
+    std::set<std::string, std::less<>> suite_names;
+    for (IndicatorSuiteState& suite : state.workspace.indicator_suites) {
+        if (suite.id.empty() || suite.name.empty() ||
+            !suite_ids.insert(suite.id).second ||
+            !suite_names.insert(suite.name).second) {
+            error = "Indicator-suite profile contains invalid or duplicate identity";
+            return false;
+        }
+        if (!ValidateIndicators(suite.indicators, "Indicator suite", error))
+            return false;
+    }
+
+    std::set<std::string, std::less<>> drawing_ids;
+    for (ChartDrawingState& drawing : state.workspace.chart_drawings) {
+        if (drawing.id.empty() || drawing.instrument_id.empty() ||
+            !drawing_ids.insert(drawing.id).second) {
+            error = "Chart drawing contains invalid or duplicate identity";
+            return false;
+        }
+        drawing.line_width = std::clamp(drawing.line_width, 0.5f, 10.0f);
+        const bool needs_second =
+            drawing.kind == ChartDrawingKind::TrendLine ||
+            drawing.kind == ChartDrawingKind::Ray ||
+            drawing.kind == ChartDrawingKind::Rectangle;
+        if (needs_second && !drawing.second) {
+            error = "Chart drawing is missing its second anchor";
+            return false;
+        }
     }
 
     std::set<std::string, std::less<>> ticket_ids;
@@ -102,4 +194,3 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
 }
 
 }  // namespace tradebox::workstation
-

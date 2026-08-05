@@ -4,6 +4,7 @@
 #include "tradebox/broker/alpaca_bar_request.h"
 #include "tradebox/broker/alpaca_rest_transport.h"
 #include "tradebox/broker/alpaca_stream_supervision.h"
+#include "tradebox/broker/history_status.h"
 #include "tradebox/core/interfaces.h"
 #include "tradebox/core/bar_series.h"
 #include "tradebox/core/market_data.h"
@@ -31,7 +32,9 @@ public:
                   tradebox::core::ITradingCore& core,
                   tradebox::core::IMarketDataSink& market_data,
                   tradebox::core::IMarketDataView& market_data_view,
-                  tradebox::core::IBarDataSink& bars);
+                  tradebox::core::IBarDataSink& bars,
+                  tradebox::broker::IHistoryRequestStatusSink*
+                      history_status = nullptr);
     ~AlpacaService();
 
     AlpacaService(const AlpacaService&) = delete;
@@ -120,6 +123,7 @@ private:
     tradebox::core::IMarketDataSink& market_data_;
     tradebox::core::IMarketDataView& market_data_view_;
     tradebox::core::IBarDataSink& bars_;
+    tradebox::broker::IHistoryRequestStatusSink* history_status_;
     tradebox::broker::alpaca::AlpacaRestTransport rest_transport_;
     AlpacaCredentials credentials_;
     mutable std::mutex credentials_mutex_;

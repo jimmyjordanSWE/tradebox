@@ -103,6 +103,7 @@ endfunction()
 
 add_library(tradebox_core STATIC
   src/core/decimal.cpp
+  src/core/indicator.cpp
   src/core/asset_catalog.cpp
   src/core/bar_series.cpp
   src/core/bar_store.cpp
@@ -140,16 +141,20 @@ tradebox_enable_windows_api(tradebox_platform)
 tradebox_enable_strict_warnings(tradebox_platform)
 
 add_library(tradebox_workstation STATIC
+  src/workstation/chart_documents.cpp
   src/workstation/defaults.cpp
   src/workstation/profile_codec.cpp
   src/workstation/profile_lock.cpp
   src/workstation/profile_store.cpp
+  src/workstation/stable_id.cpp
   src/workstation/validation.cpp
 )
 target_include_directories(tradebox_workstation PUBLIC include)
 target_compile_features(tradebox_workstation PUBLIC cxx_std_23)
 target_link_libraries(tradebox_workstation
-  PUBLIC tomlplusplus::tomlplusplus
+  PUBLIC
+    tradebox_core
+    tomlplusplus::tomlplusplus
   PRIVATE shell32 ole32
 )
 tradebox_enable_windows_api(tradebox_workstation)
@@ -181,6 +186,8 @@ tradebox_enable_windows_api(tradebox_broker_alpaca)
 tradebox_enable_strict_warnings(tradebox_broker_alpaca)
 
 add_library(tradebox_application STATIC
+  src/application/chart_query.cpp
+  src/application/history_request_tracker.cpp
   src/application/order_execution_service.cpp
   src/application/trading_application.cpp
 )
@@ -241,6 +248,7 @@ if(BUILD_TESTING)
   add_executable(tradebox_core_tests
     tests/unit/bar_store_tests.cpp
     tests/unit/decimal_tests.cpp
+    tests/unit/indicator_tests.cpp
     tests/unit/market_data_store_tests.cpp
     tests/unit/order_request_tests.cpp
     tests/unit/order_projection_tests.cpp
@@ -258,6 +266,7 @@ if(BUILD_TESTING)
   gtest_discover_tests(tradebox_core_tests)
 
   add_executable(tradebox_order_pipeline_tests
+    tests/unit/chart_application_tests.cpp
     tests/unit/alpaca_account_activity_tests.cpp
     tests/unit/alpaca_bar_request_tests.cpp
     tests/unit/alpaca_market_stream_decoder_tests.cpp

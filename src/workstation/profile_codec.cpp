@@ -5,6 +5,7 @@
 #include <toml++/toml.hpp>
 
 #include <iomanip>
+#include <stdexcept>
 #include <sstream>
 
 namespace tradebox::workstation {
@@ -69,6 +70,204 @@ void WriteStringArray(std::ostringstream& output,
     output << ']';
 }
 
+const char* FeedName(core::MarketDataFeed feed) {
+    switch (feed) {
+        case core::MarketDataFeed::Unknown: return "unknown";
+        case core::MarketDataFeed::Iex: return "iex";
+        case core::MarketDataFeed::Sip: return "sip";
+    }
+    return "unknown";
+}
+
+core::MarketDataFeed ReadFeed(const toml::table& table,
+                              core::MarketDataFeed fallback) {
+    const std::string value = ValueOr(
+        table, "feed", std::string(FeedName(fallback)));
+    if (value == "unknown") return core::MarketDataFeed::Unknown;
+    if (value == "iex") return core::MarketDataFeed::Iex;
+    if (value == "sip") return core::MarketDataFeed::Sip;
+    throw std::runtime_error("Unsupported chart market-data feed: " + value);
+}
+
+const char* AdjustmentName(core::BarAdjustment adjustment) {
+    switch (adjustment) {
+        case core::BarAdjustment::Raw: return "raw";
+        case core::BarAdjustment::Split: return "split";
+        case core::BarAdjustment::Dividend: return "dividend";
+        case core::BarAdjustment::All: return "all";
+    }
+    return "raw";
+}
+
+core::BarAdjustment ReadAdjustment(
+    const toml::table& table, core::BarAdjustment fallback) {
+    const std::string value = ValueOr(
+        table, "adjustment", std::string(AdjustmentName(fallback)));
+    if (value == "raw") return core::BarAdjustment::Raw;
+    if (value == "split") return core::BarAdjustment::Split;
+    if (value == "dividend") return core::BarAdjustment::Dividend;
+    if (value == "all") return core::BarAdjustment::All;
+    throw std::runtime_error("Unsupported chart adjustment: " + value);
+}
+
+const char* CalculationName(const core::IndicatorCalculation& calculation) {
+    return std::holds_alternative<
+               core::SimpleMovingAverageCalculation>(calculation)
+               ? "sma"
+               : "ema";
+}
+
+core::IndicatorCalculation ReadCalculation(const toml::table& table) {
+    const std::string value = ValueOr(
+        table, "kind", std::string{"sma"});
+    const auto period = static_cast<std::uint32_t>(
+        std::max<std::int64_t>(
+            0, ValueOr(table, "period", std::int64_t{20})));
+    if (value == "sma")
+        return core::SimpleMovingAverageCalculation{.period = period};
+    if (value == "ema")
+        return core::ExponentialMovingAverageCalculation{.period = period};
+    throw std::runtime_error("Unsupported indicator kind: " + value);
+}
+
+const char* BarFieldName(core::BarSeriesField field) {
+    switch (field) {
+        case core::BarSeriesField::Open: return "open";
+        case core::BarSeriesField::High: return "high";
+        case core::BarSeriesField::Low: return "low";
+        case core::BarSeriesField::Close: return "close";
+        case core::BarSeriesField::Volume: return "volume";
+    }
+    return "close";
+}
+
+core::BarSeriesField ReadBarField(const toml::table& table) {
+    const std::string value = ValueOr(
+        table, "input_bar_field",
+        ValueOr(table, "source", std::string{"close"}));
+    if (value == "open") return core::BarSeriesField::Open;
+    if (value == "high") return core::BarSeriesField::High;
+    if (value == "low") return core::BarSeriesField::Low;
+    if (value == "close") return core::BarSeriesField::Close;
+    if (value == "volume") return core::BarSeriesField::Volume;
+    throw std::runtime_error("Unsupported indicator bar input: " + value);
+}
+
+void WriteIndicators(std::ostringstream& output, std::string_view path,
+                     const std::vector<ChartIndicatorState>& indicators) {
+    for (const ChartIndicatorState& indicator : indicators) {
+        output << "[[" << path << "]]\n";
+        output << "id = " << Quote(indicator.definition.id) << '\n';
+        output << "kind = "
+               << Quote(CalculationName(indicator.definition.calculation))
+               << '\n';
+        std::visit(
+            [&](const auto& calculation) {
+                output << "period = " << calculation.period << '\n';
+            },
+            indicator.definition.calculation);
+        const core::IndicatorInput& input = std::visit(
+            [](const auto& calculation) -> const core::IndicatorInput& {
+                return calculation.input;
+            },
+            indicator.definition.calculation);
+        if (const auto* bar =
+                std::get_if<core::BarSeriesInput>(&input)) {
+            output << "input_type = \"bar\"\n";
+            output << "input_bar_field = "
+                   << Quote(BarFieldName(bar->field)) << '\n';
+        } else {
+            const auto& reference = std::get<core::IndicatorOutputInput>(
+                input);
+            output << "input_type = \"indicator\"\n";
+            output << "input_indicator_id = "
+                   << Quote(reference.indicator_id) << '\n';
+            output << "input_output_id = "
+                   << Quote(reference.output_id) << '\n';
+        }
+        output << "label = " << Quote(indicator.label) << '\n';
+        output << "visible = "
+               << (indicator.visible ? "true" : "false") << '\n';
+        output << "color_rgba = "
+               << static_cast<std::int64_t>(indicator.color_rgba) << '\n';
+        output << "line_width = " << indicator.line_width << "\n\n";
+    }
+}
+
+std::vector<ChartIndicatorState> ReadIndicators(const toml::table& table) {
+    std::vector<ChartIndicatorState> indicators;
+    const toml::array* values = table["indicators"].as_array();
+    if (values == nullptr) return indicators;
+    for (const toml::node& node : *values) {
+        const toml::table* value = node.as_table();
+        if (value == nullptr) continue;
+        ChartIndicatorState indicator;
+        indicator.definition.id = ValueOr(*value, "id", std::string{});
+        indicator.definition.calculation = ReadCalculation(*value);
+        const std::string input_type = ValueOr(
+            *value, "input_type", std::string{"bar"});
+        core::IndicatorInput input;
+        if (input_type == "bar") {
+            input = core::BarSeriesInput{ReadBarField(*value)};
+        } else if (input_type == "indicator") {
+            input = core::IndicatorOutputInput{
+                .indicator_id = ValueOr(
+                    *value, "input_indicator_id", std::string{}),
+                .output_id = ValueOr(
+                    *value, "input_output_id", std::string{"value"}),
+            };
+        } else {
+            throw std::runtime_error(
+                "Unsupported indicator input type: " + input_type);
+        }
+        std::visit(
+            [&](auto& calculation) {
+                calculation.input = std::move(input);
+            },
+            indicator.definition.calculation);
+        indicator.label = ValueOr(*value, "label", std::string{});
+        indicator.visible = ValueOr(*value, "visible", true);
+        indicator.color_rgba = static_cast<std::uint32_t>(ValueOr(
+            *value, "color_rgba",
+            static_cast<std::int64_t>(indicator.color_rgba)));
+        indicator.line_width =
+            ValueOr(*value, "line_width", indicator.line_width);
+        indicators.push_back(std::move(indicator));
+    }
+    return indicators;
+}
+
+const char* DrawingKindName(ChartDrawingKind kind) {
+    switch (kind) {
+        case ChartDrawingKind::HorizontalLine: return "horizontal_line";
+        case ChartDrawingKind::VerticalLine: return "vertical_line";
+        case ChartDrawingKind::TrendLine: return "trend_line";
+        case ChartDrawingKind::Ray: return "ray";
+        case ChartDrawingKind::Rectangle: return "rectangle";
+    }
+    return "trend_line";
+}
+
+ChartDrawingKind ReadDrawingKind(const toml::table& table) {
+    const std::string value = ValueOr(
+        table, "kind", std::string{"trend_line"});
+    if (value == "horizontal_line") return ChartDrawingKind::HorizontalLine;
+    if (value == "vertical_line") return ChartDrawingKind::VerticalLine;
+    if (value == "trend_line") return ChartDrawingKind::TrendLine;
+    if (value == "ray") return ChartDrawingKind::Ray;
+    if (value == "rectangle") return ChartDrawingKind::Rectangle;
+    throw std::runtime_error("Unsupported chart drawing kind: " + value);
+}
+
+core::Decimal ReadDecimal(const toml::table& table, std::string_view key) {
+    const std::string value = ValueOr(table, key, std::string{"0"});
+    const auto parsed = core::Decimal::Parse(value);
+    if (!parsed)
+        throw std::runtime_error(
+            "Invalid chart drawing decimal: " + parsed.error().message);
+    return *parsed;
+}
+
 }  // namespace
 
 std::string EncodeProfile(const WorkstationState& state) {
@@ -110,6 +309,21 @@ std::string EncodeProfile(const WorkstationState& state) {
     output << "quick_long_buying_power_percent = " << state.workspace.quick_long_buying_power_percent << '\n';
     output << "quick_short_buying_power_percent = " << state.workspace.quick_short_buying_power_percent << "\n\n";
 
+    const ChartDefaultsState& defaults = state.workspace.chart_defaults;
+    output << "[chart_defaults]\n";
+    output << "timeframe = " << Quote(defaults.timeframe) << '\n';
+    output << "feed = " << Quote(FeedName(defaults.feed)) << '\n';
+    output << "adjustment = "
+           << Quote(AdjustmentName(defaults.adjustment)) << '\n';
+    output << "visible_bars = " << defaults.visible_bars << '\n';
+    output << "show_volume = "
+           << (defaults.show_volume ? "true" : "false") << '\n';
+    output << "show_close_line = "
+           << (defaults.show_close_line ? "true" : "false") << '\n';
+    output << "show_crosshair = "
+           << (defaults.show_crosshair ? "true" : "false") << "\n\n";
+    WriteIndicators(output, "chart_defaults.indicators", defaults.indicators);
+
     for (const auto& [symbol, draft] : state.workspace.bracket_drafts) {
         output << "[bracket_drafts." << Key(symbol) << "]\n";
         output << "target_percent = " << draft.target_percent << '\n';
@@ -146,11 +360,48 @@ std::string EncodeProfile(const WorkstationState& state) {
         output << "id = " << Quote(chart.id) << '\n';
         output << "instrument_id = " << Quote(chart.instrument_id) << '\n';
         output << "symbol = " << Quote(chart.symbol) << '\n';
+        output << "ticker_input = " << Quote(chart.ticker_input) << '\n';
         output << "timeframe = " << Quote(chart.timeframe) << '\n';
+        output << "feed = " << Quote(FeedName(chart.feed)) << '\n';
+        output << "adjustment = "
+               << Quote(AdjustmentName(chart.adjustment)) << '\n';
         output << "visible_bars = " << chart.visible_bars << '\n';
         output << "show_volume = " << (chart.show_volume ? "true" : "false") << '\n';
         output << "show_close_line = " << (chart.show_close_line ? "true" : "false") << '\n';
-        output << "show_crosshair = " << (chart.show_crosshair ? "true" : "false") << "\n\n";
+        output << "show_crosshair = " << (chart.show_crosshair ? "true" : "false") << '\n';
+        output << "range_anchor_ns = " << chart.range_anchor_ns << "\n\n";
+        WriteIndicators(output, "charts.indicators", chart.indicators);
+    }
+
+    for (const IndicatorSuiteState& suite : state.workspace.indicator_suites) {
+        output << "[[indicator_suites]]\n";
+        output << "id = " << Quote(suite.id) << '\n';
+        output << "name = " << Quote(suite.name) << "\n\n";
+        WriteIndicators(
+            output, "indicator_suites.indicators", suite.indicators);
+    }
+
+    for (const ChartDrawingState& drawing : state.workspace.chart_drawings) {
+        output << "[[chart_drawings]]\n";
+        output << "id = " << Quote(drawing.id) << '\n';
+        output << "instrument_id = " << Quote(drawing.instrument_id) << '\n';
+        output << "kind = " << Quote(DrawingKindName(drawing.kind)) << '\n';
+        output << "first_time_ns = " << drawing.first.time_ns << '\n';
+        output << "first_price = " << Quote(drawing.first.price.ToString()) << '\n';
+        output << "has_second = "
+               << (drawing.second ? "true" : "false") << '\n';
+        output << "second_time_ns = "
+               << (drawing.second ? drawing.second->time_ns : 0) << '\n';
+        output << "second_price = "
+               << Quote(drawing.second
+                            ? drawing.second->price.ToString()
+                            : std::string{"0"}) << '\n';
+        output << "label = " << Quote(drawing.label) << '\n';
+        output << "visible = "
+               << (drawing.visible ? "true" : "false") << '\n';
+        output << "color_rgba = "
+               << static_cast<std::int64_t>(drawing.color_rgba) << '\n';
+        output << "line_width = " << drawing.line_width << "\n\n";
     }
 
     for (const OrderTicketState& ticket : state.workspace.order_tickets) {
@@ -211,6 +462,29 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
             state.workspace.quick_long_buying_power_percent = ValueOr(*workspace, "quick_long_buying_power_percent", 100.0f);
             state.workspace.quick_short_buying_power_percent = ValueOr(*workspace, "quick_short_buying_power_percent", 80.0f);
         }
+        if (const toml::table* defaults = root["chart_defaults"].as_table()) {
+            state.workspace.chart_defaults.timeframe = ValueOr(
+                *defaults, "timeframe",
+                state.workspace.chart_defaults.timeframe);
+            state.workspace.chart_defaults.feed = ReadFeed(
+                *defaults, state.workspace.chart_defaults.feed);
+            state.workspace.chart_defaults.adjustment = ReadAdjustment(
+                *defaults, state.workspace.chart_defaults.adjustment);
+            state.workspace.chart_defaults.visible_bars = ValueOr(
+                *defaults, "visible_bars",
+                state.workspace.chart_defaults.visible_bars);
+            state.workspace.chart_defaults.show_volume = ValueOr(
+                *defaults, "show_volume",
+                state.workspace.chart_defaults.show_volume);
+            state.workspace.chart_defaults.show_close_line = ValueOr(
+                *defaults, "show_close_line",
+                state.workspace.chart_defaults.show_close_line);
+            state.workspace.chart_defaults.show_crosshair = ValueOr(
+                *defaults, "show_crosshair",
+                state.workspace.chart_defaults.show_crosshair);
+            state.workspace.chart_defaults.indicators =
+                ReadIndicators(*defaults);
+        }
         state.workspace.bracket_drafts.clear();
         if (const toml::table* drafts = root["bracket_drafts"].as_table()) {
             for (const auto& [key, node] : *drafts) {
@@ -267,16 +541,67 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
             for (const toml::node& node : *charts) {
                 const toml::table* chart = node.as_table();
                 if (chart == nullptr) continue;
-                state.workspace.charts.push_back({
+                ChartDocumentState document{
                     .id = ValueOr(*chart, "id", std::string{}),
                     .instrument_id = ValueOr(*chart, "instrument_id", std::string{}),
                     .symbol = ValueOr(*chart, "symbol", std::string{}),
+                    .ticker_input = ValueOr(*chart, "ticker_input", std::string{}),
                     .timeframe = ValueOr(*chart, "timeframe", std::string{"1Min"}),
+                    .feed = ReadFeed(*chart, core::MarketDataFeed::Iex),
+                    .adjustment = ReadAdjustment(*chart, core::BarAdjustment::Raw),
                     .visible_bars = ValueOr(*chart, "visible_bars", 120),
                     .show_volume = ValueOr(*chart, "show_volume", true),
                     .show_close_line = ValueOr(*chart, "show_close_line", false),
                     .show_crosshair = ValueOr(*chart, "show_crosshair", true),
+                    .range_anchor_ns = ValueOr(
+                        *chart, "range_anchor_ns", std::int64_t{0}),
+                };
+                document.indicators = ReadIndicators(*chart);
+                state.workspace.charts.push_back(std::move(document));
+            }
+        }
+        state.workspace.indicator_suites.clear();
+        if (const toml::array* suites = root["indicator_suites"].as_array()) {
+            for (const toml::node& node : *suites) {
+                const toml::table* suite = node.as_table();
+                if (suite == nullptr) continue;
+                state.workspace.indicator_suites.push_back({
+                    .id = ValueOr(*suite, "id", std::string{}),
+                    .name = ValueOr(*suite, "name", std::string{}),
+                    .indicators = ReadIndicators(*suite),
                 });
+            }
+        }
+        state.workspace.chart_drawings.clear();
+        if (const toml::array* drawings = root["chart_drawings"].as_array()) {
+            for (const toml::node& node : *drawings) {
+                const toml::table* drawing = node.as_table();
+                if (drawing == nullptr) continue;
+                ChartDrawingState value{
+                    .id = ValueOr(*drawing, "id", std::string{}),
+                    .instrument_id = ValueOr(
+                        *drawing, "instrument_id", std::string{}),
+                    .kind = ReadDrawingKind(*drawing),
+                    .first = {
+                        .time_ns = ValueOr(
+                            *drawing, "first_time_ns", std::int64_t{0}),
+                        .price = ReadDecimal(*drawing, "first_price"),
+                    },
+                    .label = ValueOr(*drawing, "label", std::string{}),
+                    .visible = ValueOr(*drawing, "visible", true),
+                    .color_rgba = static_cast<std::uint32_t>(ValueOr(
+                        *drawing, "color_rgba",
+                        static_cast<std::int64_t>(0xd8d8d8ffU))),
+                    .line_width = ValueOr(*drawing, "line_width", 1.5f),
+                };
+                if (ValueOr(*drawing, "has_second", false)) {
+                    value.second = ChartDrawingAnchorState{
+                        .time_ns = ValueOr(
+                            *drawing, "second_time_ns", std::int64_t{0}),
+                        .price = ReadDecimal(*drawing, "second_price"),
+                    };
+                }
+                state.workspace.chart_drawings.push_back(std::move(value));
             }
         }
         state.workspace.order_tickets.clear();
@@ -316,4 +641,3 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
 }
 
 }  // namespace tradebox::workstation
-

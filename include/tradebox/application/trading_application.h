@@ -84,6 +84,7 @@ public:
                               const std::string& timeframe,
                               core::BarRange range);
     void RequestMarketHistory(core::HistoricalBarQuery query);
+    void RequestMarketHistory(const UiChartQuery& query);
     [[nodiscard]] std::future<core::TickSeries> RequestTicks(
         core::TickQuery query);
     void RefreshAssetCatalog();

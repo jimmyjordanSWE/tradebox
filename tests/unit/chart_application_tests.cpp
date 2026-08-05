@@ -1,0 +1,203 @@
+#include "tradebox/application/chart_query.h"
+#include "tradebox/application/history_request_tracker.h"
+#include "tradebox/application/trading_application.h"
+#include "tradebox/persistence/database.h"
+
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <filesystem>
+
+namespace {
+
+tradebox::core::BarSeriesKey Key(std::string timeframe = "1Min") {
+    return {
+        .instrument_id = "asset-aapl",
+        .feed = tradebox::core::MarketDataFeed::Iex,
+        .timeframe = std::move(timeframe),
+        .adjustment = tradebox::core::BarAdjustment::All,
+    };
+}
+
+class TemporaryDatabase {
+public:
+    TemporaryDatabase() {
+        const auto unique =
+            std::chrono::steady_clock::now().time_since_epoch().count();
+        directory = std::filesystem::temp_directory_path() /
+                    ("tradebox-chart-application-" +
+                     std::to_string(unique));
+        path = directory / "test.db";
+    }
+
+    ~TemporaryDatabase() {
+        std::error_code ignored;
+        std::filesystem::remove_all(directory, ignored);
+    }
+
+    std::filesystem::path directory;
+    std::filesystem::path path;
+};
+
+TEST(ChartRangePolicyTest, ResolvesDeterministicBoundedRange) {
+    constexpr std::int64_t minute_ns = 60LL * 1'000'000'000;
+    const auto result = tradebox::application::ResolveChartRange({
+        .document_id = "chart-1",
+        .key = Key(),
+        .symbol = "AAPL",
+        .anchor_ns = 1'000 * minute_ns,
+        .visible_bars = 100,
+    });
+
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(result->start_ns, 700 * minute_ns);
+    EXPECT_EQ(result->end_ns, 1'001 * minute_ns);
+}
+
+TEST(ChartRangePolicyTest, RejectsUnresolvedIdentityAndTimeframe) {
+    auto intent = tradebox::application::ChartViewportIntent{
+        .document_id = "chart-1",
+        .key = Key("unsupported"),
+        .symbol = "AAPL",
+        .anchor_ns = 1'000'000'000'000,
+    };
+    EXPECT_FALSE(tradebox::application::ResolveChartRange(intent));
+    intent.key = Key();
+    intent.key.instrument_id.clear();
+    EXPECT_FALSE(tradebox::application::ResolveChartRange(intent));
+}
+
+TEST(HistoryRequestTrackerTest, ReportsStatusForOverlappingQuery) {
+    tradebox::application::HistoryRequestTracker tracker;
+    tracker.Publish({
+        .key = Key(),
+        .range = {100, 200},
+        .state = tradebox::broker::HistoryRequestState::Loading,
+    });
+
+    const auto loading = tracker.StatusFor(Key(), {150, 250});
+    ASSERT_TRUE(loading);
+    EXPECT_EQ(loading->state,
+              tradebox::broker::HistoryRequestState::Loading);
+
+    tracker.Publish({
+        .key = Key(),
+        .range = {100, 200},
+        .state = tradebox::broker::HistoryRequestState::Failed,
+        .message = "provider unavailable",
+    });
+    const auto failed = tracker.StatusFor(Key(), {150, 250});
+    ASSERT_TRUE(failed);
+    EXPECT_EQ(failed->state,
+              tradebox::broker::HistoryRequestState::Failed);
+    EXPECT_EQ(failed->message, "provider unavailable");
+    EXPECT_FALSE(tracker.StatusFor(Key(), {200, 300}));
+
+    tracker.Publish({
+        .key = Key(),
+        .range = {125, 225},
+        .state = tradebox::broker::HistoryRequestState::Succeeded,
+    });
+    const auto recovered = tracker.StatusFor(Key(), {150, 175});
+    ASSERT_TRUE(recovered);
+    EXPECT_EQ(recovered->state,
+              tradebox::broker::HistoryRequestState::Succeeded);
+}
+
+TEST(ChartApplicationSnapshotTest, ExposesExplicitStatesAndAssetSearch) {
+    TemporaryDatabase temporary;
+    Database database;
+    std::string error;
+    ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+    database.SaveAssetCatalog({
+        {.symbol = "AAPL",
+         .name = "Apple Inc.",
+         .exchange = "NASDAQ",
+         .active = true,
+         .tradable = true,
+         .instrument_id = "asset-aapl"},
+    });
+    tradebox::application::TradingApplication application(database);
+    const tradebox::application::UiChartQuery missing{
+        .document_id = "chart-1",
+        .key = Key(),
+        .symbol = "AAPL",
+        .range = {0, 100},
+    };
+
+    auto snapshot = application.SnapshotForUi({
+        .charts = {missing},
+        .asset_search = "AAP",
+        .asset_limit = 5,
+    });
+    ASSERT_EQ(snapshot.charts.size(), 1U);
+    EXPECT_EQ(snapshot.charts.front().status,
+              tradebox::application::ChartDataStatus::Unavailable);
+    ASSERT_EQ(snapshot.assets.size(), 1U);
+    EXPECT_EQ(snapshot.assets.front().instrument_id, "asset-aapl");
+
+    application.RequestMarketHistory(missing);
+    snapshot = application.SnapshotForUi({.charts = {missing}});
+    EXPECT_EQ(snapshot.charts.front().status,
+              tradebox::application::ChartDataStatus::Failed);
+    EXPECT_TRUE(snapshot.charts.front().retryable);
+
+    const tradebox::core::BarRange covered{1'000, 2'000};
+    ASSERT_TRUE(database.StoreProviderBars({
+        .key = Key(),
+        .symbol = "AAPL",
+        .covered_range = covered,
+    }));
+    const tradebox::application::UiChartQuery empty{
+        .document_id = "chart-2",
+        .key = Key(),
+        .symbol = "AAPL",
+        .range = covered,
+    };
+    snapshot = application.SnapshotForUi({.charts = {empty}});
+    EXPECT_EQ(snapshot.charts.front().status,
+              tradebox::application::ChartDataStatus::Empty);
+
+    const auto ten = tradebox::core::Decimal::Parse("10");
+    const auto volume = tradebox::core::Decimal::Parse("500");
+    ASSERT_TRUE(ten && volume);
+    const tradebox::core::BarRange populated{3'000, 4'000};
+    ASSERT_TRUE(database.StoreProviderBars({
+        .key = Key(),
+        .symbol = "AAPL",
+        .bars = {{.start_ns = 3'000,
+                  .open = *ten,
+                  .high = *ten,
+                  .low = *ten,
+                  .close = *ten,
+                  .volume = *volume}},
+        .covered_range = populated,
+    }));
+    const tradebox::application::UiChartQuery calculated{
+        .document_id = "chart-3",
+        .key = Key(),
+        .symbol = "AAPL",
+        .range = populated,
+        .indicators = {
+            {.id = "volume",
+             .calculation =
+                 tradebox::core::SimpleMovingAverageCalculation{
+                     .input = tradebox::core::BarSeriesInput{
+                         tradebox::core::BarSeriesField::Volume},
+                     .period = 1}},
+            {.id = "volume-again",
+             .calculation =
+                 tradebox::core::SimpleMovingAverageCalculation{
+                     .input = tradebox::core::IndicatorOutputInput{
+                         "volume", "value"},
+                     .period = 1}},
+        },
+    };
+    snapshot = application.SnapshotForUi({.charts = {calculated}});
+    ASSERT_EQ(snapshot.charts.front().indicators.size(), 2U);
+    ASSERT_EQ(snapshot.charts.front().indicators.back().points.size(), 1U);
+    EXPECT_EQ(snapshot.charts.front().indicators.back().points.front().value,
+              *volume);
+}
+
+}  // namespace
