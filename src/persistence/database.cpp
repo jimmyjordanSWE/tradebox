@@ -694,37 +694,54 @@ CREATE TABLE IF NOT EXISTS provider_bar_coverage (
 );
 )SQL";
     if (!ExecuteMarket(market_schema, &error)) return false;
-    ExecuteMarket(
-        "ALTER TABLE market_tick_events ADD COLUMN instrument_id "
-        "TEXT NOT NULL DEFAULT ''",
-        nullptr);
-    ExecuteMarket(
-        "DROP INDEX IF EXISTS market_tick_events_series;"
-        "CREATE INDEX IF NOT EXISTS market_tick_events_series "
-        "ON market_tick_events("
-        "instrument_id,feed,event_time_ns);"
-        "CREATE UNIQUE INDEX IF NOT EXISTS market_tick_events_source "
-        "ON market_tick_events(feed,source_event_id) "
-        "WHERE source_event_id IS NOT NULL;"
-        "CREATE INDEX IF NOT EXISTS market_tick_events_corrections "
-        "ON market_tick_events(instrument_id,feed,event_time_ns) "
-        "WHERE kind IN ('x','c');"
-        "DROP INDEX IF EXISTS market_tick_coverage_lookup;"
-        "DROP INDEX IF EXISTS market_tick_coverage_v2_lookup;"
-        "DROP INDEX IF EXISTS provider_bars_range;",
-        nullptr);
-    ExecuteMarket(
-        "DROP INDEX IF EXISTS typed_market_ticks_series;"
-        "CREATE INDEX IF NOT EXISTS typed_market_ticks_series "
-        "ON typed_market_ticks("
-        "instrument_id,feed,event_time_ns);"
-        "CREATE UNIQUE INDEX IF NOT EXISTS typed_market_ticks_source "
-        "ON typed_market_ticks(feed,source_event_id) "
-        "WHERE source_event_id IS NOT NULL;"
-        "CREATE INDEX IF NOT EXISTS typed_market_ticks_corrections "
-        "ON typed_market_ticks(instrument_id,feed,event_time_ns) "
-        "WHERE kind IN ('x','c');",
-        nullptr);
+    // The market database can contain millions of ticks. These index changes
+    // are a one-time migration; dropping and rebuilding them on every launch
+    // makes startup scan the entire database repeatedly.
+    int market_schema_version = 0;
+    sqlite3_stmt* version_statement = nullptr;
+    if (sqlite3_prepare_v2(
+            market_db_, "PRAGMA user_version", -1,
+            &version_statement, nullptr) != SQLITE_OK) {
+        error = sqlite3_errmsg(market_db_);
+        return false;
+    }
+    if (sqlite3_step(version_statement) == SQLITE_ROW)
+        market_schema_version = sqlite3_column_int(version_statement, 0);
+    sqlite3_finalize(version_statement);
+    if (market_schema_version < 1) {
+        ExecuteMarket(
+            "ALTER TABLE market_tick_events ADD COLUMN instrument_id "
+            "TEXT NOT NULL DEFAULT ''",
+            nullptr);
+        ExecuteMarket(
+            "DROP INDEX IF EXISTS market_tick_events_series;"
+            "CREATE INDEX IF NOT EXISTS market_tick_events_series "
+            "ON market_tick_events("
+            "instrument_id,feed,event_time_ns);"
+            "CREATE UNIQUE INDEX IF NOT EXISTS market_tick_events_source "
+            "ON market_tick_events(feed,source_event_id) "
+            "WHERE source_event_id IS NOT NULL;"
+            "CREATE INDEX IF NOT EXISTS market_tick_events_corrections "
+            "ON market_tick_events(instrument_id,feed,event_time_ns) "
+            "WHERE kind IN ('x','c');"
+            "DROP INDEX IF EXISTS market_tick_coverage_lookup;"
+            "DROP INDEX IF EXISTS market_tick_coverage_v2_lookup;"
+            "DROP INDEX IF EXISTS provider_bars_range;",
+            nullptr);
+        ExecuteMarket(
+            "DROP INDEX IF EXISTS typed_market_ticks_series;"
+            "CREATE INDEX IF NOT EXISTS typed_market_ticks_series "
+            "ON typed_market_ticks("
+            "instrument_id,feed,event_time_ns);"
+            "CREATE UNIQUE INDEX IF NOT EXISTS typed_market_ticks_source "
+            "ON typed_market_ticks(feed,source_event_id) "
+            "WHERE source_event_id IS NOT NULL;"
+            "CREATE INDEX IF NOT EXISTS typed_market_ticks_corrections "
+            "ON typed_market_ticks(instrument_id,feed,event_time_ns) "
+            "WHERE kind IN ('x','c');",
+            nullptr);
+        if (!ExecuteMarket("PRAGMA user_version = 1", &error)) return false;
+    }
     writer_ = std::thread(&Database::WriterLoop, this);
     return true;
 }

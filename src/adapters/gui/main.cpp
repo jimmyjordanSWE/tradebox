@@ -12,8 +12,11 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -39,6 +42,19 @@ struct LaunchOptions {
     std::filesystem::path workspace_path;
     bool read_only_workspace = false;
 };
+
+struct DatabaseStartupResult {
+    std::unique_ptr<Database> database;
+    std::string error;
+};
+
+DatabaseStartupResult OpenDatabaseInBackground() {
+    auto database = std::make_unique<Database>();
+    std::string error;
+    if (!database->Open(error))
+        return {nullptr, std::move(error)};
+    return {std::move(database), {}};
+}
 
 bool CreateRenderTarget(Dx11Renderer& renderer) {
     ComPtr<ID3D11Texture2D> back_buffer;
@@ -162,21 +178,6 @@ int RunApplication(const LaunchOptions& options) {
     tradebox::workstation::WorkstationState workstation_state =
         *loaded_profile;
 
-    Database database;
-    std::string database_error;
-    if (!database.Open(database_error)) {
-        MessageBoxA(nullptr, database_error.c_str(), "Trade Box database error",
-                    MB_OK | MB_ICONERROR);
-        return 1;
-    }
-
-    UiEventQueue events;
-    tradebox::application::TradingApplication application(events, database);
-    // Keep the GUI dependent on the application-owned snapshot boundary while
-    // the visual surface is intentionally empty.
-    const tradebox::application::UiSnapshotQuery empty_query;
-    static_cast<void>(application.SnapshotForUi(empty_query));
-
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) return 1;
     const auto& native_window = workstation_state.native_window;
     const int initial_width = std::max(
@@ -209,6 +210,16 @@ int RunApplication(const LaunchOptions& options) {
     ImGui_ImplSDL3_InitForD3D(window);
     ImGui_ImplDX11_Init(renderer.device.Get(), renderer.context.Get());
 
+    // The window is usable before local database startup completes. In
+    // particular, opening a large market-data store or running a one-time
+    // migration must not block the first frame.
+    SDL_SetWindowTitle(window, "Trade Box - Loading local data...");
+    UiEventQueue events;
+    std::future<DatabaseStartupResult> database_startup = std::async(
+        std::launch::async, OpenDatabaseInBackground);
+    std::unique_ptr<Database> database;
+    std::unique_ptr<tradebox::application::TradingApplication> application;
+
     tradebox::ui::UiScaleController ui_scale;
     tradebox::ui::Workspace workspace;
     workspace.SetPersistentState(&workstation_state.workspace);
@@ -233,8 +244,29 @@ int RunApplication(const LaunchOptions& options) {
         }
         if (options.run_for_ms > 0 &&
             SDL_GetTicks() - started_at >=
-                static_cast<Uint64>(options.run_for_ms))
+            static_cast<Uint64>(options.run_for_ms))
             done = true;
+
+        if (!application && database_startup.wait_for(
+                std::chrono::milliseconds(0)) == std::future_status::ready) {
+            DatabaseStartupResult result = database_startup.get();
+            if (!result.error.empty()) {
+                MessageBoxA(nullptr, result.error.c_str(),
+                            "Trade Box database error",
+                            MB_OK | MB_ICONERROR);
+                done = true;
+            } else {
+                database = std::move(result.database);
+                application = std::make_unique<
+                    tradebox::application::TradingApplication>(
+                    events, *database);
+                // Keep the GUI dependent on the application-owned snapshot
+                // boundary while the visual surface is intentionally empty.
+                const tradebox::application::UiSnapshotQuery empty_query;
+                static_cast<void>(application->SnapshotForUi(empty_query));
+                SDL_SetWindowTitle(window, "Trade Box");
+            }
+        }
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplSDL3_NewFrame();
@@ -282,6 +314,21 @@ int RunApplication(const LaunchOptions& options) {
             renderer.render_target.Get(), clear_color);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         renderer.swap_chain->Present(1, 0);
+    }
+
+    // Ensure the background initializer has completed before its future and
+    // the database-owning objects leave scope.
+    if (!application && database_startup.valid()) {
+        DatabaseStartupResult result = database_startup.get();
+        if (!result.error.empty())
+            MessageBoxA(nullptr, result.error.c_str(),
+                        "Trade Box database error",
+                        MB_OK | MB_ICONERROR);
+        else {
+            database = std::move(result.database);
+            application = std::make_unique<
+                tradebox::application::TradingApplication>(events, *database);
+        }
     }
 
     CaptureNativeWindowState(window, workstation_state.native_window);
