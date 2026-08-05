@@ -36,6 +36,14 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(nlohmann_json)
 
 FetchContent_Declare(
+  tomlplusplus
+  GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
+  GIT_TAG v3.4.0
+  GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(tomlplusplus)
+
+FetchContent_Declare(
   rapidjson
   GIT_REPOSITORY https://github.com/Tencent/rapidjson.git
   GIT_TAG 24b5e7a8b27f42fa16b96fc70aade9106cf7102f
@@ -131,6 +139,22 @@ target_link_libraries(tradebox_platform PRIVATE crypt32 advapi32)
 tradebox_enable_windows_api(tradebox_platform)
 tradebox_enable_strict_warnings(tradebox_platform)
 
+add_library(tradebox_workstation STATIC
+  src/workstation/defaults.cpp
+  src/workstation/profile_codec.cpp
+  src/workstation/profile_lock.cpp
+  src/workstation/profile_store.cpp
+  src/workstation/validation.cpp
+)
+target_include_directories(tradebox_workstation PUBLIC include)
+target_compile_features(tradebox_workstation PUBLIC cxx_std_23)
+target_link_libraries(tradebox_workstation
+  PUBLIC tomlplusplus::tomlplusplus
+  PRIVATE shell32 ole32
+)
+tradebox_enable_windows_api(tradebox_workstation)
+tradebox_enable_strict_warnings(tradebox_workstation)
+
 add_library(tradebox_broker_alpaca STATIC
   src/broker/alpaca/alpaca_account_activity.cpp
   src/broker/alpaca/alpaca_auth.cpp
@@ -173,6 +197,7 @@ tradebox_enable_strict_warnings(tradebox_application)
 
 add_executable(tradebox_gui WIN32
   src/adapters/gui/main.cpp
+  src/adapters/gui/workspace.cpp
 )
 set_target_properties(tradebox_gui PROPERTIES OUTPUT_NAME TradeBoxNative)
 target_compile_features(tradebox_gui PRIVATE cxx_std_23)
@@ -184,6 +209,7 @@ target_compile_definitions(tradebox_gui PRIVATE
 target_link_libraries(tradebox_gui PRIVATE
   tradebox_application
   tradebox_persistence
+  tradebox_workstation
   imgui
   SDL3::SDL3-static
   d3d11
@@ -248,6 +274,18 @@ if(BUILD_TESTING)
   )
   tradebox_enable_strict_warnings(tradebox_order_pipeline_tests)
   gtest_discover_tests(tradebox_order_pipeline_tests)
+
+  add_executable(tradebox_workstation_tests
+    tests/unit/workstation_state_tests.cpp
+  )
+  target_compile_features(tradebox_workstation_tests PRIVATE cxx_std_23)
+  target_link_libraries(tradebox_workstation_tests PRIVATE
+    tradebox_workstation
+    GTest::gtest_main
+  )
+  tradebox_enable_windows_api(tradebox_workstation_tests)
+  tradebox_enable_strict_warnings(tradebox_workstation_tests)
+  gtest_discover_tests(tradebox_workstation_tests)
 
   set(TRADEBOX_REPLAY_CORPUS
     ${CMAKE_CURRENT_BINARY_DIR}/testdata/alpaca_market_stream_10x10000.jsonl

@@ -1,6 +1,9 @@
 #include "tradebox/application/trading_application.h"
 #include "tradebox/persistence/database.h"
 #include "tradebox/ui/model.h"
+#include "tradebox/ui/workspace.h"
+#include "tradebox/workstation/profile_codec.h"
+#include "tradebox/workstation/profile_store.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -10,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <string_view>
 
@@ -32,6 +36,8 @@ struct Dx11Renderer {
 
 struct LaunchOptions {
     int run_for_ms = 0;
+    std::filesystem::path workspace_path;
+    bool read_only_workspace = false;
 };
 
 bool CreateRenderTarget(Dx11Renderer& renderer) {
@@ -102,14 +108,60 @@ bool CreateRenderer(SDL_Window* window, Dx11Renderer& renderer) {
 LaunchOptions ParseLaunchOptions(int argc, char* argv[]) {
     LaunchOptions options;
     for (int index = 1; index < argc; ++index) {
-        if (std::string_view(argv[index]) == "--run-for-ms" &&
-            index + 1 < argc)
+        const std::string_view argument = argv[index];
+        if (argument == "--run-for-ms" && index + 1 < argc) {
             options.run_for_ms = std::max(0, std::atoi(argv[++index]));
+        } else if (argument == "--workspace" && index + 1 < argc) {
+            options.workspace_path = std::filesystem::path(argv[++index]);
+        } else if (argument == "--read-only") {
+            options.read_only_workspace = true;
+        }
     }
     return options;
 }
 
+void CaptureNativeWindowState(
+    SDL_Window* window,
+    tradebox::workstation::NativeWindowState& state) {
+    const SDL_WindowFlags flags = SDL_GetWindowFlags(window);
+    state.maximized = (flags & SDL_WINDOW_MAXIMIZED) != 0;
+    if (state.maximized || (flags & SDL_WINDOW_MINIMIZED) != 0) return;
+
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+    if (SDL_GetWindowPosition(window, &x, &y) &&
+        SDL_GetWindowSize(window, &width, &height)) {
+        state.bounds = {static_cast<float>(x), static_cast<float>(y),
+                        static_cast<float>(width),
+                        static_cast<float>(height)};
+    }
+}
+
 int RunApplication(const LaunchOptions& options) {
+    tradebox::workstation::ProfileStore profile_store;
+    const std::filesystem::path profile_path =
+        options.workspace_path.empty()
+            ? tradebox::workstation::ProfileStore::DefaultProfilePath()
+            : options.workspace_path;
+    const bool profile_existed = std::filesystem::exists(profile_path);
+    std::string profile_error;
+    if (!profile_store.Open(profile_path, options.read_only_workspace,
+                            profile_error)) {
+        MessageBoxA(nullptr, profile_error.c_str(),
+                    "Trade Box profile error", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    const auto loaded_profile = profile_store.Load(profile_path);
+    if (!loaded_profile) {
+        MessageBoxA(nullptr, loaded_profile.error().c_str(),
+                    "Trade Box profile error", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    tradebox::workstation::WorkstationState workstation_state =
+        *loaded_profile;
+
     Database database;
     std::string database_error;
     if (!database.Open(database_error)) {
@@ -126,13 +178,22 @@ int RunApplication(const LaunchOptions& options) {
     static_cast<void>(application.SnapshotForUi(empty_query));
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) return 1;
+    const auto& native_window = workstation_state.native_window;
+    const int initial_width = std::max(
+        640, static_cast<int>(native_window.bounds.width));
+    const int initial_height = std::max(
+        480, static_cast<int>(native_window.bounds.height));
     SDL_Window* window = SDL_CreateWindow(
-        "Trade Box", 960, 640,
+        "Trade Box", initial_width, initial_height,
         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) {
         SDL_Quit();
         return 1;
     }
+    SDL_SetWindowPosition(window,
+                          static_cast<int>(native_window.bounds.x),
+                          static_cast<int>(native_window.bounds.y));
+    if (native_window.maximized) SDL_MaximizeWindow(window);
 
     Dx11Renderer renderer;
     if (!CreateRenderer(window, renderer)) {
@@ -147,6 +208,18 @@ int RunApplication(const LaunchOptions& options) {
     ImGui::GetIO().IniFilename = nullptr;
     ImGui_ImplSDL3_InitForD3D(window);
     ImGui_ImplDX11_Init(renderer.device.Get(), renderer.context.Get());
+
+    tradebox::ui::UiScaleController ui_scale;
+    tradebox::ui::Workspace workspace;
+    workspace.SetPersistentState(&workstation_state.workspace);
+    workspace.SetSnapPixels(
+        workstation_state.application.window_snap_pixels);
+    workspace.SetUiScale(workstation_state.application.ui_scale);
+    ui_scale.SetScale(workstation_state.application.ui_scale);
+    ui_scale.CaptureBaseline();
+    if (!profile_existed) profile_store.MarkDirty();
+    std::string last_profile_snapshot =
+        tradebox::workstation::EncodeProfile(workstation_state);
 
     const Uint64 started_at = SDL_GetTicks();
     bool done = false;
@@ -166,7 +239,33 @@ int RunApplication(const LaunchOptions& options) {
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
-        // Intentionally no windows, menus, controls, or overlays yet.
+
+        if (ui_scale.HandleShortcuts()) {
+            workspace.SetUiScale(ui_scale.Scale());
+            workstation_state.application.ui_scale = ui_scale.Scale();
+        }
+        const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        workspace.BeginFrame(viewport->Pos, viewport->Size, false);
+        // Intentionally no windows, menus, controls, or overlays yet. New
+        // surfaces should be created through Workspace so their state enters
+        // the active .tbw profile automatically.
+        workspace.EndFrame();
+
+        CaptureNativeWindowState(window, workstation_state.native_window);
+        workstation_state.application.window_snap_pixels =
+            workspace.SnapPixels();
+        const std::string profile_snapshot =
+            tradebox::workstation::EncodeProfile(workstation_state);
+        if (profile_snapshot != last_profile_snapshot) {
+            profile_store.MarkDirty();
+            last_profile_snapshot = profile_snapshot;
+        }
+        std::string save_error;
+        if (!profile_store.FlushIfDue(workstation_state, save_error)) {
+            MessageBoxA(nullptr, save_error.c_str(),
+                        "Trade Box profile error", MB_OK | MB_ICONERROR);
+            done = true;
+        }
         ImGui::Render();
 
         int width = 0;
@@ -183,6 +282,13 @@ int RunApplication(const LaunchOptions& options) {
             renderer.render_target.Get(), clear_color);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         renderer.swap_chain->Present(1, 0);
+    }
+
+    CaptureNativeWindowState(window, workstation_state.native_window);
+    std::string flush_error;
+    if (!profile_store.Flush(workstation_state, flush_error)) {
+        MessageBoxA(nullptr, flush_error.c_str(),
+                    "Trade Box profile error", MB_OK | MB_ICONERROR);
     }
 
     ImGui_ImplDX11_Shutdown();
