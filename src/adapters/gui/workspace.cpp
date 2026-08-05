@@ -11,6 +11,14 @@ bool Different(ImVec2 left, ImVec2 right) {
            std::fabs(left.y - right.y) > 0.01f;
 }
 
+bool Different(const workstation::LogicalRect& left,
+               const workstation::LogicalRect& right) {
+    return std::fabs(left.x - right.x) > 0.25f ||
+           std::fabs(left.y - right.y) > 0.25f ||
+           std::fabs(left.width - right.width) > 0.25f ||
+           std::fabs(left.height - right.height) > 0.25f;
+}
+
 bool IsResizeCursor(ImGuiMouseCursor cursor) {
     return cursor == ImGuiMouseCursor_ResizeNS ||
            cursor == ImGuiMouseCursor_ResizeEW ||
@@ -66,9 +74,19 @@ void Workspace::BeginFrame(ImVec2 work_position, ImVec2 work_size,
 
 void Workspace::EndFrame() {}
 
-void Workspace::SetUiScale(float scale) { ui_scale_ = std::clamp(scale, 0.70f, 2.00f); }
+void Workspace::SetUiScale(float scale) {
+    const float next_scale = std::clamp(scale, 0.70f, 2.00f);
+    if (std::fabs(ui_scale_ - next_scale) <= 0.001f) return;
+    ui_scale_ = next_scale;
+    dirty_ = true;
+}
 
-void Workspace::SetSnapPixels(int pixels) { snap_pixels_ = std::clamp(pixels, 1, 1000); }
+void Workspace::SetSnapPixels(int pixels) {
+    const int next_pixels = std::clamp(pixels, 1, 1000);
+    if (snap_pixels_ == next_pixels) return;
+    snap_pixels_ = next_pixels;
+    dirty_ = true;
+}
 
 void Workspace::ConstrainNextWindowSize(ImVec2 minimum, ImVec2 maximum) {
     ImGui::SetNextWindowSizeConstraints(minimum, maximum);
@@ -81,16 +99,34 @@ bool Workspace::BeginWindow(WorkspaceWindow& window) {
 
 bool Workspace::BeginWindow(std::string_view id, std::string_view title, bool* open,
                             ImVec2 default_offset, ImVec2 default_size) {
-    if (open == nullptr || !*open) return false;
+    if (open == nullptr) return false;
+    if (!*open) {
+        if (persistent_state_ != nullptr) {
+            if (auto found = persistent_state_->windows.find(std::string(id));
+                found != persistent_state_->windows.end() && found->second.open) {
+                found->second.open = false;
+                dirty_ = true;
+            }
+        }
+        return false;
+    }
     workstation::WindowInstanceState local{
         .id = std::string(id), .kind = "tool", .title = std::string(title), .open = *open,
         .bounds = {default_offset.x, default_offset.y, default_size.x, default_size.y}};
     workstation::WindowInstanceState* state = &local;
     if (persistent_state_ != nullptr) {
         auto [found, inserted] = persistent_state_->windows.try_emplace(std::string(id), local);
+        if (inserted) dirty_ = true;
         state = &found->second;
-        state->title = std::string(title);
-        state->open = *open;
+        const std::string next_title(title);
+        if (state->title != next_title) {
+            state->title = next_title;
+            dirty_ = true;
+        }
+        if (state->open != *open) {
+            state->open = *open;
+            dirty_ = true;
+        }
     }
     if (!state->open) return false;
     ImGui::SetNextWindowPos(
@@ -100,7 +136,9 @@ bool Workspace::BeginWindow(std::string_view id, std::string_view title, bool* o
                                     state->bounds.height * ui_scale_),
                              ImGuiCond_FirstUseEver);
     const std::string label = std::string(title) + "###" + std::string(id);
+    const bool open_before = state->open;
     const bool visible = ImGui::Begin(label.c_str(), &state->open);
+    if (state->open != open_before) dirty_ = true;
     *open = state->open;
     return visible;
 }
@@ -112,9 +150,15 @@ void Workspace::EndWindow(std::string_view id) {
             const ImVec2 position = ImGui::GetWindowPos();
             const ImVec2 size = ImGui::GetWindowSize();
             auto& state = found->second;
-            state.bounds = {(position.x - work_position_.x) / ui_scale_,
-                            (position.y - work_position_.y) / ui_scale_,
-                            size.x / ui_scale_, size.y / ui_scale_};
+            const workstation::LogicalRect next_bounds{
+                (position.x - work_position_.x) / ui_scale_,
+                (position.y - work_position_.y) / ui_scale_,
+                size.x / ui_scale_,
+                size.y / ui_scale_};
+            if (Different(state.bounds, next_bounds)) {
+                state.bounds = next_bounds;
+                dirty_ = true;
+            }
         }
     }
     ImGui::End();
@@ -127,10 +171,19 @@ void Workspace::EndWindow(WorkspaceWindow& window) {
         auto found = persistent_state_->windows.find(window.id);
         if (found != persistent_state_->windows.end()) {
             auto& state = found->second;
-            state.bounds = {(position.x - work_position_.x) / ui_scale_,
-                            (position.y - work_position_.y) / ui_scale_,
-                            size.x / ui_scale_, size.y / ui_scale_};
-            state.open = window.open;
+            const workstation::LogicalRect next_bounds{
+                (position.x - work_position_.x) / ui_scale_,
+                (position.y - work_position_.y) / ui_scale_,
+                size.x / ui_scale_,
+                size.y / ui_scale_};
+            if (Different(state.bounds, next_bounds)) {
+                state.bounds = next_bounds;
+                dirty_ = true;
+            }
+            if (state.open != window.open) {
+                state.open = window.open;
+                dirty_ = true;
+            }
         }
     }
     ImGui::End();
@@ -148,8 +201,11 @@ void Workspace::ResetAll() {
         if (const auto default_window = defaults.find(id);
             default_window != defaults.end()) {
             const bool open = window.open;
-            window.bounds = default_window->second.bounds;
-            window.open = open;
+            if (Different(window.bounds, default_window->second.bounds)) {
+                window.bounds = default_window->second.bounds;
+                dirty_ = true;
+            }
+            if (window.open != open) window.open = open;
         }
     }
 }
@@ -168,4 +224,3 @@ ImVec2 Workspace::SnapPosition(ImVec2 position, ImVec2 window_size) const {
 }
 
 }  // namespace tradebox::ui
-

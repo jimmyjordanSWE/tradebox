@@ -68,6 +68,13 @@ public:
     void ResetWindow(WorkspaceWindow& window);
     void ResetAll();
 
+    void MarkDirty() { dirty_ = true; }
+    [[nodiscard]] bool ConsumeDirty() {
+        const bool dirty = dirty_;
+        dirty_ = false;
+        return dirty;
+    }
+
     [[nodiscard]] int SnapPixels() const { return snap_pixels_; }
 
 private:
@@ -79,8 +86,8 @@ private:
     int snap_pixels_ = 10;
     bool snap_enabled_ = true;
     float ui_scale_ = 1.0f;
+    bool dirty_ = false;
     workstation::WorkspaceState* persistent_state_ = nullptr;
 };
 
 }  // namespace tradebox::ui
-

@@ -2,7 +2,6 @@
 #include "tradebox/persistence/database.h"
 #include "tradebox/ui/model.h"
 #include "tradebox/ui/workspace.h"
-#include "tradebox/workstation/profile_codec.h"
 #include "tradebox/workstation/profile_store.h"
 
 #include <SDL3/SDL.h>
@@ -12,6 +11,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -136,12 +136,15 @@ LaunchOptions ParseLaunchOptions(int argc, char* argv[]) {
     return options;
 }
 
-void CaptureNativeWindowState(
+bool CaptureNativeWindowState(
     SDL_Window* window,
     tradebox::workstation::NativeWindowState& state) {
     const SDL_WindowFlags flags = SDL_GetWindowFlags(window);
-    state.maximized = (flags & SDL_WINDOW_MAXIMIZED) != 0;
-    if (state.maximized || (flags & SDL_WINDOW_MINIMIZED) != 0) return;
+    const bool maximized = (flags & SDL_WINDOW_MAXIMIZED) != 0;
+    bool changed = state.maximized != maximized;
+    state.maximized = maximized;
+    if (state.maximized || (flags & SDL_WINDOW_MINIMIZED) != 0)
+        return changed;
 
     int x = 0;
     int y = 0;
@@ -149,10 +152,17 @@ void CaptureNativeWindowState(
     int height = 0;
     if (SDL_GetWindowPosition(window, &x, &y) &&
         SDL_GetWindowSize(window, &width, &height)) {
-        state.bounds = {static_cast<float>(x), static_cast<float>(y),
-                        static_cast<float>(width),
-                        static_cast<float>(height)};
+        const tradebox::workstation::LogicalRect next_bounds{
+            static_cast<float>(x), static_cast<float>(y),
+            static_cast<float>(width), static_cast<float>(height)};
+        changed = changed ||
+                  std::fabs(state.bounds.x - next_bounds.x) > 0.25f ||
+                  std::fabs(state.bounds.y - next_bounds.y) > 0.25f ||
+                  std::fabs(state.bounds.width - next_bounds.width) > 0.25f ||
+                  std::fabs(state.bounds.height - next_bounds.height) > 0.25f;
+        state.bounds = next_bounds;
     }
+    return changed;
 }
 
 int RunApplication(const LaunchOptions& options) {
@@ -228,9 +238,8 @@ int RunApplication(const LaunchOptions& options) {
     workspace.SetUiScale(workstation_state.application.ui_scale);
     ui_scale.SetScale(workstation_state.application.ui_scale);
     ui_scale.CaptureBaseline();
+    static_cast<void>(workspace.ConsumeDirty());
     if (!profile_existed) profile_store.MarkDirty();
-    std::string last_profile_snapshot =
-        tradebox::workstation::EncodeProfile(workstation_state);
 
     const Uint64 started_at = SDL_GetTicks();
     bool done = false;
@@ -283,15 +292,15 @@ int RunApplication(const LaunchOptions& options) {
         // the active .tbw profile automatically.
         workspace.EndFrame();
 
-        CaptureNativeWindowState(window, workstation_state.native_window);
-        workstation_state.application.window_snap_pixels =
-            workspace.SnapPixels();
-        const std::string profile_snapshot =
-            tradebox::workstation::EncodeProfile(workstation_state);
-        if (profile_snapshot != last_profile_snapshot) {
+        const bool native_window_changed =
+            CaptureNativeWindowState(window, workstation_state.native_window);
+        const int snap_pixels = workspace.SnapPixels();
+        const bool snap_pixels_changed =
+            workstation_state.application.window_snap_pixels != snap_pixels;
+        workstation_state.application.window_snap_pixels = snap_pixels;
+        const bool workspace_changed = workspace.ConsumeDirty();
+        if (native_window_changed || snap_pixels_changed || workspace_changed)
             profile_store.MarkDirty();
-            last_profile_snapshot = profile_snapshot;
-        }
         std::string save_error;
         if (!profile_store.FlushIfDue(workstation_state, save_error)) {
             MessageBoxA(nullptr, save_error.c_str(),

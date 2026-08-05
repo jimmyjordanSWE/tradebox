@@ -277,10 +277,13 @@ if(BUILD_TESTING)
 
   add_executable(tradebox_workstation_tests
     tests/unit/workstation_state_tests.cpp
+    tests/unit/workspace_dirty_tests.cpp
+    src/adapters/gui/workspace.cpp
   )
   target_compile_features(tradebox_workstation_tests PRIVATE cxx_std_23)
   target_link_libraries(tradebox_workstation_tests PRIVATE
     tradebox_workstation
+    imgui
     GTest::gtest_main
   )
   tradebox_enable_windows_api(tradebox_workstation_tests)
