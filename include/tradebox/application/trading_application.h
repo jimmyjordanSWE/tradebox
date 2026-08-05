@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 class Database;
@@ -22,6 +23,7 @@ namespace tradebox::application {
 
 struct ConnectionRequest {
     core::AccountEnvironment environment = core::AccountEnvironment::Paper;
+    std::string credential_slot;
     std::string api_key;
     std::string api_secret;
     std::vector<std::string> market_symbols;
@@ -64,6 +66,16 @@ public:
         std::size_t maximum_series = 512) const;
     [[nodiscard]] std::expected<core::CommandReceipt, core::CoreError>
     Connect(ConnectionRequest request);
+    [[nodiscard]] bool HasSavedCredentials(
+        std::string_view credential_slot,
+        core::AccountEnvironment environment) const;
+    [[nodiscard]] std::expected<void, std::string> SaveCredentials(
+        std::string_view credential_slot,
+        core::AccountEnvironment environment, std::string api_key,
+        std::string api_secret);
+    [[nodiscard]] std::expected<void, std::string> ForgetCredentials(
+        std::string_view credential_slot,
+        core::AccountEnvironment environment);
     [[nodiscard]] std::expected<core::CommandReceipt, core::CoreError>
     Disconnect();
     [[nodiscard]] std::future<core::OrderCommandResult> SubmitOrder(

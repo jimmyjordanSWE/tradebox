@@ -71,6 +71,7 @@ target_compile_definitions(sqlite3 PRIVATE
 
 add_library(imgui STATIC
   ${dear_imgui_SOURCE_DIR}/imgui.cpp
+  ${dear_imgui_SOURCE_DIR}/imgui_demo.cpp
   ${dear_imgui_SOURCE_DIR}/imgui_draw.cpp
   ${dear_imgui_SOURCE_DIR}/imgui_tables.cpp
   ${dear_imgui_SOURCE_DIR}/imgui_widgets.cpp
@@ -203,8 +204,12 @@ target_link_libraries(tradebox_application
 tradebox_enable_strict_warnings(tradebox_application)
 
 add_executable(tradebox_gui WIN32
+  src/adapters/gui/account_popup.cpp
+  src/adapters/gui/application_chrome.cpp
   src/adapters/gui/chart_geometry.cpp
   src/adapters/gui/chart_window.cpp
+  src/adapters/gui/gui_controls.cpp
+  src/adapters/gui/gui_support.cpp
   src/adapters/gui/main.cpp
   src/adapters/gui/workspace.cpp
 )
@@ -276,6 +281,7 @@ if(BUILD_TESTING)
     tests/unit/alpaca_polling_policy_tests.cpp
     tests/unit/alpaca_rest_transport_tests.cpp
     tests/unit/alpaca_stream_supervision_tests.cpp
+    tests/unit/credential_store_tests.cpp
     tests/unit/database_order_command_journal_tests.cpp
     tests/unit/order_execution_service_tests.cpp
   )
@@ -283,11 +289,13 @@ if(BUILD_TESTING)
   target_link_libraries(tradebox_order_pipeline_tests PRIVATE
     tradebox_application
     tradebox_broker_alpaca
+    tradebox_platform
     tradebox_persistence
     nlohmann_json::nlohmann_json
     GTest::gtest_main
   )
   tradebox_enable_strict_warnings(tradebox_order_pipeline_tests)
+  tradebox_enable_windows_api(tradebox_order_pipeline_tests)
   gtest_discover_tests(tradebox_order_pipeline_tests)
 
   add_executable(tradebox_workstation_tests

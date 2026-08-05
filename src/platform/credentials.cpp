@@ -25,7 +25,10 @@ std::wstring Target(std::string_view slot, bool paper) {
             character == '_')
             safe_slot += character;
     }
-    return L"TradeBoxNative/Alpaca/Slot/" + Wide(safe_slot);
+    std::wstring target = L"TradeBoxNative/Alpaca/Slot/";
+    target += paper ? L"Paper/" : L"Live/";
+    target += Wide(safe_slot);
+    return target;
 }
 
 std::wstring Wide(const std::string& value) {
@@ -91,6 +94,15 @@ bool CredentialStore::Load(std::string_view slot, bool paper,
         SecureZeroMemory(value->CredentialBlob, value->CredentialBlobSize);
     CredFree(value);
     credentials = std::move(loaded);
+    return true;
+}
+
+bool CredentialStore::Exists(std::string_view slot, bool paper) {
+    PCREDENTIALW value = nullptr;
+    const std::wstring target = Target(slot, paper);
+    if (!CredReadW(target.c_str(), CRED_TYPE_GENERIC, 0, &value))
+        return false;
+    CredFree(value);
     return true;
 }
 

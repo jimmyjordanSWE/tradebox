@@ -385,6 +385,29 @@ core::ChangedBarSeriesBatch TradingApplication::ChangedBarSeries(
 
 std::expected<core::CommandReceipt, core::CoreError>
 TradingApplication::Connect(ConnectionRequest request) {
+    const bool missing_key = request.api_key.empty();
+    const bool missing_secret = request.api_secret.empty();
+    if (missing_key != missing_secret) {
+        return std::unexpected(core::CoreError{
+            .code = core::CoreErrorCode::InvalidCommand,
+            .message = "Both broker credential fields are required",
+        });
+    }
+    if (missing_key) {
+        AlpacaCredentials saved;
+        std::string credential_error;
+        const bool paper =
+            request.environment == core::AccountEnvironment::Paper;
+        if (!CredentialStore::Load(request.credential_slot, paper, saved,
+                                   credential_error)) {
+            return std::unexpected(core::CoreError{
+                .code = core::CoreErrorCode::InvalidCommand,
+                .message = credential_error,
+            });
+        }
+        request.api_key = std::move(saved.key);
+        request.api_secret = std::move(saved.secret);
+    }
     auto receipt = impl_->core.Submit(
         core::ConnectAccount{request.environment});
     if (!receipt || !receipt->accepted) return receipt;
@@ -399,6 +422,37 @@ TradingApplication::Connect(ConnectionRequest request) {
                           request.market_data_feed);
     impl_->broker.RequestAssetCatalog();
     return receipt;
+}
+
+bool TradingApplication::HasSavedCredentials(
+    std::string_view credential_slot,
+    core::AccountEnvironment environment) const {
+    return CredentialStore::Exists(
+        credential_slot, environment == core::AccountEnvironment::Paper);
+}
+
+std::expected<void, std::string> TradingApplication::SaveCredentials(
+    std::string_view credential_slot, core::AccountEnvironment environment,
+    std::string api_key, std::string api_secret) {
+    if (api_key.empty() || api_secret.empty())
+        return std::unexpected("Both broker credential fields are required");
+    AlpacaCredentials credentials(
+        std::move(api_key), std::move(api_secret),
+        environment == core::AccountEnvironment::Paper);
+    std::string error;
+    if (!CredentialStore::Save(credential_slot, credentials, error))
+        return std::unexpected(std::move(error));
+    return {};
+}
+
+std::expected<void, std::string> TradingApplication::ForgetCredentials(
+    std::string_view credential_slot, core::AccountEnvironment environment) {
+    std::string error;
+    if (!CredentialStore::Delete(
+            credential_slot, environment == core::AccountEnvironment::Paper,
+            error))
+        return std::unexpected(std::move(error));
+    return {};
 }
 
 std::expected<core::CommandReceipt, core::CoreError>

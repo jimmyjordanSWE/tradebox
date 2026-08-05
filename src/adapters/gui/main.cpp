@@ -6,6 +6,9 @@
 #include "tradebox/workstation/profile_store.h"
 
 #include "chart_window.h"
+#include "account_popup.h"
+#include "application_chrome.h"
+#include "gui_support.h"
 #include "native_chrome_layout.h"
 
 #include <SDL3/SDL.h>
@@ -33,6 +36,14 @@
 namespace {
 
 using Microsoft::WRL::ComPtr;
+using tradebox::gui::AccountPopupAction;
+using tradebox::gui::AccountPopupState;
+using tradebox::gui::ChromeActions;
+using tradebox::gui::ChromeMetrics;
+using tradebox::gui::DrawApplicationChrome;
+using tradebox::gui::DrawImGuiDemo;
+using tradebox::gui::GuiFonts;
+using tradebox::gui::ConfigureImGuiStyle;
 
 constexpr float kRegularFontSize = 18.0f;
 constexpr float kTitleFontSize = 20.0f;
@@ -54,25 +65,6 @@ struct LaunchOptions {
     bool read_only_workspace = false;
 };
 
-enum class AccountPopupAction {
-    None,
-    Connect,
-    Disconnect,
-};
-
-struct AccountPopupState {
-    std::array<char, 256> api_key{};
-    std::array<char, 256> api_secret{};
-    bool paper = true;
-    bool initialized = false;
-    std::string message;
-};
-
-struct ChromeActions {
-    AccountPopupAction account = AccountPopupAction::None;
-    bool new_chart = false;
-};
-
 struct DatabaseStartupResult {
     std::unique_ptr<Database> database;
     std::string error;
@@ -83,20 +75,6 @@ struct MarketTimeZone {
     bool available = false;
 };
 
-struct ChromeMetrics {
-    int title_bar_height = 35;
-    int control_width = 46;
-    int tool_width = 40;
-    int interactive_left_width = 0;
-};
-
-struct GuiFonts {
-    ImFont* regular = nullptr;
-    ImFont* title = nullptr;
-    ImFont* icons = nullptr;
-    std::array<ImWchar, 7> icon_ranges{
-        0xe8b8, 0xe8b8, 0xf20b, 0xf20b, 0xe145, 0xe145, 0};
-};
 
 DatabaseStartupResult OpenDatabaseInBackground() {
     auto database = std::make_unique<Database>();
@@ -271,357 +249,6 @@ SDL_HitTestResult SDLCALL HitTestChrome(
     return SDL_HITTEST_NORMAL;
 }
 
-enum class ChromeButtonSymbol {
-    Minimize,
-    Maximize,
-    Restore,
-    Close,
-};
-
-void DrawChromeButtonSymbol(
-    ImDrawList& draw_list, const ImVec2& button_min, const ImVec2& button_size,
-    ChromeButtonSymbol symbol, ImU32 color) {
-    constexpr float kSymbolSize = 10.0f;
-    constexpr float kStrokeWidth = 1.0f;
-    constexpr float kCornerRadius = 1.5f;
-    constexpr float kSeparation = 2.0f;
-    const float left = std::floor(
-        button_min.x + (button_size.x - kSymbolSize) * 0.5f) + 0.5f;
-    const float top = std::floor(
-        button_min.y + (button_size.y - kSymbolSize) * 0.5f) + 0.5f;
-    const float right = left + kSymbolSize - 1.0f;
-    const float bottom = top + kSymbolSize - 1.0f;
-
-    switch (symbol) {
-        case ChromeButtonSymbol::Minimize: {
-            const float middle = std::floor((top + bottom) * 0.5f) + 0.5f;
-            draw_list.AddLine({left, middle}, {right, middle}, color,
-                              kStrokeWidth);
-            break;
-        }
-        case ChromeButtonSymbol::Maximize:
-            draw_list.AddRect({left, top}, {right, bottom}, color,
-                              kCornerRadius, ImDrawFlags_RoundCornersAll,
-                              kStrokeWidth);
-            break;
-        case ChromeButtonSymbol::Restore:
-            draw_list.AddLine(
-                {left + kSeparation, top}, {right, top}, color, kStrokeWidth);
-            draw_list.AddLine(
-                {right, top}, {right, bottom - kSeparation}, color,
-                kStrokeWidth);
-            draw_list.AddRect(
-                {left, top + kSeparation},
-                {right - kSeparation, bottom}, color, kCornerRadius,
-                ImDrawFlags_RoundCornersAll, kStrokeWidth);
-            break;
-        case ChromeButtonSymbol::Close:
-            draw_list.AddLine({left, top}, {right, bottom}, color,
-                              kStrokeWidth);
-            draw_list.AddLine({right, top}, {left, bottom}, color,
-                              kStrokeWidth);
-            break;
-    }
-}
-
-bool DrawChromeButton(
-    const char* id, ChromeButtonSymbol symbol, ImVec2 size) {
-    const bool clicked = ImGui::InvisibleButton(id, size);
-    const ImVec2 minimum = ImGui::GetItemRectMin();
-    const ImVec2 maximum = ImGui::GetItemRectMax();
-    const bool hovered = ImGui::IsItemHovered();
-    const bool active = ImGui::IsItemActive();
-    const bool close = symbol == ChromeButtonSymbol::Close;
-
-    ImDrawList& draw_list = *ImGui::GetWindowDrawList();
-    if (hovered || active) {
-        ImU32 background = 0;
-        if (close) {
-            background = active ? IM_COL32(232, 17, 35, 0x98)
-                                : IM_COL32(232, 17, 35, 0xff);
-        } else {
-            const ImVec4 foreground = ImGui::GetStyleColorVec4(ImGuiCol_Text);
-            background = ImGui::ColorConvertFloat4ToU32(
-                {foreground.x, foreground.y, foreground.z,
-                 active ? 0x33 / 255.0f : 0x1a / 255.0f});
-        }
-        draw_list.AddRectFilled(minimum, maximum, background);
-    }
-
-    const ImU32 symbol_color = close && (hovered || active)
-                                   ? IM_COL32(255, 255, 255, 255)
-                                   : ImGui::GetColorU32(ImGuiCol_Text);
-    DrawChromeButtonSymbol(
-        draw_list, minimum, size, symbol, symbol_color);
-    return clicked;
-}
-
-std::array<char, 4> Utf8BmpGlyph(unsigned int codepoint) {
-    return {
-        static_cast<char>(0xe0U | (codepoint >> 12U)),
-        static_cast<char>(0x80U | ((codepoint >> 6U) & 0x3fU)),
-        static_cast<char>(0x80U | (codepoint & 0x3fU)),
-        '\0'};
-}
-
-bool DrawTitleBarToolButton(
-    const char* id, unsigned int codepoint,
-    ImFont* icon_font, ImVec2 size, ImU32 glyph_color) {
-    const bool clicked = ImGui::InvisibleButton(id, size);
-    const ImVec2 minimum = ImGui::GetItemRectMin();
-    const ImVec2 maximum = ImGui::GetItemRectMax();
-    const bool hovered = ImGui::IsItemHovered();
-    const bool active = ImGui::IsItemActive();
-    ImDrawList& draw_list = *ImGui::GetWindowDrawList();
-
-    if (hovered || active) {
-        const ImVec4 foreground = ImGui::GetStyleColorVec4(ImGuiCol_Text);
-        draw_list.AddRectFilled(
-            minimum, maximum,
-            ImGui::ColorConvertFloat4ToU32(
-                {foreground.x, foreground.y, foreground.z,
-                 active ? 0x33 / 255.0f : 0x1a / 255.0f}));
-    }
-
-    const std::array<char, 4> glyph = Utf8BmpGlyph(codepoint);
-    ImGui::PushFont(icon_font, kToolIconSize);
-    const ImVec2 glyph_size = ImGui::CalcTextSize(glyph.data());
-    draw_list.AddText(
-        ImGui::GetFont(), ImGui::GetFontSize(),
-        {minimum.x + (size.x - glyph_size.x) * 0.5f,
-         minimum.y + (size.y - glyph_size.y) * 0.5f},
-        glyph_color, glyph.data());
-    ImGui::PopFont();
-    return clicked;
-}
-
-ImVec4 AccountIconColor(const tradebox::core::CoreSnapshot& snapshot) {
-    if (snapshot.authenticated)
-        return {0.25f, 0.78f, 0.42f, 1.0f};
-    if (snapshot.safety_status == tradebox::core::SafetyStatus::Error ||
-        snapshot.safety_status == tradebox::core::SafetyStatus::Stale)
-        return {0.95f, 0.62f, 0.16f, 1.0f};
-    return {0.60f, 0.62f, 0.66f, 1.0f};
-}
-
-void DrawAccordionSection(const char* label, bool default_open) {
-    const ImGuiTreeNodeFlags flags =
-        default_open ? ImGuiTreeNodeFlags_DefaultOpen : 0;
-    if (!ImGui::CollapsingHeader(label, flags)) return;
-
-    ImGui::PushID(label);
-    ImGui::Indent(8.0f);
-    if (ImGui::MenuItem("Option A")) ImGui::CloseCurrentPopup();
-    if (ImGui::MenuItem("Option B")) ImGui::CloseCurrentPopup();
-    if (ImGui::MenuItem("Option C")) ImGui::CloseCurrentPopup();
-    ImGui::Unindent(8.0f);
-    ImGui::PopID();
-}
-
-void DrawTitleBarPopup(ImFont* regular_font, const char* id, ImVec2 anchor,
-                       const char* title,
-                       const char* first_section,
-                       const char* second_section,
-                       const char* third_section) {
-    ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, {0.0f, 0.0f});
-    ImGui::SetNextWindowSizeConstraints({250.0f, 0.0f}, {360.0f, 640.0f});
-    if (!ImGui::BeginPopup(id)) return;
-
-    ImGui::PushFont(regular_font, kMenuFontSize);
-    ImGui::TextUnformatted(title);
-    ImGui::Separator();
-    DrawAccordionSection(first_section, true);
-    DrawAccordionSection(second_section, false);
-    DrawAccordionSection(third_section, false);
-    ImGui::PopFont();
-    ImGui::EndPopup();
-}
-
-AccountPopupAction DrawAccountPopup(
-    ImFont* regular_font, const char* id, ImVec2 anchor,
-    const tradebox::core::CoreSnapshot& snapshot, bool application_available,
-    AccountPopupState& state) {
-    ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, {0.0f, 0.0f});
-    ImGui::SetNextWindowSizeConstraints({360.0f, 0.0f}, {480.0f, 420.0f});
-    if (!ImGui::BeginPopup(id)) return AccountPopupAction::None;
-
-    ImGui::PushFont(regular_font, kMenuFontSize);
-    if (!state.initialized) {
-        state.paper = snapshot.environment == tradebox::core::AccountEnvironment::Paper;
-        state.initialized = true;
-    }
-    ImGui::TextUnformatted("Account connection");
-    ImGui::Separator();
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::BeginCombo(
-            "Environment", state.paper ? "Paper" : "Live")) {
-        if (ImGui::Selectable("Paper", state.paper)) state.paper = true;
-        if (ImGui::Selectable("Live", !state.paper)) state.paper = false;
-        ImGui::EndCombo();
-    }
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputText("API key", state.api_key.data(), state.api_key.size());
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputText("API secret", state.api_secret.data(),
-                     state.api_secret.size(), ImGuiInputTextFlags_Password);
-    if (!state.message.empty())
-        ImGui::TextWrapped("%s", state.message.c_str());
-    ImGui::TextDisabled("Status: %s", snapshot.status_message.c_str());
-
-    const bool can_connect = application_available &&
-                             state.api_key[0] != '\0' &&
-                             state.api_secret[0] != '\0';
-    AccountPopupAction action = AccountPopupAction::None;
-    ImGui::BeginDisabled(!can_connect);
-    if (ImGui::Button("Connect")) action = AccountPopupAction::Connect;
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::BeginDisabled(!application_available);
-    if (ImGui::Button("Disconnect"))
-        action = AccountPopupAction::Disconnect;
-    ImGui::EndDisabled();
-    if (action != AccountPopupAction::None) ImGui::CloseCurrentPopup();
-    ImGui::PopFont();
-    ImGui::EndPopup();
-    return action;
-}
-
-bool DrawCreationPopup(ImFont* regular_font, const char* id, ImVec2 anchor) {
-    ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, {0.0f, 0.0f});
-    ImGui::SetNextWindowSizeConstraints({220.0f, 0.0f}, {320.0f, 320.0f});
-    if (!ImGui::BeginPopup(id)) return false;
-
-    ImGui::PushFont(regular_font, kMenuFontSize);
-    ImGui::TextUnformatted("Create");
-    ImGui::Separator();
-    const bool new_chart = ImGui::MenuItem("New chart");
-    if (new_chart) ImGui::CloseCurrentPopup();
-    ImGui::PopFont();
-    ImGui::EndPopup();
-    return new_chart;
-}
-
-ChromeActions DrawApplicationChrome(
-    SDL_Window* window, ChromeMetrics& metrics,
-    const GuiFonts& fonts, const MarketTimeZone& market_time_zone,
-    const tradebox::core::CoreSnapshot& snapshot,
-    bool application_available, AccountPopupState& account_popup,
-    bool& done) {
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    metrics.title_bar_height = 35;
-    metrics.control_width = 46;
-    metrics.tool_width = 40;
-    const float row_height = static_cast<float>(metrics.title_bar_height);
-    const float caption_controls_width =
-        static_cast<float>(metrics.control_width * 3);
-    const float tool_controls_width =
-        static_cast<float>(metrics.tool_width * 3);
-    metrics.interactive_left_width = static_cast<int>(tool_controls_width);
-
-    const ImGuiWindowFlags flags =
-        ImGuiWindowFlags_NoDecoration |
-        ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoSavedSettings |
-        ImGuiWindowFlags_NoBringToFrontOnFocus |
-        ImGuiWindowFlags_NoNavFocus |
-        ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoScrollWithMouse;
-    ImGui::SetNextWindowPos(viewport->Pos, ImGuiCond_Always);
-    ImGui::SetNextWindowSize(
-        {viewport->Size.x, row_height}, ImGuiCond_Always);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0.0f, 0.0f));
-    ChromeActions actions;
-    if (ImGui::Begin("##tradebox_chrome", nullptr, flags)) {
-        const ImVec2 window_min = ImGui::GetWindowPos();
-        const ImVec2 window_size = ImGui::GetWindowSize();
-        const ImVec2 window_max{window_min.x + window_size.x,
-                                window_min.y + window_size.y};
-        ImDrawList* draw_list = ImGui::GetWindowDrawList();
-        draw_list->AddRectFilled(
-            window_min, window_max, ImGui::GetColorU32(ImGuiCol_MenuBarBg));
-        draw_list->AddLine(
-            {window_min.x, window_max.y - 1.0f},
-            {window_max.x, window_max.y - 1.0f},
-            ImGui::GetColorU32(ImGuiCol_Border));
-
-        ImGui::SetCursorPos({0.0f, 0.0f});
-        const ImVec2 tool_size{
-            static_cast<float>(metrics.tool_width), row_height};
-        const bool account_clicked = DrawTitleBarToolButton(
-            "##account", 0xf20b, fonts.icons, tool_size,
-            ImGui::GetColorU32(AccountIconColor(snapshot)));
-        const ImVec2 account_anchor = ImGui::GetItemRectMax();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", snapshot.status_message.c_str());
-        ImGui::SameLine(0.0f, 0.0f);
-        const bool settings_clicked = DrawTitleBarToolButton(
-            "##settings", 0xe8b8, fonts.icons, tool_size,
-            ImGui::GetColorU32(ImGuiCol_Text));
-        ImGui::SameLine(0.0f, 0.0f);
-        const bool create_clicked = DrawTitleBarToolButton(
-            "##create", 0xe145, fonts.icons, tool_size,
-            ImGui::GetColorU32(ImGuiCol_Text));
-
-        if (account_clicked) ImGui::OpenPopup("##account_menu");
-        if (settings_clicked) ImGui::OpenPopup("##settings_menu");
-        if (create_clicked) ImGui::OpenPopup("##create_menu");
-        const ImVec2 left_menu_anchor{window_min.x, account_anchor.y};
-        actions.account = DrawAccountPopup(
-            fonts.regular, "##account_menu", left_menu_anchor, snapshot,
-            application_available, account_popup);
-        DrawTitleBarPopup(
-            fonts.regular, "##settings_menu", left_menu_anchor, "Settings",
-            "General", "Workspace", "Trading");
-        actions.new_chart = DrawCreationPopup(
-            fonts.regular, "##create_menu",
-            {window_min.x + tool_controls_width -
-                 static_cast<float>(metrics.tool_width),
-             account_anchor.y});
-
-        ImGui::SetCursorPos(
-            {window_size.x - caption_controls_width, 0.0f});
-        const ImVec2 button_size{
-            static_cast<float>(metrics.control_width), row_height};
-        if (DrawChromeButton(
-                "##minimize", ChromeButtonSymbol::Minimize,
-                button_size))
-            static_cast<void>(SDL_MinimizeWindow(window));
-        ImGui::SameLine(0.0f, 0.0f);
-        const bool maximized =
-            (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
-        if (DrawChromeButton(
-                "##maximize",
-                maximized ? ChromeButtonSymbol::Restore
-                          : ChromeButtonSymbol::Maximize,
-                button_size)) {
-            if (maximized)
-                static_cast<void>(SDL_RestoreWindow(window));
-            else
-                static_cast<void>(SDL_MaximizeWindow(window));
-        }
-        ImGui::SameLine(0.0f, 0.0f);
-        if (DrawChromeButton(
-                "##close", ChromeButtonSymbol::Close,
-                button_size))
-            done = true;
-
-        ImGui::PushFont(fonts.title, kTitleFontSize);
-        const std::string title = MarketTimeText(market_time_zone);
-        const ImVec2 title_size = ImGui::CalcTextSize(title.c_str());
-        draw_list->AddText(
-            ImGui::GetFont(), ImGui::GetFontSize(),
-            {window_min.x + (window_size.x - title_size.x) * 0.5f,
-             window_min.y + (row_height - title_size.y) * 0.5f},
-            ImGui::GetColorU32(ImGuiCol_Text), title.c_str());
-        ImGui::PopFont();
-    }
-    ImGui::End();
-    ImGui::PopStyleVar(3);
-    return actions;
-}
-
 LaunchOptions ParseLaunchOptions(int argc, char* argv[]) {
     LaunchOptions options;
     for (int index = 1; index < argc; ++index) {
@@ -680,9 +307,21 @@ std::vector<std::string> ConnectionSymbols(
     return result;
 }
 
-void ClearSecretInput(AccountPopupState& state) {
+void ClearCredentialInputs(AccountPopupState& state) {
+    SecureZeroMemory(state.api_key.data(), state.api_key.size());
+    state.api_key.fill('\0');
     SecureZeroMemory(state.api_secret.data(), state.api_secret.size());
     state.api_secret.fill('\0');
+}
+
+std::string CredentialSlot(
+    const tradebox::workstation::AccountContext& account_context,
+    tradebox::core::AccountEnvironment environment) {
+    if (!account_context.credential_slot.empty())
+        return account_context.credential_slot;
+    return environment == tradebox::core::AccountEnvironment::Paper
+               ? "alpaca-paper-default"
+               : "alpaca-live-default";
 }
 
 int RunApplication(const LaunchOptions& options) {
@@ -756,7 +395,7 @@ int RunApplication(const LaunchOptions& options) {
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGui::StyleColorsDark();
+    ConfigureImGuiStyle();
     ImGui::GetIO().IniFilename = nullptr;
     GuiFonts gui_fonts;
     if (!LoadGuiFonts(gui_fonts)) {
@@ -788,6 +427,11 @@ int RunApplication(const LaunchOptions& options) {
 
     bool done = false;
     AccountPopupState account_popup;
+    account_popup.environment =
+        workstation_state.account_context.paper
+            ? tradebox::core::AccountEnvironment::Paper
+            : tradebox::core::AccountEnvironment::Live;
+    bool show_imgui_demo = false;
     const MarketTimeZone market_time_zone = LoadMarketTimeZone();
     const Uint64 started_at = SDL_GetTicks();
     while (!done) {
@@ -833,10 +477,18 @@ int RunApplication(const LaunchOptions& options) {
             application != nullptr
                 ? application->SnapshotForUi(snapshot_query)
                 : tradebox::application::ApplicationUiSnapshot{};
+        const std::string credential_slot =
+            CredentialSlot(workstation_state.account_context,
+                           account_popup.environment);
+        const bool saved_credentials_available =
+            application != nullptr && application->HasSavedCredentials(
+                credential_slot, account_popup.environment);
 
         const ChromeActions chrome_actions = DrawApplicationChrome(
-            window, chrome_metrics, gui_fonts, market_time_zone, snapshot.core,
-            application != nullptr, account_popup, done);
+            window, chrome_metrics, gui_fonts,
+            MarketTimeText(market_time_zone), snapshot.core,
+            application != nullptr, account_popup, saved_credentials_available,
+            workstation_state.application, done);
         if (chrome_actions.new_chart) {
             const auto created = tradebox::workstation::CreateChartDocument(
                 workstation_state.workspace);
@@ -848,31 +500,58 @@ int RunApplication(const LaunchOptions& options) {
                 profile_store.MarkDirty();
             }
         }
+        if (chrome_actions.imgui_demo) show_imgui_demo = true;
+        if (chrome_actions.settings_changed) profile_store.MarkDirty();
 
         if (chrome_actions.account == AccountPopupAction::Connect) {
-            workstation_state.account_context.paper = account_popup.paper;
+            workstation_state.account_context.paper =
+                account_popup.environment ==
+                tradebox::core::AccountEnvironment::Paper;
+            workstation_state.account_context.credential_slot = credential_slot;
             workstation_state.account_context.account_alias =
-                account_popup.paper ? "Alpaca Paper" : "Alpaca Live";
+                workstation_state.account_context.paper ? "Alpaca Paper"
+                                                        : "Alpaca Live";
             profile_store.MarkDirty();
             if (application == nullptr) {
                 account_popup.message = "Local application is still loading";
             } else {
+                bool connect_requested = true;
                 tradebox::application::ConnectionRequest request;
-                request.environment = account_popup.paper
-                                          ? tradebox::core::AccountEnvironment::Paper
-                                          : tradebox::core::AccountEnvironment::Live;
-                request.api_key = account_popup.api_key.data();
-                request.api_secret = account_popup.api_secret.data();
-                request.market_symbols =
-                    ConnectionSymbols(workstation_state.workspace);
-                request.market_data_feed =
-                    tradebox::core::MarketDataFeed::Iex;
-                const auto receipt = application->Connect(std::move(request));
-                account_popup.message = receipt
-                                             ? receipt->message
-                                             : receipt.error().message;
+                request.environment =
+                    account_popup.environment;
+                request.credential_slot = credential_slot;
+                const bool fields_complete =
+                    account_popup.api_key[0] != '\0' &&
+                    account_popup.api_secret[0] != '\0';
+                if (fields_complete && account_popup.remember_credentials) {
+                    const auto saved = application->SaveCredentials(
+                        credential_slot, account_popup.environment,
+                        account_popup.api_key.data(),
+                        account_popup.api_secret.data());
+                    if (!saved) {
+                        account_popup.message = saved.error();
+                        ClearCredentialInputs(account_popup);
+                        connect_requested = false;
+                    }
+                }
+                if (connect_requested) {
+                    if (fields_complete) {
+                        request.api_key = account_popup.api_key.data();
+                        request.api_secret = account_popup.api_secret.data();
+                    }
+                    request.market_symbols =
+                        ConnectionSymbols(workstation_state.workspace);
+                    request.market_data_feed =
+                        tradebox::core::MarketDataFeed::Iex;
+                    const auto receipt =
+                        application->Connect(std::move(request));
+                    account_popup.message = receipt
+                                                 ? receipt->message
+                                                 : receipt.error().message;
+                }
             }
-            ClearSecretInput(account_popup);
+            account_popup.live_trading_confirmed = false;
+            ClearCredentialInputs(account_popup);
         } else if (chrome_actions.account == AccountPopupAction::Disconnect) {
             if (application == nullptr) {
                 account_popup.message = "Local application is still loading";
@@ -881,6 +560,21 @@ int RunApplication(const LaunchOptions& options) {
                 account_popup.message = receipt
                                              ? receipt->message
                                              : receipt.error().message;
+            }
+            account_popup.live_trading_confirmed = false;
+        } else if (chrome_actions.account ==
+                   AccountPopupAction::ForgetCredentials) {
+            if (application == nullptr) {
+                account_popup.message = "Local application is still loading";
+            } else {
+                const auto forgotten = application->ForgetCredentials(
+                    credential_slot, snapshot.core.authenticated
+                        ? snapshot.core.environment
+                        : account_popup.environment);
+                account_popup.message = forgotten
+                                            ? "Saved credentials forgotten"
+                                            : forgotten.error();
+                if (forgotten) account_popup.remember_credentials = false;
             }
         }
         if (application != nullptr)
@@ -905,6 +599,9 @@ int RunApplication(const LaunchOptions& options) {
             static_cast<void>(chart_renderer.ConsumeHistoryRetries());
         }
         workspace.EndFrame();
+
+        DrawImGuiDemo(show_imgui_demo,
+                      static_cast<float>(chrome_metrics.title_bar_height));
 
         if (chart_renderer.ConsumePersistentChanges() ||
             workspace.ConsumeDirty())
@@ -968,6 +665,7 @@ int RunApplication(const LaunchOptions& options) {
     renderer.device.Reset();
     SDL_DestroyWindow(window);
     SDL_Quit();
+    ClearCredentialInputs(account_popup);
     return 0;
 }
 
