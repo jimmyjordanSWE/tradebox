@@ -1,7 +1,6 @@
 #pragma once
 
 #include "tradebox/core/order_command.h"
-#include "tradebox/core/order_request.h"
 #include "tradebox/core/asset_catalog.h"
 
 #include <cstdint>
@@ -78,47 +77,6 @@ enum class OperationalSeverity {
     Warning,
     Critical,
 };
-
-[[nodiscard]] const char* OperationalComponentLabel(
-    OperationalComponent component);
-[[nodiscard]] const char* OperationalStateLabel(OperationalState state);
-[[nodiscard]] const char* OperationalReasonLabel(OperationalReason reason);
-[[nodiscard]] const char* OperationalSeverityLabel(
-    OperationalSeverity severity);
-
-struct OrderEntryDraft {
-    std::string name = "Untitled order";
-    std::string symbol = "AMD";
-    std::string side = "Buy";
-    std::string amount = "1";
-    bool amount_is_notional = false;
-    std::string type = "Market";
-    std::string limit_price;
-    std::string stop_price;
-    std::string time_in_force = "Day";
-    bool extended_hours = false;
-};
-
-struct UiValidationMessage {
-    std::string field;
-    std::string message;
-};
-
-enum class UiOrderState {
-    Pending, Accepted, Rejected, Canceled, Filled, Indeterminate, Stale,
-    Reconciling
-};
-
-[[nodiscard]] std::vector<UiValidationMessage> ValidateOrderEntry(
-    const OrderEntryDraft& draft);
-[[nodiscard]] std::optional<tradebox::core::NativeOrderRequest>
-BuildNativeOrderRequest(const OrderEntryDraft& draft,
-                        std::vector<UiValidationMessage>& errors);
-[[nodiscard]] std::string UiOrderStateLabel(UiOrderState state);
-[[nodiscard]] UiOrderState UiOrderStateFromCore(
-    const tradebox::core::OrderState& order,
-    const tradebox::core::CoreSnapshot& snapshot,
-    bool command_indeterminate = false);
 
 struct UiEvent {
     UiEventType type = UiEventType::Status;

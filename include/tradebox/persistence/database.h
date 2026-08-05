@@ -21,15 +21,6 @@
 
 struct sqlite3;
 
-struct WindowPlacement {
-    int x = 0;
-    int y = 0;
-    int width = 1440;
-    int height = 900;
-    bool maximized = false;
-    bool exists = false;
-};
-
 struct MarketDataStorageUsage {
     std::uint64_t candlestick_bytes = 0;
     std::uint64_t tick_bytes = 0;
@@ -91,22 +82,8 @@ public:
     bool Open(std::string& error);
     bool OpenAt(const std::filesystem::path& database_path,
                 std::string& error);
-    std::vector<std::string> LoadWatchlist();
-    std::expected<void, std::string> SaveWatchlist(
-        const std::vector<std::string>& symbols);
     std::vector<tradebox::core::TradableAsset> LoadAssetCatalog();
     void SaveAssetCatalog(const std::vector<tradebox::core::TradableAsset>& assets);
-    WindowPlacement LoadWindowPlacement();
-    void SaveWindowPlacement(const WindowPlacement& placement);
-    std::optional<std::string> LoadAppSetting(std::string_view key);
-    void SaveAppSetting(std::string_view key, std::string_view value);
-    std::optional<bool> LoadLastConnectedPaper();
-    void SaveLastConnectedPaper(bool paper);
-    void ClearLastConnectedAccount(bool paper);
-    std::string LoadAccountAlias(const std::string& account_id);
-    void SaveAccountAlias(const std::string& account_id,
-                          const std::string& account_number,
-                          const std::string& alias);
     std::vector<Bar> LoadBars(const std::string& symbol);
     void StoreBars(const std::string& symbol, const std::vector<Bar>& bars);
     std::expected<void, std::string> StoreProviderBars(

@@ -16,7 +16,6 @@ set(BANNED_PATTERNS
   "ApplyTrade\\("
   "UpsertDailyBar\\("
   "BuildOrderRequest\\("
-  "ValidateOrderEntry\\("
 )
 
 foreach(BANNED_PATTERN IN LISTS BANNED_PATTERNS)

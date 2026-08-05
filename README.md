@@ -45,9 +45,6 @@ See the durable project documentation:
 - [Broker and strategy order model](docs/ORDER_MODEL.md)
 - [Order and position consistency](docs/ORDER_POSITION_STATE_MACHINE.md)
 - [Product vision and replay model](docs/VISION.md)
-- [Adaptive chart rendering](docs/CHART_RENDERING.md)
-- [Workstation window model](docs/WINDOW_MODEL.md)
-- [Daily ETF watch window](docs/ETF_WATCH_WINDOW.md)
 
 ## Toolchain and build
 

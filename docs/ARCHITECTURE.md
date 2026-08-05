@@ -26,10 +26,9 @@ typed command, but it must not validate broker rules, aggregate trades into
 bars, derive account or position state, query SQLite during rendering, or call
 Alpaca directly.
 
-The current GUI surface uses public Dear ImGui APIs, SDL3 event/frame
-integration, and ImPlot for chart presentation. Library contexts and
-`Begin`/`End` lifetimes are adapter concerns; their semantics must not leak
-into the core model.
+The current GUI surface is an intentionally empty Dear ImGui/SDL3 shell.
+Library contexts and frame lifetimes are adapter concerns; their semantics must
+not leak into the core model.
 
 ## Account and command flow
 

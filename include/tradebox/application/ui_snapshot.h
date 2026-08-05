@@ -20,9 +20,8 @@ struct UiSnapshotQuery {
     std::vector<UiChartQuery> charts;
 };
 
-// A complete read model for one render pass. It contains no ImGui, SDL, or
-// ImPlot types and can therefore be assembled and tested independently of the
-// renderer.
+// A complete read model for one render pass. It contains no renderer types and
+// can therefore be assembled and tested independently of the renderer.
 struct ApplicationUiSnapshot {
     core::CoreSnapshot core;
     std::vector<core::MarketDataSnapshot> markets;

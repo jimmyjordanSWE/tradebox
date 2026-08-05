@@ -418,28 +418,6 @@ bool Database::OpenAt(const std::filesystem::path& database_path,
     const char* schema = R"SQL(
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=FULL;
-CREATE TABLE IF NOT EXISTS watchlist (
-  symbol TEXT PRIMARY KEY,
-  sort_order INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS window_placement (
-  id INTEGER PRIMARY KEY CHECK(id = 1),
-  x INTEGER NOT NULL,
-  y INTEGER NOT NULL,
-  width INTEGER NOT NULL,
-  height INTEGER NOT NULL,
-  maximized INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS app_settings (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS account_aliases (
-  account_id TEXT PRIMARY KEY,
-  account_number TEXT NOT NULL,
-  alias TEXT NOT NULL,
-  updated_at_ms INTEGER NOT NULL
-);
 CREATE TABLE IF NOT EXISTS daily_bars (
   symbol TEXT NOT NULL,
   timestamp_ms INTEGER NOT NULL,
@@ -575,6 +553,13 @@ SELECT
 FROM market_events;
 )SQL";
     if (!Execute(schema, &error)) return false;
+    // UI/application state belongs to workstation profiles now. Remove the
+    // legacy tables from existing operational databases without touching
+    // broker journals or market history.
+    Execute("DROP TABLE IF EXISTS watchlist; DROP TABLE IF EXISTS "
+            "window_placement; DROP TABLE IF EXISTS account_aliases; "
+            "DROP TABLE IF EXISTS app_settings;",
+            nullptr);
     Execute(
         "ALTER TABLE order_commands ADD COLUMN items_json TEXT NOT NULL "
         "DEFAULT '[]'",
@@ -620,7 +605,7 @@ CREATE TABLE IF NOT EXISTS daily_bars (
   timeframe TEXT NOT NULL DEFAULT '1Day',
   PRIMARY KEY(symbol, timestamp_ms, feed, timeframe)
 );
-CREATE TABLE IF NOT EXISTS app_settings (
+CREATE TABLE IF NOT EXISTS market_metadata (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
@@ -1405,80 +1390,11 @@ tradebox::core::AccountActivityPage Database::LoadAccountActivities(
     return page;
 }
 
-std::vector<std::string> Database::LoadWatchlist() {
-    std::vector<std::string> result;
-    std::scoped_lock lock(db_mutex_);
-    sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(db_,
-                       "SELECT symbol FROM watchlist ORDER BY sort_order", -1,
-                       &statement, nullptr);
-    while (sqlite3_step(statement) == SQLITE_ROW) {
-        result.emplace_back(
-            reinterpret_cast<const char*>(sqlite3_column_text(statement, 0)));
-    }
-    sqlite3_finalize(statement);
-    return result;
-}
-
-std::expected<void, std::string> Database::SaveWatchlist(
-    const std::vector<std::string>& symbols) {
-    std::scoped_lock lock(db_mutex_);
-    if (!db_)
-        return std::unexpected("Database is not open");
-
-    std::string error;
-    if (!Execute("BEGIN IMMEDIATE;", &error))
-        return std::unexpected("Could not begin watchlist save: " + error);
-    const auto rollback = [&]() {
-        Execute("ROLLBACK;", nullptr);
-    };
-    if (!Execute("DELETE FROM watchlist;", &error)) {
-        rollback();
-        return std::unexpected("Could not clear watchlist: " + error);
-    }
-
-    sqlite3_stmt* statement = nullptr;
-    if (sqlite3_prepare_v2(
-            db_,
-            "INSERT INTO watchlist(symbol, sort_order) VALUES(?, ?)",
-            -1, &statement, nullptr) != SQLITE_OK) {
-        error = sqlite3_errmsg(db_);
-        rollback();
-        return std::unexpected("Could not prepare watchlist save: " +
-                               error);
-    }
-    for (std::size_t i = 0; i < symbols.size(); ++i) {
-        if (sqlite3_bind_text(statement, 1, symbols[i].c_str(), -1,
-                              SQLITE_TRANSIENT) != SQLITE_OK ||
-            sqlite3_bind_int(statement, 2, static_cast<int>(i)) !=
-                SQLITE_OK ||
-            sqlite3_step(statement) != SQLITE_DONE) {
-            error = sqlite3_errmsg(db_);
-            sqlite3_finalize(statement);
-            rollback();
-            return std::unexpected("Could not insert watchlist row: " +
-                                   error);
-        }
-        if (sqlite3_reset(statement) != SQLITE_OK) {
-            error = sqlite3_errmsg(db_);
-            sqlite3_finalize(statement);
-            rollback();
-            return std::unexpected("Could not reset watchlist row: " +
-                                   error);
-        }
-    }
-    sqlite3_finalize(statement);
-    if (!Execute("COMMIT;", &error))
-        return std::unexpected("Could not commit watchlist save: " +
-                               error);
-    return {};
-}
-
 std::vector<tradebox::core::TradableAsset> Database::LoadAssetCatalog() {
     std::vector<tradebox::core::TradableAsset> result;
     std::scoped_lock lock(db_mutex_);
     sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(market_db_, "SELECT value FROM app_settings WHERE key='asset_catalog'",
+    sqlite3_prepare_v2(market_db_, "SELECT value FROM market_metadata WHERE key='asset_catalog'",
                        -1, &statement, nullptr);
     if (sqlite3_step(statement) == SQLITE_ROW) {
         try {
@@ -1526,163 +1442,11 @@ void Database::SaveAssetCatalog(
         {"provider_asset_id", asset.provider_asset_id}});
     std::scoped_lock lock(db_mutex_);
     sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(market_db_, "INSERT INTO app_settings(key,value) VALUES('asset_catalog',?) "
+    sqlite3_prepare_v2(market_db_, "INSERT INTO market_metadata(key,value) VALUES('asset_catalog',?) "
                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                        -1, &statement, nullptr);
     const std::string text = json.dump();
     sqlite3_bind_text(statement, 1, text.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(statement);
-    sqlite3_finalize(statement);
-}
-
-std::optional<bool> Database::LoadLastConnectedPaper() {
-    std::scoped_lock lock(db_mutex_);
-    sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(
-        db_,
-        "SELECT value FROM app_settings WHERE key='last_connected_account'", -1,
-        &statement, nullptr);
-    std::optional<bool> result;
-    if (sqlite3_step(statement) == SQLITE_ROW) {
-        const char* value = reinterpret_cast<const char*>(
-            sqlite3_column_text(statement, 0));
-        if (value && std::strcmp(value, "paper") == 0)
-            result = true;
-        else if (value && std::strcmp(value, "live") == 0)
-            result = false;
-    }
-    sqlite3_finalize(statement);
-    return result;
-}
-
-void Database::SaveLastConnectedPaper(bool paper) {
-    std::scoped_lock lock(db_mutex_);
-    sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(
-        db_,
-        "INSERT INTO app_settings(key,value) VALUES('last_connected_account',?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        -1, &statement, nullptr);
-    sqlite3_bind_text(statement, 1, paper ? "paper" : "live", -1,
-                      SQLITE_STATIC);
-    sqlite3_step(statement);
-    sqlite3_finalize(statement);
-}
-
-void Database::ClearLastConnectedAccount(bool paper) {
-    const std::optional<bool> previous = LoadLastConnectedPaper();
-    if (!previous || *previous != paper) return;
-    std::scoped_lock lock(db_mutex_);
-    Execute("DELETE FROM app_settings WHERE key='last_connected_account'");
-}
-
-std::string Database::LoadAccountAlias(const std::string& account_id) {
-    std::string result;
-    std::scoped_lock lock(db_mutex_);
-    sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(
-        db_, "SELECT alias FROM account_aliases WHERE account_id=?", -1,
-        &statement, nullptr);
-    sqlite3_bind_text(statement, 1, account_id.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(statement) == SQLITE_ROW) {
-        const char* alias = reinterpret_cast<const char*>(
-            sqlite3_column_text(statement, 0));
-        if (alias) result = alias;
-    }
-    sqlite3_finalize(statement);
-    return result;
-}
-
-void Database::SaveAccountAlias(const std::string& account_id,
-                                const std::string& account_number,
-                                const std::string& alias) {
-    std::scoped_lock lock(db_mutex_);
-    sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(
-        db_,
-        "INSERT INTO account_aliases(account_id,account_number,alias,"
-        "updated_at_ms) VALUES(?,?,?,?) "
-        "ON CONFLICT(account_id) DO UPDATE SET "
-        "account_number=excluded.account_number,alias=excluded.alias,"
-        "updated_at_ms=excluded.updated_at_ms",
-        -1, &statement, nullptr);
-    sqlite3_bind_text(statement, 1, account_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(statement, 2, account_number.c_str(), -1,
-                      SQLITE_TRANSIENT);
-    sqlite3_bind_text(statement, 3, alias.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(statement, 4, NowMs());
-    sqlite3_step(statement);
-    sqlite3_finalize(statement);
-}
-
-WindowPlacement Database::LoadWindowPlacement() {
-    WindowPlacement result;
-    std::scoped_lock lock(db_mutex_);
-    sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(
-        db_,
-        "SELECT x,y,width,height,maximized FROM window_placement WHERE id=1",
-        -1, &statement, nullptr);
-    if (sqlite3_step(statement) == SQLITE_ROW) {
-        result.x = sqlite3_column_int(statement, 0);
-        result.y = sqlite3_column_int(statement, 1);
-        result.width = sqlite3_column_int(statement, 2);
-        result.height = sqlite3_column_int(statement, 3);
-        result.maximized = sqlite3_column_int(statement, 4) != 0;
-        result.exists = true;
-    }
-    sqlite3_finalize(statement);
-    return result;
-}
-
-void Database::SaveWindowPlacement(const WindowPlacement& placement) {
-    std::scoped_lock lock(db_mutex_);
-    sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(
-        db_,
-        "INSERT INTO window_placement(id,x,y,width,height,maximized) "
-        "VALUES(1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
-        "x=excluded.x,y=excluded.y,width=excluded.width,height=excluded.height,"
-        "maximized=excluded.maximized",
-        -1, &statement, nullptr);
-    sqlite3_bind_int(statement, 1, placement.x);
-    sqlite3_bind_int(statement, 2, placement.y);
-    sqlite3_bind_int(statement, 3, placement.width);
-    sqlite3_bind_int(statement, 4, placement.height);
-    sqlite3_bind_int(statement, 5, placement.maximized ? 1 : 0);
-    sqlite3_step(statement);
-    sqlite3_finalize(statement);
-}
-
-std::optional<std::string> Database::LoadAppSetting(std::string_view key) {
-    std::scoped_lock lock(db_mutex_);
-    sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(db_, "SELECT value FROM app_settings WHERE key=?", -1,
-                       &statement, nullptr);
-    sqlite3_bind_text(statement, 1, key.data(),
-                      static_cast<int>(key.size()), SQLITE_TRANSIENT);
-    std::optional<std::string> result;
-    if (sqlite3_step(statement) == SQLITE_ROW) {
-        const unsigned char* value = sqlite3_column_text(statement, 0);
-        if (value)
-            result.emplace(reinterpret_cast<const char*>(value));
-    }
-    sqlite3_finalize(statement);
-    return result;
-}
-
-void Database::SaveAppSetting(std::string_view key, std::string_view value) {
-    std::scoped_lock lock(db_mutex_);
-    sqlite3_stmt* statement = nullptr;
-    sqlite3_prepare_v2(
-        db_,
-        "INSERT INTO app_settings(key,value) VALUES(?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        -1, &statement, nullptr);
-    sqlite3_bind_text(statement, 1, key.data(),
-                      static_cast<int>(key.size()), SQLITE_TRANSIENT);
-    sqlite3_bind_text(statement, 2, value.data(),
-                      static_cast<int>(value.size()), SQLITE_TRANSIENT);
     sqlite3_step(statement);
     sqlite3_finalize(statement);
 }

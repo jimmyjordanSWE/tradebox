@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <utility>
 
 struct AlpacaCredentials {
@@ -57,6 +58,11 @@ private:
 
 class CredentialStore {
 public:
+    static bool Save(std::string_view slot, const AlpacaCredentials& credentials,
+                     std::string& error);
+    static bool Load(std::string_view slot, bool paper,
+                     AlpacaCredentials& credentials, std::string& error);
+    static bool Delete(std::string_view slot, bool paper, std::string& error);
     static bool Save(const AlpacaCredentials& credentials, std::string& error);
     static bool Load(bool paper, AlpacaCredentials& credentials, std::string& error);
     static bool Delete(bool paper, std::string& error);

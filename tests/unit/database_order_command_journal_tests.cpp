@@ -213,26 +213,6 @@ TEST(DatabaseOrderCommandJournal,
     }
 }
 
-TEST(DatabaseSettings, PersistsUserInterfacePerformanceOptions) {
-    TemporaryDatabase temporary;
-    {
-        Database database;
-        std::string error;
-        ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
-        EXPECT_FALSE(database.LoadAppSetting("ui.vsync"));
-        database.SaveAppSetting("ui.vsync", "1");
-        database.SaveAppSetting("ui.maximum_fps", "240");
-        database.SaveAppSetting("ui.maximum_fps", "120");
-    }
-    {
-        Database database;
-        std::string error;
-        ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
-        EXPECT_EQ(database.LoadAppSetting("ui.vsync"), "1");
-        EXPECT_EQ(database.LoadAppSetting("ui.maximum_fps"), "120");
-    }
-}
-
 TEST(DatabaseAccountActivities,
      DeduplicatesRevisesFiltersPagesAndLoadsAcrossRestart) {
     TemporaryDatabase temporary;

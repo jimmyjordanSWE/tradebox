@@ -88,11 +88,8 @@ outside the OneDrive-synchronized repository.
 
 ## Later, without commitment to schedule
 
-- A combined ETF watch window plots saved symbol groups as raw, normalized, or
-  relative-strength series as specified in
-  [ETF_WATCH_WINDOW.md](ETF_WATCH_WINDOW.md).
-- Window behavior and persistence follow
-  [WINDOW_MODEL.md](WINDOW_MODEL.md).
+- A combined ETF watch window may be designed after the empty GUI shell is
+  re-established.
 - A replay clock reads the recorded event stream into the same event queue.
 - Semantic UI actions and broker updates join the universal timeline.
 - Journal markers and raw audio clips attach to timeline timestamps.

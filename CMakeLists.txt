@@ -15,15 +15,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(dear_imgui)
 
-FetchContent_Declare(
-  implot
-  GIT_REPOSITORY https://github.com/epezent/implot.git
-  GIT_TAG v1.0
-  GIT_SHALLOW TRUE
-  SOURCE_SUBDIR tradebox-no-cmake-project
-)
-FetchContent_MakeAvailable(implot)
-
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST OFF CACHE BOOL "" FORCE)
@@ -101,13 +92,6 @@ function(tradebox_enable_windows_api target)
     _WIN32_WINNT=0x0A00
   )
 endfunction()
-
-add_library(tradebox_implot STATIC
-  ${implot_SOURCE_DIR}/implot.cpp
-  ${implot_SOURCE_DIR}/implot_items.cpp
-)
-target_include_directories(tradebox_implot PUBLIC ${implot_SOURCE_DIR})
-target_link_libraries(tradebox_implot PUBLIC imgui)
 
 add_library(tradebox_core STATIC
   src/core/decimal.cpp
@@ -189,22 +173,8 @@ tradebox_enable_strict_warnings(tradebox_application)
 
 add_executable(tradebox_gui WIN32
   src/adapters/gui/main.cpp
-  src/adapters/gui/model.cpp
-  src/adapters/gui/workspace.cpp
-  src/adapters/gui/chart_view.cpp
-  src/adapters/gui/chart_view_data.cpp
 )
 set_target_properties(tradebox_gui PROPERTIES OUTPUT_NAME TradeBoxNative)
-add_custom_command(TARGET tradebox_gui POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E make_directory
-    "$<TARGET_FILE_DIR:tradebox_gui>/assets/fonts"
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/B612-Regular.ttf"
-    "$<TARGET_FILE_DIR:tradebox_gui>/assets/fonts/B612-Regular.ttf"
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/B612Mono-Regular.ttf"
-    "$<TARGET_FILE_DIR:tradebox_gui>/assets/fonts/B612Mono-Regular.ttf"
-)
 target_compile_features(tradebox_gui PRIVATE cxx_std_23)
 target_compile_definitions(tradebox_gui PRIVATE
   WIN32_LEAN_AND_MEAN
@@ -214,14 +184,10 @@ target_compile_definitions(tradebox_gui PRIVATE
 target_link_libraries(tradebox_gui PRIVATE
   tradebox_application
   tradebox_persistence
-  tradebox_platform
   imgui
-  tradebox_implot
-  nlohmann_json::nlohmann_json
   SDL3::SDL3-static
   d3d11
   dxgi
-  psapi
 )
 
 include(CTest)
@@ -270,7 +236,6 @@ if(BUILD_TESTING)
     tests/unit/alpaca_rest_transport_tests.cpp
     tests/unit/alpaca_stream_supervision_tests.cpp
     tests/unit/database_order_command_journal_tests.cpp
-    tests/unit/database_watchlist_tests.cpp
     tests/unit/order_execution_service_tests.cpp
   )
   target_compile_features(tradebox_order_pipeline_tests PRIVATE cxx_std_23)
@@ -283,16 +248,6 @@ if(BUILD_TESTING)
   )
   tradebox_enable_strict_warnings(tradebox_order_pipeline_tests)
   gtest_discover_tests(tradebox_order_pipeline_tests)
-
-  add_executable(tradebox_ui_tests
-    tests/unit/ui_model_tests.cpp
-    tests/unit/chart_view_tests.cpp
-    src/adapters/gui/model.cpp
-    src/adapters/gui/chart_view_data.cpp)
-  target_compile_features(tradebox_ui_tests PRIVATE cxx_std_23)
-  target_link_libraries(tradebox_ui_tests PRIVATE tradebox_core GTest::gtest_main)
-  tradebox_enable_strict_warnings(tradebox_ui_tests)
-  gtest_discover_tests(tradebox_ui_tests)
 
   set(TRADEBOX_REPLAY_CORPUS
     ${CMAKE_CURRENT_BINARY_DIR}/testdata/alpaca_market_stream_10x10000.jsonl
