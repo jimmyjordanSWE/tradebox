@@ -51,16 +51,14 @@ struct DatabaseStartupResult {
     std::string error;
 };
 
-enum class NativeMenuCommand : UINT {
-    Exit = 1,
-    ResetLayout = 2,
-};
-
-struct NativeMenuState {
-    HMENU menu = nullptr;
-    HWND window = nullptr;
-    bool* done = nullptr;
-    tradebox::ui::Workspace* workspace = nullptr;
+struct ChromeMetrics {
+    // These dimensions mirror VS Code's desktop custom titlebar: a compact
+    // 35px row and a fixed 46px slot for each window control.
+    int title_bar_height = 35;
+    int control_width = 46;
+    int menu_width = 180;
+    int status_start = 0;
+    int status_end = 0;
 };
 
 struct IconEntry {
@@ -152,66 +150,6 @@ bool CreateRenderer(SDL_Window* window, Dx11Renderer& renderer) {
     return CreateRenderTarget(renderer);
 }
 
-bool SDLCALL HandleNativeMenuMessage(void* userdata, MSG* message) {
-    if (userdata == nullptr || message == nullptr ||
-        message->message != WM_COMMAND)
-        return true;
-    auto& state = *static_cast<NativeMenuState*>(userdata);
-    if (message->hwnd != state.window) return true;
-
-    switch (static_cast<NativeMenuCommand>(LOWORD(message->wParam))) {
-        case NativeMenuCommand::Exit:
-            if (state.done != nullptr) *state.done = true;
-            return false;
-        case NativeMenuCommand::ResetLayout:
-            if (state.workspace != nullptr) {
-                state.workspace->ResetAll();
-                state.workspace->MarkDirty();
-            }
-            return false;
-    }
-    return true;
-}
-
-bool InstallNativeMenu(SDL_Window* window, NativeMenuState& state) {
-    state.window = NativeWindowHandle(window);
-    if (state.window == nullptr) return false;
-
-    HMENU file_menu = CreatePopupMenu();
-    HMENU view_menu = CreatePopupMenu();
-    HMENU menu = CreateMenu();
-    if (file_menu == nullptr || view_menu == nullptr || menu == nullptr) {
-        if (menu != nullptr) DestroyMenu(menu);
-        if (view_menu != nullptr) DestroyMenu(view_menu);
-        if (file_menu != nullptr) DestroyMenu(file_menu);
-        return false;
-    }
-    if (!AppendMenuW(file_menu, MF_STRING,
-                     static_cast<UINT_PTR>(NativeMenuCommand::Exit),
-                     L"Exit") ||
-        !AppendMenuW(view_menu, MF_STRING,
-                     static_cast<UINT_PTR>(NativeMenuCommand::ResetLayout),
-                     L"Reset layout") ||
-        !AppendMenuW(menu, MF_POPUP,
-                     reinterpret_cast<UINT_PTR>(file_menu), L"File") ||
-        !AppendMenuW(menu, MF_POPUP,
-                     reinterpret_cast<UINT_PTR>(view_menu), L"View") ||
-        !SetMenu(state.window, menu) || !DrawMenuBar(state.window)) {
-        DestroyMenu(menu);
-        return false;
-    }
-    state.menu = menu;
-    SDL_SetWindowsMessageHook(HandleNativeMenuMessage, &state);
-    return true;
-}
-
-void RemoveNativeMenu(NativeMenuState& state) {
-    SDL_SetWindowsMessageHook(nullptr, nullptr);
-    if (state.window != nullptr) SetMenu(state.window, nullptr);
-    if (state.menu != nullptr) DestroyMenu(state.menu);
-    state.menu = nullptr;
-}
-
 std::filesystem::path AssetPath(std::string_view relative_path) {
     const char* base_path = SDL_GetBasePath();
     const std::filesystem::path result =
@@ -289,6 +227,224 @@ std::string Utf8Codepoint(unsigned int codepoint) {
         result.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
     }
     return result;
+}
+
+SDL_HitTestResult SDLCALL HitTestChrome(
+    SDL_Window* window, const SDL_Point* area, void* data) {
+    if (area == nullptr || data == nullptr) return SDL_HITTEST_NORMAL;
+    const auto& metrics = *static_cast<const ChromeMetrics*>(data);
+    const SDL_WindowFlags flags = SDL_GetWindowFlags(window);
+    const bool maximized = (flags & SDL_WINDOW_MAXIMIZED) != 0;
+
+    int width = 0;
+    int height = 0;
+    SDL_GetWindowSize(window, &width, &height);
+    constexpr int kResizeBorder = 8;
+    if (!maximized) {
+        if (area->x < kResizeBorder) {
+            if (area->y < kResizeBorder) return SDL_HITTEST_RESIZE_TOPLEFT;
+            if (area->y >= height - kResizeBorder)
+                return SDL_HITTEST_RESIZE_BOTTOMLEFT;
+            return SDL_HITTEST_RESIZE_LEFT;
+        }
+        if (area->x >= width - kResizeBorder) {
+            if (area->y < kResizeBorder) return SDL_HITTEST_RESIZE_TOPRIGHT;
+            if (area->y >= height - kResizeBorder)
+                return SDL_HITTEST_RESIZE_BOTTOMRIGHT;
+            return SDL_HITTEST_RESIZE_RIGHT;
+        }
+        if (area->y >= height - kResizeBorder)
+            return SDL_HITTEST_RESIZE_BOTTOM;
+        if (area->y < kResizeBorder) return SDL_HITTEST_RESIZE_TOP;
+    }
+
+    const int controls_width = metrics.control_width * 3;
+    const bool in_title_bar = area->y < metrics.title_bar_height;
+    const bool in_menu = area->x < metrics.menu_width;
+    const bool in_controls = area->x >= width - controls_width;
+    const bool in_status = metrics.status_start > 0 &&
+                           area->x >= metrics.status_start &&
+                           area->x < metrics.status_end;
+    if (in_title_bar && !in_menu && !in_status && !in_controls)
+        return SDL_HITTEST_DRAGGABLE;
+    return SDL_HITTEST_NORMAL;
+}
+
+bool DrawChromeIconButton(const char* id, unsigned int codepoint,
+                          ImFont* icon_font, ImVec2 size,
+                          const char* tooltip, bool close_button = false) {
+    const bool clicked = ImGui::InvisibleButton(id, size);
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    ImU32 background = active
+                           ? ImGui::GetColorU32(ImGuiCol_ButtonActive)
+                           : hovered
+                                 ? ImGui::GetColorU32(ImGuiCol_ButtonHovered)
+                                 : IM_COL32(0, 0, 0, 0);
+    if (close_button && hovered)
+        background = IM_COL32(196, 60, 60, 255);
+
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    draw_list->AddRectFilled(min, max, background);
+    const std::string glyph = Utf8Codepoint(codepoint);
+    ImGui::PushFont(icon_font);
+    const ImVec2 glyph_size = ImGui::CalcTextSize(glyph.c_str());
+    const ImVec2 glyph_position{
+        min.x + (size.x - glyph_size.x) * 0.5f,
+        min.y + (size.y - glyph_size.y) * 0.5f};
+    draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize(), glyph_position,
+                       ImGui::GetColorU32(ImGuiCol_Text), glyph.c_str());
+    ImGui::PopFont();
+    if (hovered && tooltip != nullptr) ImGui::SetTooltip("%s", tooltip);
+    return clicked;
+}
+
+void DrawApplicationChrome(
+    SDL_Window* window, ChromeMetrics& metrics,
+    tradebox::ui::Workspace& workspace, const GuiFonts& fonts, bool& done) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    metrics.title_bar_height = 35;
+    metrics.control_width = 46;
+    const float row_height = static_cast<float>(metrics.title_bar_height);
+    const float controls_width =
+        static_cast<float>(metrics.control_width * 3);
+
+    ImGui::PushFont(fonts.regular, 14.0f);
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float menu_width =
+        ImGui::CalcTextSize("File").x + ImGui::CalcTextSize("View").x +
+        style.FramePadding.x * 4.0f + style.ItemSpacing.x * 3.0f;
+    ImGui::PushFont(fonts.icons, 16.0f);
+    const float status_icon_width =
+        ImGui::CalcTextSize(Utf8Codepoint(0xe63e).c_str()).x;
+    ImGui::PopFont();
+    const float status_width = status_icon_width + style.ItemSpacing.x +
+                               ImGui::CalcTextSize("OFFLINE").x;
+    const float status_controls_gap = 16.0f;
+    const float right_width =
+        status_width + status_controls_gap + controls_width;
+    ImGui::PopFont();
+
+    metrics.menu_width = static_cast<int>(std::ceil(menu_width));
+    metrics.status_end = static_cast<int>(viewport->Size.x - controls_width);
+    metrics.status_start = static_cast<int>(
+        viewport->Size.x - right_width);
+
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoNavFocus |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse;
+    ImGui::SetNextWindowPos(viewport->Pos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(
+        {viewport->Size.x, row_height}, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0.0f, 0.0f));
+    if (ImGui::Begin("##tradebox_chrome", nullptr, flags)) {
+        const ImVec2 window_min = ImGui::GetWindowPos();
+        const ImVec2 window_size = ImGui::GetWindowSize();
+        const ImVec2 window_max{window_min.x + window_size.x,
+                                window_min.y + window_size.y};
+        ImDrawList* draw_list = ImGui::GetWindowDrawList();
+        draw_list->AddRectFilled(
+            window_min, window_max, ImGui::GetColorU32(ImGuiCol_MenuBarBg));
+        draw_list->AddLine(
+            {window_min.x, window_max.y - 1.0f},
+            {window_max.x, window_max.y - 1.0f},
+            ImGui::GetColorU32(ImGuiCol_Border));
+
+        if (ImGui::BeginTable(
+                "##tradebox_chrome_layout", 3,
+                ImGuiTableFlags_NoSavedSettings |
+                    ImGuiTableFlags_NoBordersInBody |
+                    ImGuiTableFlags_NoPadOuterX)) {
+            ImGui::TableSetupColumn(
+                "##chrome_menu", ImGuiTableColumnFlags_WidthFixed,
+                menu_width);
+            ImGui::TableSetupColumn(
+                "##chrome_center", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn(
+                "##chrome_right", ImGuiTableColumnFlags_WidthFixed,
+                right_width);
+            ImGui::TableNextRow(0, row_height);
+
+            ImGui::TableNextColumn();
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                                ImVec2(8.0f, 3.0f));
+            if (ImGui::BeginMenu("File")) {
+                if (ImGui::MenuItem("Exit")) done = true;
+                ImGui::EndMenu();
+            }
+            ImGui::SameLine(0.0f, 4.0f);
+            if (ImGui::BeginMenu("View")) {
+                if (ImGui::MenuItem("Reset layout")) {
+                    workspace.ResetAll();
+                    workspace.MarkDirty();
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::PopStyleVar();
+
+            ImGui::TableNextColumn();
+            ImGui::PushFont(fonts.regular, 14.0f);
+            const float title_width = ImGui::CalcTextSize("Trade Box").x;
+            const float center_width = ImGui::GetContentRegionAvail().x;
+            if (center_width > title_width)
+                ImGui::SetCursorPosX(
+                    ImGui::GetCursorPosX() +
+                    (center_width - title_width) * 0.5f);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextUnformatted("Trade Box");
+            ImGui::PopFont();
+
+            ImGui::TableNextColumn();
+            ImGui::PushFont(fonts.regular, 14.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                                ImVec2(0.0f, 3.0f));
+            ImGui::PushFont(fonts.icons, 16.0f);
+            ImGui::TextUnformatted(Utf8Codepoint(0xe63e).c_str());
+            ImGui::PopFont();
+            ImGui::SameLine(0.0f, style.ItemSpacing.x);
+            ImGui::TextUnformatted("OFFLINE");
+            ImGui::SameLine(0.0f, status_controls_gap);
+            ImGui::PopStyleVar();
+
+            if (DrawChromeIconButton(
+                    "##minimize", 0xe931, fonts.icons,
+                    {static_cast<float>(metrics.control_width), row_height},
+                    "Minimize"))
+                static_cast<void>(SDL_MinimizeWindow(window));
+            ImGui::SameLine(0.0f, 0.0f);
+            const bool maximized =
+                (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
+            if (DrawChromeIconButton(
+                    "##maximize", maximized ? 0xe5d1 : 0xe930,
+                    fonts.icons,
+                    {static_cast<float>(metrics.control_width), row_height},
+                    maximized ? "Restore" : "Maximize")) {
+                if (maximized)
+                    static_cast<void>(SDL_RestoreWindow(window));
+                else
+                    static_cast<void>(SDL_MaximizeWindow(window));
+            }
+            ImGui::SameLine(0.0f, 0.0f);
+            if (DrawChromeIconButton(
+                    "##close", 0xe5cd, fonts.icons,
+                    {static_cast<float>(metrics.control_width), row_height},
+                    "Close", true))
+                done = true;
+            ImGui::PopFont();
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(3);
 }
 
 void DrawFontSpecimen(tradebox::ui::Workspace& workspace, const GuiFonts& fonts,
@@ -438,7 +594,8 @@ int RunApplication(const LaunchOptions& options) {
         480, static_cast<int>(native_window.bounds.height));
     SDL_Window* window = SDL_CreateWindow(
         "Trade Box", initial_width, initial_height,
-        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS |
+            SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window) {
         SDL_Quit();
         return 1;
@@ -447,6 +604,14 @@ int RunApplication(const LaunchOptions& options) {
                           static_cast<int>(native_window.bounds.x),
                           static_cast<int>(native_window.bounds.y));
     if (native_window.maximized) SDL_MaximizeWindow(window);
+    ChromeMetrics chrome_metrics;
+    if (!SDL_SetWindowHitTest(window, HitTestChrome, &chrome_metrics)) {
+        MessageBoxA(nullptr, SDL_GetError(), "Trade Box window error",
+                    MB_OK | MB_ICONERROR);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
 
     Dx11Renderer renderer;
     if (!CreateRenderer(window, renderer)) {
@@ -507,16 +672,6 @@ int RunApplication(const LaunchOptions& options) {
     if (!profile_existed) profile_store.MarkDirty();
 
     bool done = false;
-    NativeMenuState native_menu{
-        .done = &done,
-        .workspace = &workspace,
-    };
-    if (!InstallNativeMenu(window, native_menu)) {
-        MessageBoxA(nullptr, "Trade Box could not create its native menu.",
-                    "Trade Box window error", MB_OK | MB_ICONERROR);
-        done = true;
-    }
-
     const Uint64 started_at = SDL_GetTicks();
     while (!done) {
         SDL_Event event;
@@ -561,12 +716,17 @@ int RunApplication(const LaunchOptions& options) {
             workstation_state.application.ui_scale = ui_scale.Scale();
         }
         const ImGuiViewport* viewport = ImGui::GetMainViewport();
+        const float chrome_height =
+            static_cast<float>(chrome_metrics.title_bar_height);
         workspace.BeginFrame(
-            viewport->Pos, viewport->Size,
+            {viewport->Pos.x, viewport->Pos.y + chrome_height},
+            {viewport->Size.x,
+             std::max(0.0f, viewport->Size.y - chrome_height)},
             false);
         DrawFontSpecimen(workspace, gui_fonts, font_specimen_window);
         DrawIconGallery(workspace, gui_fonts, icon_catalog, icon_gallery_window);
         workspace.EndFrame();
+        DrawApplicationChrome(window, chrome_metrics, workspace, gui_fonts, done);
 
         const bool native_window_changed =
             CaptureNativeWindowState(window, workstation_state.native_window);
@@ -623,7 +783,6 @@ int RunApplication(const LaunchOptions& options) {
                     "Trade Box profile error", MB_OK | MB_ICONERROR);
     }
 
-    RemoveNativeMenu(native_menu);
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
