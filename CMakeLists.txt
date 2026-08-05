@@ -203,6 +203,8 @@ target_link_libraries(tradebox_application
 tradebox_enable_strict_warnings(tradebox_application)
 
 add_executable(tradebox_gui WIN32
+  src/adapters/gui/chart_geometry.cpp
+  src/adapters/gui/chart_window.cpp
   src/adapters/gui/main.cpp
   src/adapters/gui/workspace.cpp
 )
@@ -289,6 +291,7 @@ if(BUILD_TESTING)
   gtest_discover_tests(tradebox_order_pipeline_tests)
 
   add_executable(tradebox_workstation_tests
+    tests/unit/chart_geometry_tests.cpp
     tests/unit/native_chrome_layout_tests.cpp
     tests/unit/workstation_state_tests.cpp
     tests/unit/workspace_dirty_tests.cpp
@@ -297,6 +300,9 @@ if(BUILD_TESTING)
   target_compile_features(tradebox_workstation_tests PRIVATE cxx_std_23)
   target_include_directories(tradebox_workstation_tests PRIVATE
     src/adapters/gui
+  )
+  target_sources(tradebox_workstation_tests PRIVATE
+    src/adapters/gui/chart_geometry.cpp
   )
   target_link_libraries(tradebox_workstation_tests PRIVATE
     tradebox_workstation

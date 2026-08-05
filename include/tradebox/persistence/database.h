@@ -83,6 +83,8 @@ public:
     bool OpenAt(const std::filesystem::path& database_path,
                 std::string& error);
     std::vector<tradebox::core::TradableAsset> LoadAssetCatalog();
+    std::vector<tradebox::core::TradableAsset>
+    LoadKnownProviderBarAssets();
     void SaveAssetCatalog(const std::vector<tradebox::core::TradableAsset>& assets);
     std::vector<Bar> LoadBars(const std::string& symbol);
     void StoreBars(const std::string& symbol, const std::vector<Bar>& bars);

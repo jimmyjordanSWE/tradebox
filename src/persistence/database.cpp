@@ -1442,6 +1442,38 @@ std::vector<tradebox::core::TradableAsset> Database::LoadAssetCatalog() {
     return result;
 }
 
+std::vector<tradebox::core::TradableAsset>
+Database::LoadKnownProviderBarAssets() {
+    std::vector<tradebox::core::TradableAsset> result;
+    std::scoped_lock lock(db_mutex_);
+    sqlite3_stmt* statement = nullptr;
+    const char* sql =
+        "SELECT instrument_id,MAX(symbol) FROM provider_bars "
+        "WHERE instrument_id<>'' AND symbol<>'' "
+        "GROUP BY instrument_id ORDER BY MAX(symbol)";
+    if (sqlite3_prepare_v2(market_db_, sql, -1, &statement, nullptr) !=
+        SQLITE_OK)
+        return result;
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        const auto text = [statement](int column) {
+            const auto* value = sqlite3_column_text(statement, column);
+            return value
+                       ? std::string(
+                             reinterpret_cast<const char*>(value))
+                       : std::string{};
+        };
+        result.push_back({
+            .symbol = text(1),
+            .name = "Stored market data",
+            .active = true,
+            .tradable = true,
+            .instrument_id = text(0),
+        });
+    }
+    sqlite3_finalize(statement);
+    return result;
+}
+
 void Database::SaveAssetCatalog(
     const std::vector<tradebox::core::TradableAsset>& assets) {
     nlohmann::json json = nlohmann::json::array();

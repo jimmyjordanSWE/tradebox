@@ -200,4 +200,34 @@ TEST(ChartApplicationSnapshotTest, ExposesExplicitStatesAndAssetSearch) {
               *volume);
 }
 
+TEST(ChartApplicationSnapshotTest, FindsStoredBarInstrumentWithoutCatalog) {
+    TemporaryDatabase temporary;
+    Database database;
+    std::string error;
+    ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+    const tradebox::core::BarRange coverage{1'000, 2'000};
+    const auto one = tradebox::core::Decimal::Parse("1");
+    ASSERT_TRUE(one);
+    ASSERT_TRUE(database.StoreProviderBars({
+        .key = Key(),
+        .symbol = "AAPL",
+        .bars = {{.start_ns = 1'000,
+                  .open = *one,
+                  .high = *one,
+                  .low = *one,
+                  .close = *one,
+                  .volume = *one}},
+        .covered_range = coverage,
+    }));
+
+    tradebox::application::TradingApplication application(database);
+    const auto snapshot = application.SnapshotForUi({
+        .asset_search = "AAPL",
+        .asset_limit = 5,
+    });
+    ASSERT_EQ(snapshot.assets.size(), 1U);
+    EXPECT_EQ(snapshot.assets.front().symbol, "AAPL");
+    EXPECT_EQ(snapshot.assets.front().instrument_id, "asset-aapl");
+}
+
 }  // namespace

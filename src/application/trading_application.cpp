@@ -244,9 +244,15 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
         result.charts.push_back(std::move(projected));
     }
     if (query.asset_limit != 0) {
-        const auto assets = impl_->database.LoadAssetCatalog();
+        const auto catalog = impl_->database.LoadAssetCatalog();
         result.assets = core::SearchTradableAssets(
-            assets, query.asset_search, query.asset_limit);
+            catalog, query.asset_search, query.asset_limit);
+        if (result.assets.empty() && !query.asset_search.empty()) {
+            const auto stored =
+                impl_->database.LoadKnownProviderBarAssets();
+            result.assets = core::SearchTradableAssets(
+                stored, query.asset_search, query.asset_limit);
+        }
     }
     return result;
 }
@@ -391,6 +397,7 @@ TradingApplication::Connect(ConnectionRequest request) {
     impl_->broker.Connect(std::move(credentials),
                           request.market_symbols,
                           request.market_data_feed);
+    impl_->broker.RequestAssetCatalog();
     return receipt;
 }
 
