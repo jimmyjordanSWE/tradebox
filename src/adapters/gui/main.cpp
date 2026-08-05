@@ -57,8 +57,6 @@ struct ChromeMetrics {
     int title_bar_height = 35;
     int control_width = 46;
     int menu_width = 180;
-    int status_start = 0;
-    int status_end = 0;
 };
 
 struct IconEntry {
@@ -262,10 +260,7 @@ SDL_HitTestResult SDLCALL HitTestChrome(
     const bool in_title_bar = area->y < metrics.title_bar_height;
     const bool in_menu = area->x < metrics.menu_width;
     const bool in_controls = area->x >= width - controls_width;
-    const bool in_status = metrics.status_start > 0 &&
-                           area->x >= metrics.status_start &&
-                           area->x < metrics.status_end;
-    if (in_title_bar && !in_menu && !in_status && !in_controls)
+    if (in_title_bar && !in_menu && !in_controls)
         return SDL_HITTEST_DRAGGABLE;
     return SDL_HITTEST_NORMAL;
 }
@@ -303,7 +298,7 @@ bool DrawChromeIconButton(const char* id, unsigned int codepoint,
 
 void DrawApplicationChrome(
     SDL_Window* window, ChromeMetrics& metrics,
-    tradebox::ui::Workspace& workspace, const GuiFonts& fonts, bool& done) {
+    const GuiFonts& fonts, bool& done) {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     metrics.title_bar_height = 35;
     metrics.control_width = 46;
@@ -313,24 +308,12 @@ void DrawApplicationChrome(
 
     ImGui::PushFont(fonts.regular, 14.0f);
     const ImGuiStyle& style = ImGui::GetStyle();
-    const float menu_width =
-        ImGui::CalcTextSize("File").x + ImGui::CalcTextSize("View").x +
-        style.FramePadding.x * 4.0f + style.ItemSpacing.x * 3.0f;
-    ImGui::PushFont(fonts.icons, 16.0f);
-    const float status_icon_width =
-        ImGui::CalcTextSize(Utf8Codepoint(0xe63e).c_str()).x;
-    ImGui::PopFont();
-    const float status_width = status_icon_width + style.ItemSpacing.x +
-                               ImGui::CalcTextSize("OFFLINE").x;
-    const float status_controls_gap = 16.0f;
-    const float right_width =
-        status_width + status_controls_gap + controls_width;
+    const float menu_width = ImGui::CalcTextSize("File").x +
+                             style.FramePadding.x * 2.0f;
+    const float right_width = controls_width;
     ImGui::PopFont();
 
     metrics.menu_width = static_cast<int>(std::ceil(menu_width));
-    metrics.status_end = static_cast<int>(viewport->Size.x - controls_width);
-    metrics.status_start = static_cast<int>(
-        viewport->Size.x - right_width);
 
     const ImGuiWindowFlags flags =
         ImGuiWindowFlags_NoDecoration |
@@ -381,14 +364,6 @@ void DrawApplicationChrome(
                 if (ImGui::MenuItem("Exit")) done = true;
                 ImGui::EndMenu();
             }
-            ImGui::SameLine(0.0f, 4.0f);
-            if (ImGui::BeginMenu("View")) {
-                if (ImGui::MenuItem("Reset layout")) {
-                    workspace.ResetAll();
-                    workspace.MarkDirty();
-                }
-                ImGui::EndMenu();
-            }
             ImGui::PopStyleVar();
 
             ImGui::TableNextColumn();
@@ -404,17 +379,6 @@ void DrawApplicationChrome(
             ImGui::PopFont();
 
             ImGui::TableNextColumn();
-            ImGui::PushFont(fonts.regular, 14.0f);
-            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
-                                ImVec2(0.0f, 3.0f));
-            ImGui::PushFont(fonts.icons, 16.0f);
-            ImGui::TextUnformatted(Utf8Codepoint(0xe63e).c_str());
-            ImGui::PopFont();
-            ImGui::SameLine(0.0f, style.ItemSpacing.x);
-            ImGui::TextUnformatted("OFFLINE");
-            ImGui::SameLine(0.0f, status_controls_gap);
-            ImGui::PopStyleVar();
-
             if (DrawChromeIconButton(
                     "##minimize", 0xe931, fonts.icons,
                     {static_cast<float>(metrics.control_width), row_height},
@@ -439,7 +403,6 @@ void DrawApplicationChrome(
                     {static_cast<float>(metrics.control_width), row_height},
                     "Close", true))
                 done = true;
-            ImGui::PopFont();
             ImGui::EndTable();
         }
     }
@@ -726,7 +689,7 @@ int RunApplication(const LaunchOptions& options) {
         DrawFontSpecimen(workspace, gui_fonts, font_specimen_window);
         DrawIconGallery(workspace, gui_fonts, icon_catalog, icon_gallery_window);
         workspace.EndFrame();
-        DrawApplicationChrome(window, chrome_metrics, workspace, gui_fonts, done);
+        DrawApplicationChrome(window, chrome_metrics, gui_fonts, done);
 
         const bool native_window_changed =
             CaptureNativeWindowState(window, workstation_state.native_window);
