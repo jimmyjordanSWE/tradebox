@@ -69,10 +69,16 @@ public:
     [[nodiscard]] bool HasSavedCredentials(
         std::string_view credential_slot,
         core::AccountEnvironment environment) const;
+    [[nodiscard]] std::expected<std::vector<SavedAccountDescriptor>, std::string>
+    SavedAccounts() const;
     [[nodiscard]] std::expected<void, std::string> SaveCredentials(
         std::string_view credential_slot,
         core::AccountEnvironment environment, std::string api_key,
         std::string api_secret);
+    [[nodiscard]] std::expected<void, std::string> RenameAccount(
+        std::string_view old_credential_slot,
+        std::string_view new_credential_slot,
+        core::AccountEnvironment environment);
     [[nodiscard]] std::expected<void, std::string> ForgetCredentials(
         std::string_view credential_slot,
         core::AccountEnvironment environment);

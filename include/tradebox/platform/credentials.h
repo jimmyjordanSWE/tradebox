@@ -1,8 +1,10 @@
 #pragma once
 
+#include <expected>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 struct AlpacaCredentials {
     std::string key;
@@ -58,12 +60,24 @@ private:
 
 class CredentialStore {
 public:
+    struct Descriptor {
+        std::string slot;
+        bool paper = true;
+        // Windows Credential Manager's UserName field contains the API key.
+        // This descriptor intentionally never contains the secret blob.
+        std::string api_key_id;
+    };
+
     static bool Save(std::string_view slot, const AlpacaCredentials& credentials,
                      std::string& error);
     static bool Load(std::string_view slot, bool paper,
                      AlpacaCredentials& credentials, std::string& error);
     static bool Exists(std::string_view slot, bool paper);
     static bool Delete(std::string_view slot, bool paper, std::string& error);
+    static bool Rename(std::string_view old_slot, std::string_view new_slot,
+                       bool paper, std::string& error);
+    [[nodiscard]] static std::expected<std::vector<Descriptor>, std::string>
+    List();
     static bool Save(const AlpacaCredentials& credentials, std::string& error);
     static bool Load(bool paper, AlpacaCredentials& credentials, std::string& error);
     static bool Delete(bool paper, std::string& error);

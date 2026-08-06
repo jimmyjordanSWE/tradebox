@@ -431,16 +431,51 @@ bool TradingApplication::HasSavedCredentials(
         credential_slot, environment == core::AccountEnvironment::Paper);
 }
 
+std::expected<std::vector<SavedAccountDescriptor>, std::string>
+TradingApplication::SavedAccounts() const {
+    const auto listed = CredentialStore::List();
+    if (!listed) return std::unexpected(listed.error());
+
+    std::vector<SavedAccountDescriptor> result;
+    result.reserve(listed->size());
+    for (const CredentialStore::Descriptor& descriptor : *listed) {
+        result.push_back({
+            .credential_slot = descriptor.slot,
+            .environment = descriptor.paper
+                ? core::AccountEnvironment::Paper
+                : core::AccountEnvironment::Live,
+            .api_key_id = descriptor.api_key_id,
+        });
+    }
+    return result;
+}
+
 std::expected<void, std::string> TradingApplication::SaveCredentials(
     std::string_view credential_slot, core::AccountEnvironment environment,
     std::string api_key, std::string api_secret) {
     if (api_key.empty() || api_secret.empty())
         return std::unexpected("Both broker credential fields are required");
+    if (credential_slot.empty())
+        return std::unexpected("An account name is required");
     AlpacaCredentials credentials(
         std::move(api_key), std::move(api_secret),
         environment == core::AccountEnvironment::Paper);
     std::string error;
     if (!CredentialStore::Save(credential_slot, credentials, error))
+        return std::unexpected(std::move(error));
+    return {};
+}
+
+std::expected<void, std::string> TradingApplication::RenameAccount(
+    std::string_view old_credential_slot,
+    std::string_view new_credential_slot,
+    core::AccountEnvironment environment) {
+    if (old_credential_slot.empty() || new_credential_slot.empty())
+        return std::unexpected("An account name is required");
+    std::string error;
+    if (!CredentialStore::Rename(
+            old_credential_slot, new_credential_slot,
+            environment == core::AccountEnvironment::Paper, error))
         return std::unexpected(std::move(error));
     return {};
 }

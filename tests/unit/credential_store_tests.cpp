@@ -2,7 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
+#include <ranges>
 #include <string>
 
 namespace {
@@ -37,7 +39,28 @@ TEST(CredentialStore, SeparatesPaperAndLiveCredentialsForOneSlot) {
     EXPECT_EQ(loaded_live.secret, "live-secret");
     EXPECT_FALSE(loaded_live.paper);
 
-    ASSERT_TRUE(CredentialStore::Delete(slot, true, error)) << error;
+    const auto listed = CredentialStore::List();
+    ASSERT_TRUE(listed) << listed.error();
+    const auto paper_entry = std::ranges::find_if(
+        *listed, [&slot](const CredentialStore::Descriptor& descriptor) {
+            return descriptor.slot == slot && descriptor.paper;
+        });
+    ASSERT_NE(paper_entry, listed->end());
+    EXPECT_EQ(paper_entry->api_key_id, "paper-key");
+    const auto live_entry = std::ranges::find_if(
+        *listed, [&slot](const CredentialStore::Descriptor& descriptor) {
+            return descriptor.slot == slot && !descriptor.paper;
+        });
+    ASSERT_NE(live_entry, listed->end());
+    EXPECT_EQ(live_entry->api_key_id, "live-key");
+
+    const std::string renamed_slot = slot + "-renamed";
+    ASSERT_TRUE(CredentialStore::Rename(
+        slot, renamed_slot, true, error)) << error;
+    EXPECT_FALSE(CredentialStore::Exists(slot, true));
+    EXPECT_TRUE(CredentialStore::Exists(renamed_slot, true));
+
+    ASSERT_TRUE(CredentialStore::Delete(renamed_slot, true, error)) << error;
     ASSERT_TRUE(CredentialStore::Delete(slot, false, error)) << error;
     EXPECT_FALSE(CredentialStore::Exists(slot, true));
     EXPECT_FALSE(CredentialStore::Exists(slot, false));

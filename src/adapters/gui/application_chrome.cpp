@@ -21,14 +21,15 @@ ImVec4 AccountIconColor(const core::CoreSnapshot& snapshot) {
 
 void DrawSettingsPopup(
     ImFont* regular_font, const char* id, ImVec2 anchor,
-    workstation::ApplicationSettings& settings, bool& changed) {
+    workstation::ApplicationSettings& settings, bool& auto_connect,
+    bool& changed) {
     ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, {0.0f, 0.0f});
     ImGui::SetNextWindowSizeConstraints({250.0f, 0.0f}, {360.0f, 640.0f});
     if (!ImGui::BeginPopup(id)) return;
 
     ImGui::PushFont(regular_font, 18.0f);
-    ImGui::TextUnformatted("Settings");
-    ImGui::Separator();
+    if (ImGui::Checkbox("Auto connect last used account", &auto_connect))
+        changed = true;
     bool vsync = settings.vsync_requested;
     if (ImGui::Checkbox("VSync", &vsync)) {
         settings.vsync_requested = vsync;
@@ -36,16 +37,13 @@ void DrawSettingsPopup(
     }
     ImGui::SetItemTooltip("Synchronizes rendering with the display refresh.");
     int maximum_frame_rate = settings.maximum_frame_rate;
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::SliderInt(
-            "Maximum frame rate", &maximum_frame_rate, 30, 240, "%d FPS",
-            ImGuiSliderFlags_AlwaysClamp)) {
+    ImGui::SetNextItemWidth(90.0f);
+    if (ImGui::InputInt("Max framerate", &maximum_frame_rate, 1, 10,
+                        ImGuiInputTextFlags_CharsDecimal)) {
         settings.maximum_frame_rate =
             std::clamp(maximum_frame_rate, 30, 240);
         changed = true;
     }
-    ImGui::SetItemTooltip(
-        "Limits rendering work per second. Ctrl+click to type a value.");
     ImGui::PopFont();
     ImGui::EndPopup();
 }
@@ -76,8 +74,14 @@ CreationActions DrawCreationPopup(ImFont* regular_font, const char* id,
 ChromeActions DrawApplicationChrome(
     SDL_Window* window, ChromeMetrics& metrics, const GuiFonts& fonts,
     std::string_view market_time_text, const core::CoreSnapshot& snapshot,
+    std::string_view account_alias,
     bool application_available, AccountPopupState& account_popup,
-    bool saved_credentials_available,
+    const std::vector<application::SavedAccountDescriptor>& saved_accounts,
+    std::string_view saved_accounts_error,
+    std::string_view current_credential_slot,
+    core::AccountEnvironment current_environment,
+    std::string_view current_account_id,
+    bool& auto_connect,
     workstation::ApplicationSettings& application_settings, bool& done) {
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     metrics.title_bar_height = 35;
@@ -124,8 +128,6 @@ ChromeActions DrawApplicationChrome(
             "##account", 0xf20b, fonts.icons, tool_size,
             ImGui::GetColorU32(AccountIconColor(snapshot)));
         const ImVec2 account_anchor = ImGui::GetItemRectMax();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", snapshot.status_message.c_str());
         ImGui::SameLine(0.0f, 0.0f);
         const bool settings_clicked = DrawTitleBarToolButton(
             "##settings", 0xe8b8, fonts.icons, tool_size,
@@ -141,10 +143,14 @@ ChromeActions DrawApplicationChrome(
         const ImVec2 left_menu_anchor{window_min.x, account_anchor.y};
         actions.account = DrawAccountPopup(
             fonts.regular, "##account_menu", left_menu_anchor, snapshot,
-            application_available, saved_credentials_available, fonts.icons,
+            application_available, saved_accounts, saved_accounts_error,
+            current_credential_slot, current_environment, current_account_id,
+            fonts.icons,
             account_popup);
         DrawSettingsPopup(fonts.regular, "##settings_menu", left_menu_anchor,
-                          application_settings, actions.settings_changed);
+                          application_settings,
+                          auto_connect,
+                          actions.settings_changed);
         const CreationActions creation_actions = DrawCreationPopup(
             fonts.regular, "##create_menu",
             {window_min.x + tool_controls_width -
@@ -182,8 +188,12 @@ ChromeActions DrawApplicationChrome(
         const bool live_account =
             snapshot.authenticated &&
             snapshot.environment == core::AccountEnvironment::Live;
-        const std::string environment_title =
+        std::string environment_title =
             snapshot.authenticated ? (live_account ? "LIVE" : "PAPER") : "";
+        if (!environment_title.empty() && !account_alias.empty()) {
+            environment_title += " · ";
+            environment_title += account_alias;
+        }
         const ImVec2 time_size = ImGui::CalcTextSize(time_title.c_str());
         const ImVec2 environment_size =
             ImGui::CalcTextSize(environment_title.c_str());

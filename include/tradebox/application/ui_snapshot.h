@@ -11,6 +11,12 @@
 
 namespace tradebox::application {
 
+struct SavedAccountDescriptor {
+    std::string credential_slot;
+    core::AccountEnvironment environment = core::AccountEnvironment::Paper;
+    std::string api_key_id;
+};
+
 struct UiChartQuery {
     std::string document_id;
     core::BarSeriesKey key;

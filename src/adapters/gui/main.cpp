@@ -427,6 +427,13 @@ int RunApplication(const LaunchOptions& options) {
 
     bool done = false;
     AccountPopupState account_popup;
+    const std::string initial_account_name =
+        workstation_state.account_context.account_alias;
+    std::copy_n(
+        initial_account_name.c_str(),
+        std::min(initial_account_name.size(),
+                 account_popup.account_name.size() - 1U),
+        account_popup.account_name.data());
     account_popup.environment =
         workstation_state.account_context.paper
             ? tradebox::core::AccountEnvironment::Paper
@@ -461,6 +468,32 @@ int RunApplication(const LaunchOptions& options) {
                     tradebox::application::TradingApplication>(
                     events, *database);
                 SDL_SetWindowTitle(window, "Trade Box");
+                if (workstation_state.account_context.auto_connect) {
+                    const tradebox::core::AccountEnvironment environment =
+                        workstation_state.account_context.paper
+                            ? tradebox::core::AccountEnvironment::Paper
+                            : tradebox::core::AccountEnvironment::Live;
+                    const std::string slot = CredentialSlot(
+                        workstation_state.account_context, environment);
+                    if (application->HasSavedCredentials(slot, environment)) {
+                        tradebox::application::ConnectionRequest request;
+                        request.environment = environment;
+                        request.credential_slot = slot;
+                        request.market_symbols =
+                            ConnectionSymbols(workstation_state.workspace);
+                        request.market_data_feed =
+                            tradebox::core::MarketDataFeed::Iex;
+                        const auto receipt =
+                            application->Connect(std::move(request));
+                        account_popup.message = receipt
+                                                     ? receipt->message
+                                                     : receipt.error().message;
+                    } else {
+                        account_popup.message =
+                            "Auto-connect is enabled, but no saved credentials "
+                            "were found for the last account";
+                    }
+                }
             }
         }
 
@@ -477,17 +510,40 @@ int RunApplication(const LaunchOptions& options) {
             application != nullptr
                 ? application->SnapshotForUi(snapshot_query)
                 : tradebox::application::ApplicationUiSnapshot{};
+        std::vector<tradebox::application::SavedAccountDescriptor>
+            saved_accounts;
+        std::string saved_accounts_error;
+        if (application != nullptr) {
+            const auto listed_accounts = application->SavedAccounts();
+            if (listed_accounts)
+                saved_accounts = std::move(*listed_accounts);
+            else
+                saved_accounts_error = listed_accounts.error();
+        }
+        if (snapshot.core.authenticated && snapshot.core.account &&
+            workstation_state.account_context.account_id !=
+                snapshot.core.account->id) {
+            workstation_state.account_context.account_id =
+                snapshot.core.account->id;
+            profile_store.MarkDirty();
+        }
         const std::string credential_slot =
             CredentialSlot(workstation_state.account_context,
                            account_popup.environment);
-        const bool saved_credentials_available =
-            application != nullptr && application->HasSavedCredentials(
-                credential_slot, account_popup.environment);
+        const tradebox::core::AccountEnvironment current_environment =
+            workstation_state.account_context.paper
+                ? tradebox::core::AccountEnvironment::Paper
+                : tradebox::core::AccountEnvironment::Live;
 
         const ChromeActions chrome_actions = DrawApplicationChrome(
             window, chrome_metrics, gui_fonts,
             MarketTimeText(market_time_zone), snapshot.core,
-            application != nullptr, account_popup, saved_credentials_available,
+            workstation_state.account_context.account_alias,
+            application != nullptr, account_popup, saved_accounts,
+            saved_accounts_error, credential_slot,
+            current_environment,
+            workstation_state.account_context.account_id,
+            workstation_state.account_context.auto_connect,
             workstation_state.application, done);
         if (chrome_actions.new_chart) {
             const auto created = tradebox::workstation::CreateChartDocument(
@@ -503,54 +559,130 @@ int RunApplication(const LaunchOptions& options) {
         if (chrome_actions.imgui_demo) show_imgui_demo = true;
         if (chrome_actions.settings_changed) profile_store.MarkDirty();
 
-        if (chrome_actions.account == AccountPopupAction::Connect) {
+        if (chrome_actions.account == AccountPopupAction::SaveAccount) {
+            const std::string account_name = account_popup.account_name.data();
+            const tradebox::core::AccountEnvironment environment =
+                account_popup.environment;
+            if (application == nullptr) {
+                account_popup.message = "Local application is still loading";
+            } else if (application->HasSavedCredentials(
+                           account_name, environment)) {
+                account_popup.message =
+                    "An account with that name already exists";
+                ClearCredentialInputs(account_popup);
+            } else {
+                const auto saved = application->SaveCredentials(
+                    account_name, environment, account_popup.api_key.data(),
+                    account_popup.api_secret.data());
+                if (!saved) {
+                    account_popup.message = saved.error();
+                    ClearCredentialInputs(account_popup);
+                } else {
+                    account_popup.message = "Account saved";
+                    account_popup.adding_account = false;
+                    ClearCredentialInputs(account_popup);
+                }
+            }
+        } else if (chrome_actions.account == AccountPopupAction::EditName) {
+            const std::string old_slot = CredentialSlot(
+                workstation_state.account_context,
+                workstation_state.account_context.paper
+                    ? tradebox::core::AccountEnvironment::Paper
+                    : tradebox::core::AccountEnvironment::Live);
+            const bool account_changed =
+                old_slot != account_popup.selected_credential_slot ||
+                workstation_state.account_context.paper !=
+                    (account_popup.selected_environment ==
+                     tradebox::core::AccountEnvironment::Paper);
             workstation_state.account_context.paper =
-                account_popup.environment ==
+                account_popup.selected_environment ==
                 tradebox::core::AccountEnvironment::Paper;
-            workstation_state.account_context.credential_slot = credential_slot;
+            workstation_state.account_context.credential_slot =
+                account_popup.selected_credential_slot;
             workstation_state.account_context.account_alias =
-                workstation_state.account_context.paper ? "Alpaca Paper"
-                                                        : "Alpaca Live";
+                account_popup.account_name.data();
+            if (account_changed)
+                workstation_state.account_context.account_id.clear();
+            profile_store.MarkDirty();
+        } else if (chrome_actions.account == AccountPopupAction::SaveName) {
+            const std::string old_slot =
+                account_popup.selected_credential_slot;
+            const std::string new_slot = account_popup.account_name.data();
+            const tradebox::core::AccountEnvironment environment =
+                account_popup.selected_environment;
+            if (application == nullptr) {
+                account_popup.message = "Local application is still loading";
+            } else {
+                const auto renamed = application->RenameAccount(
+                    old_slot, new_slot, environment);
+                if (!renamed) {
+                    account_popup.message = renamed.error();
+                } else {
+                    workstation_state.account_context.paper =
+                        environment == tradebox::core::AccountEnvironment::Paper;
+                    workstation_state.account_context.credential_slot = new_slot;
+                    workstation_state.account_context.account_alias = new_slot;
+                    account_popup.selected_credential_slot = new_slot;
+                    account_popup.editing_name = false;
+                    account_popup.message.clear();
+                    profile_store.MarkDirty();
+                }
+            }
+        } else if (chrome_actions.account == AccountPopupAction::Connect) {
+            const bool has_selected_account =
+                !account_popup.selected_credential_slot.empty();
+            const tradebox::core::AccountEnvironment target_environment =
+                has_selected_account ? account_popup.selected_environment
+                                     : account_popup.environment;
+            const std::string old_credential_slot = CredentialSlot(
+                workstation_state.account_context,
+                workstation_state.account_context.paper
+                    ? tradebox::core::AccountEnvironment::Paper
+                    : tradebox::core::AccountEnvironment::Live);
+            std::string target_credential_slot =
+                account_popup.selected_credential_slot;
+            if (account_popup.adding_account)
+                target_credential_slot = account_popup.account_name.data();
+            if (target_credential_slot.empty())
+                target_credential_slot = credential_slot;
+
+            const bool account_changed =
+                old_credential_slot != target_credential_slot ||
+                workstation_state.account_context.paper !=
+                    (target_environment ==
+                     tradebox::core::AccountEnvironment::Paper);
+            workstation_state.account_context.paper =
+                target_environment == tradebox::core::AccountEnvironment::Paper;
+            workstation_state.account_context.credential_slot =
+                target_credential_slot;
+            if (account_popup.account_name[0] != '\0')
+                workstation_state.account_context.account_alias =
+                    account_popup.account_name.data();
+            else if (workstation_state.account_context.account_alias.empty())
+                workstation_state.account_context.account_alias =
+                    workstation_state.account_context.paper ? "Alpaca Paper"
+                                                            : "Alpaca Live";
+            if (account_changed)
+                workstation_state.account_context.account_id.clear();
             profile_store.MarkDirty();
             if (application == nullptr) {
                 account_popup.message = "Local application is still loading";
             } else {
-                bool connect_requested = true;
                 tradebox::application::ConnectionRequest request;
                 request.environment =
-                    account_popup.environment;
-                request.credential_slot = credential_slot;
-                const bool fields_complete =
-                    account_popup.api_key[0] != '\0' &&
-                    account_popup.api_secret[0] != '\0';
-                if (fields_complete && account_popup.remember_credentials) {
-                    const auto saved = application->SaveCredentials(
-                        credential_slot, account_popup.environment,
-                        account_popup.api_key.data(),
-                        account_popup.api_secret.data());
-                    if (!saved) {
-                        account_popup.message = saved.error();
-                        ClearCredentialInputs(account_popup);
-                        connect_requested = false;
-                    }
-                }
-                if (connect_requested) {
-                    if (fields_complete) {
-                        request.api_key = account_popup.api_key.data();
-                        request.api_secret = account_popup.api_secret.data();
-                    }
-                    request.market_symbols =
-                        ConnectionSymbols(workstation_state.workspace);
-                    request.market_data_feed =
-                        tradebox::core::MarketDataFeed::Iex;
-                    const auto receipt =
-                        application->Connect(std::move(request));
-                    account_popup.message = receipt
-                                                 ? receipt->message
-                                                 : receipt.error().message;
-                }
+                    target_environment;
+                request.credential_slot = target_credential_slot;
+                request.market_symbols =
+                    ConnectionSymbols(workstation_state.workspace);
+                request.market_data_feed =
+                    tradebox::core::MarketDataFeed::Iex;
+                const auto receipt = application->Connect(std::move(request));
+                account_popup.message = receipt
+                                             ? receipt->message
+                                             : receipt.error().message;
             }
             account_popup.live_trading_confirmed = false;
+            account_popup.adding_account = false;
             ClearCredentialInputs(account_popup);
         } else if (chrome_actions.account == AccountPopupAction::Disconnect) {
             if (application == nullptr) {
@@ -567,14 +699,23 @@ int RunApplication(const LaunchOptions& options) {
             if (application == nullptr) {
                 account_popup.message = "Local application is still loading";
             } else {
+                const std::string target_slot =
+                    account_popup.selected_credential_slot.empty()
+                        ? credential_slot
+                        : account_popup.selected_credential_slot;
+                const tradebox::core::AccountEnvironment target_environment =
+                    account_popup.selected_credential_slot.empty()
+                        ? (snapshot.core.authenticated
+                               ? snapshot.core.environment
+                               : account_popup.environment)
+                        : account_popup.selected_environment;
                 const auto forgotten = application->ForgetCredentials(
-                    credential_slot, snapshot.core.authenticated
-                        ? snapshot.core.environment
-                        : account_popup.environment);
-                account_popup.message = forgotten
-                                            ? "Saved credentials forgotten"
-                                            : forgotten.error();
-                if (forgotten) account_popup.remember_credentials = false;
+                    target_slot, target_environment);
+                account_popup.message = forgotten ? "" : forgotten.error();
+                if (forgotten) {
+                    account_popup.remember_credentials = false;
+                    account_popup.editing_name = false;
+                }
             }
         }
         if (application != nullptr)

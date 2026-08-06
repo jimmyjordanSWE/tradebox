@@ -7,6 +7,7 @@
 
 #include <array>
 #include <string_view>
+#include <vector>
 
 struct SDL_Window;
 
@@ -38,8 +39,14 @@ struct ChromeActions {
 [[nodiscard]] ChromeActions DrawApplicationChrome(
     SDL_Window* window, ChromeMetrics& metrics, const GuiFonts& fonts,
     std::string_view market_time_text, const core::CoreSnapshot& snapshot,
+    std::string_view account_alias,
     bool application_available, AccountPopupState& account_popup,
-    bool saved_credentials_available,
+    const std::vector<application::SavedAccountDescriptor>& saved_accounts,
+    std::string_view saved_accounts_error,
+    std::string_view current_credential_slot,
+    core::AccountEnvironment current_environment,
+    std::string_view current_account_id,
+    bool& auto_connect,
     workstation::ApplicationSettings& application_settings, bool& done);
 
 }  // namespace tradebox::gui
