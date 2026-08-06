@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <ranges>
+#include <shared_mutex>
 #include <type_traits>
 #include <utility>
 
@@ -106,7 +107,9 @@ public:
                  valuation_market_data,
                  market_data, bars, &history_requests),
           order_execution(core, broker, order_journal, clock,
-                          &market_data) {}
+                          &market_data) {
+        ReloadAssetCatalogCache();
+    }
 
     Impl(Database& database,
          core::IOrderCommandJournal& external_order_journal)
@@ -121,7 +124,9 @@ public:
                  valuation_market_data,
                  market_data, bars, &history_requests),
           order_execution(core, broker, external_order_journal, clock,
-                          &market_data) {}
+                          &market_data) {
+        ReloadAssetCatalogCache();
+    }
 
     Impl(UiEventQueue& events, Database& database)
         : database(database),
@@ -134,11 +139,24 @@ public:
                  valuation_market_data,
                  market_data, bars, &history_requests),
           order_execution(core, broker, order_journal, clock,
-                          &market_data) {}
+                          &market_data) {
+        ReloadAssetCatalogCache();
+    }
+
+    void ReloadAssetCatalogCache() {
+        auto catalog = database.LoadAssetCatalog();
+        auto stored = database.LoadKnownProviderBarAssets();
+        std::unique_lock lock(asset_catalog_mutex);
+        asset_catalog = std::move(catalog);
+        stored_asset_catalog = std::move(stored);
+    }
 
     Database& database;
     std::unique_ptr<UiEventQueue> owned_events;
     UiEventQueue* event_queue = nullptr;
+    mutable std::shared_mutex asset_catalog_mutex;
+    std::vector<core::TradableAsset> asset_catalog;
+    std::vector<core::TradableAsset> stored_asset_catalog;
     persistence::DatabaseEventJournal journal;
     persistence::DatabaseOrderCommandJournal order_journal;
     core::SystemClock clock;
@@ -253,15 +271,14 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
         result.charts.push_back(std::move(projected));
     }
     if (query.asset_limit != 0) {
-        const auto catalog = impl_->database.LoadAssetCatalog();
-        const auto stored = impl_->database.LoadKnownProviderBarAssets();
+        std::shared_lock catalog_lock(impl_->asset_catalog_mutex);
         const auto search = [&](const std::string& text) {
             auto matches = core::SearchTradableAssets(
-                catalog, text, query.asset_limit,
+                impl_->asset_catalog, text, query.asset_limit,
                 query.asset_preferred_instrument_ids);
             if (matches.empty() && !text.empty())
                 matches = core::SearchTradableAssets(
-                    stored, text, query.asset_limit,
+                    impl_->stored_asset_catalog, text, query.asset_limit,
                     query.asset_preferred_instrument_ids);
             return matches;
         };
@@ -677,8 +694,11 @@ std::vector<UiEvent> TradingApplication::DrainUiEvents() {
     if (impl_->event_queue == nullptr) return {};
     std::vector<UiEvent> events = impl_->event_queue->Drain();
     for (const UiEvent& event : events)
-        if (event.type == UiEventType::AssetCatalogReady)
+        if (event.type == UiEventType::AssetCatalogReady) {
             impl_->database.SaveAssetCatalog(event.assets);
+            std::unique_lock lock(impl_->asset_catalog_mutex);
+            impl_->asset_catalog = event.assets;
+        }
     return events;
 }
 

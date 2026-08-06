@@ -203,6 +203,61 @@ TEST(ChartApplicationSnapshotTest, ExposesExplicitStatesAndAssetSearch) {
               *volume);
 }
 
+TEST(ChartApplicationSnapshotTest,
+     AssetCatalogIsCachedAndRefreshesOnlyFromCatalogEvent) {
+    TemporaryDatabase temporary;
+    Database database;
+    std::string error;
+    ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+    database.SaveAssetCatalog({
+        {.symbol = "AAPL",
+         .name = "Apple Inc.",
+         .active = true,
+         .tradable = true,
+         .instrument_id = "asset-aapl"},
+    });
+    UiEventQueue events;
+    tradebox::application::TradingApplication application(events, database);
+
+    auto snapshot = application.SnapshotForUi({
+        .asset_search = "AAP",
+        .asset_limit = 5,
+    });
+    ASSERT_EQ(snapshot.assets.size(), 1U);
+    EXPECT_EQ(snapshot.assets.front().symbol, "AAPL");
+
+    database.SaveAssetCatalog({
+        {.symbol = "MSFT",
+         .name = "Microsoft Corporation",
+         .active = true,
+         .tradable = true,
+         .instrument_id = "asset-msft"},
+    });
+    snapshot = application.SnapshotForUi({
+        .asset_search = "MSF",
+        .asset_limit = 5,
+    });
+    EXPECT_TRUE(snapshot.assets.empty());
+
+    UiEvent refreshed;
+    refreshed.type = UiEventType::AssetCatalogReady;
+    refreshed.assets = {
+        {.symbol = "MSFT",
+         .name = "Microsoft Corporation",
+         .active = true,
+         .tradable = true,
+         .instrument_id = "asset-msft"},
+    };
+    events.Push(std::move(refreshed));
+    static_cast<void>(application.DrainUiEvents());
+    snapshot = application.SnapshotForUi({
+        .asset_search = "MSF",
+        .asset_limit = 5,
+    });
+    ASSERT_EQ(snapshot.assets.size(), 1U);
+    EXPECT_EQ(snapshot.assets.front().symbol, "MSFT");
+}
+
 TEST(ChartApplicationSnapshotTest, FindsStoredBarInstrumentWithoutCatalog) {
     TemporaryDatabase temporary;
     Database database;

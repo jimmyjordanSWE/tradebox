@@ -16,6 +16,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 #include <d3d11.h>
+#include <dxgi1_3.h>
 #include <windows.h>
 #include <wrl/client.h>
 
@@ -53,10 +54,17 @@ constexpr float kMenuFontSize = 18.0f;
 constexpr float kToolIconSize = 24.0f;
 
 struct Dx11Renderer {
+    ~Dx11Renderer() {
+        if (frame_latency_waitable != nullptr)
+            CloseHandle(frame_latency_waitable);
+    }
+
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<IDXGISwapChain> swap_chain;
     ComPtr<ID3D11RenderTargetView> render_target;
+    HANDLE frame_latency_waitable = nullptr;
+    bool vsync_requested = true;
     int width = 0;
     int height = 0;
 };
@@ -174,6 +182,7 @@ bool CreateRenderer(SDL_Window* window, Dx11Renderer& renderer) {
     description.SampleDesc.Count = 1;
     description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     description.BufferCount = 2;
+    description.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     description.OutputWindow = hwnd;
     description.Windowed = TRUE;
     description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
@@ -181,6 +190,14 @@ bool CreateRenderer(SDL_Window* window, Dx11Renderer& renderer) {
             renderer.device.Get(), &description,
             renderer.swap_chain.GetAddressOf())))
         return false;
+
+    ComPtr<IDXGISwapChain2> low_latency_swap_chain;
+    if (FAILED(renderer.swap_chain.As(&low_latency_swap_chain)) ||
+        FAILED(low_latency_swap_chain->SetMaximumFrameLatency(1)))
+        return false;
+    renderer.frame_latency_waitable =
+        low_latency_swap_chain->GetFrameLatencyWaitableObject();
+    if (renderer.frame_latency_waitable == nullptr) return false;
 
     SDL_GetWindowSizeInPixels(window, &renderer.width, &renderer.height);
     return CreateRenderTarget(renderer);
@@ -455,6 +472,10 @@ int RunApplication(const LaunchOptions& options) {
             SDL_GetTicks() - started_at >=
             static_cast<Uint64>(options.run_for_ms))
             done = true;
+
+        if (renderer.frame_latency_waitable != nullptr)
+            static_cast<void>(WaitForSingleObject(
+                renderer.frame_latency_waitable, 1000));
 
         if (!application && database_startup.wait_for(
                 std::chrono::milliseconds(0)) == std::future_status::ready) {
@@ -799,7 +820,10 @@ int RunApplication(const LaunchOptions& options) {
         renderer.context->ClearRenderTargetView(
             renderer.render_target.Get(), clear_color);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        renderer.swap_chain->Present(1, 0);
+        renderer.vsync_requested =
+            workstation_state.application.vsync_requested;
+        renderer.swap_chain->Present(
+            renderer.vsync_requested ? 1 : 0, 0);
     }
 
     // Ensure the background initializer has completed before its future and
