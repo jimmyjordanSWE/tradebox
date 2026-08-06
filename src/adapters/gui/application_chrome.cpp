@@ -180,6 +180,7 @@ ChromeActions DrawApplicationChrome(
             workspace_state);
         actions.new_chart = creation_actions.new_chart;
         actions.new_watch_list = creation_actions.new_watch_list;
+        actions.open_watch_list_id = creation_actions.open_watch_list_id;
         actions.new_debug = creation_actions.new_debug;
         actions.imgui_demo = creation_actions.imgui_demo;
 

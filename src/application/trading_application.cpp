@@ -337,6 +337,11 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
                 }
                 row_snapshot.history_missing =
                     !daily.missing_ranges.empty();
+                if (daily.previous_session_close)
+                    row_snapshot.previous_close =
+                        *daily.previous_session_close;
+                if (daily.current_bar)
+                    row_snapshot.session_open = daily.current_bar->open;
                 if (row_snapshot.current_price && daily.current_bar)
                     row_snapshot.change_from_open =
                         *row_snapshot.current_price - daily.current_bar->open;

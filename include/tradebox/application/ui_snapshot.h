@@ -81,6 +81,8 @@ struct UiChartSnapshot {
 struct UiWatchListRowSnapshot {
     std::string row_id;
     std::optional<core::Decimal> current_price;
+    std::optional<core::Decimal> previous_close;
+    std::optional<core::Decimal> session_open;
     std::optional<core::Decimal> change_from_open;
     bool history_missing = false;
 };

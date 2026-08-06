@@ -563,18 +563,6 @@ int RunApplication(const LaunchOptions& options) {
     tradebox::workstation::WorkstationState workstation_state =
         *loaded_profile;
 
-    bool chart_created = false;
-    if (workstation_state.workspace.charts.empty()) {
-        const auto created = tradebox::workstation::CreateChartDocument(
-            workstation_state.workspace);
-        if (!created) {
-            MessageBoxA(nullptr, created.error().message.c_str(),
-                        "Trade Box chart error", MB_OK | MB_ICONERROR);
-            return 1;
-        }
-        chart_created = true;
-    }
-
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) return 1;
     const auto& native_window = workstation_state.native_window;
     const int initial_width = std::max(
@@ -645,7 +633,7 @@ int RunApplication(const LaunchOptions& options) {
     DebugWindowRenderer debug_renderer;
     tradebox::gui::WatchListWindowRenderer watch_list_renderer;
 
-    if (!profile_existed || chart_created) profile_store.MarkDirty();
+    if (!profile_existed) profile_store.MarkDirty();
 
     bool done = false;
     AccountPopupState account_popup;

@@ -156,7 +156,6 @@ void WatchListWindowRenderer::StartNewDraft(
 
 void WatchListWindowRenderer::EnsureSession(
     workstation::WorkspaceState& state) {
-    static_cast<void>(workstation::EnsureWatchListWindow(state));
     if (!state.active_watch_list_id.empty()) {
         if (workstation::FindWatchListDocument(
                 state, state.active_watch_list_id) != nullptr) {
@@ -167,11 +166,13 @@ void WatchListWindowRenderer::EnsureSession(
         persistent_changed_ = true;
     }
     if (!draft_) {
-        draft_ = workstation::WatchListDocumentState{
-            .id = std::string(workstation::kWatchListDraftId),
-            .name = "Untitled Watch List",
-            .rows = {{.id = workstation::NewStableId("watch-list-row")}},
-        };
+        const bool had_active_document = !state.active_watch_list_id.empty();
+        const auto ensured = workstation::EnsureDefaultWatchList(state);
+        if (!ensured) {
+            message_ = ensured.error().message;
+            return;
+        }
+        if (!had_active_document) persistent_changed_ = true;
     }
 }
 
@@ -257,10 +258,19 @@ void WatchListWindowRenderer::AppendSnapshotQuery(
     if (document == nullptr) return;
     application::UiWatchListQuery watch_query{
         .document_id = document->id,
+        .needs_change_from_open = true,
     };
     for (const workstation::WatchListRowState& row : document->rows) {
-        if (row.instrument_id.empty() && !row.ticker_input.empty())
+        if (!row.instrument_id.empty() && !row.symbol.empty()) {
+            query.market_symbols.push_back(row.symbol);
+            watch_query.rows.push_back({
+                .row_id = row.id,
+                .instrument_id = row.instrument_id,
+                .symbol = row.symbol,
+            });
+        } else if (row.instrument_id.empty() && !row.ticker_input.empty()) {
             query.asset_searches.push_back(row.ticker_input);
+        }
     }
     if (!query.asset_searches.empty())
         query.asset_limit = std::max<std::size_t>(query.asset_limit, 8U);
@@ -311,10 +321,6 @@ void WatchListWindowRenderer::AppendSnapshotQuery(
 void WatchListWindowRenderer::RequestMissingHistory(
     application::TradingApplication& application,
     const application::ApplicationUiSnapshot& snapshot) {
-    (void)application;
-    (void)snapshot;
-    return;
-#if 0
     for (const application::UiWatchListSnapshot& watch_list :
          snapshot.watch_lists) {
         if (watch_list.daily_range.start_ns >= watch_list.daily_range.end_ns)
@@ -336,7 +342,6 @@ void WatchListWindowRenderer::RequestMissingHistory(
             requested_history_[row.row_id] = watch_list.daily_range;
         }
     }
-#endif
 }
 
 void WatchListWindowRenderer::Draw(
@@ -349,6 +354,11 @@ void WatchListWindowRenderer::Draw(
     EnsureSession(state);
     workstation::WatchListDocumentState* document = ActiveDocument(state);
     if (document == nullptr) return;
+    const auto window_state = state.windows.find(
+        std::string(workstation::kWatchListWindowId));
+    if (window_state == state.windows.end() || !window_state->second.open)
+        return;
+    const auto* watch_snapshot = SnapshotFor(snapshot, document->id);
     ui::WorkspaceWindow window{
         .title = "Watch List",
         .id = std::string(workstation::kWatchListWindowId),
@@ -369,9 +379,16 @@ void WatchListWindowRenderer::Draw(
         ImGuiTableFlags_Sortable | ImGuiTableFlags_Resizable |
         ImGuiTableFlags_SizingFixedFit |
         ImGuiTableFlags_NoSavedSettings;
-    if (ImGui::BeginTable("watch_list_table", 4, table_flags,
+    std::optional<std::string> pending_delete_row;
+    if (ImGui::BeginTable("watch_list_table", 5, table_flags,
                           ImVec2(-FLT_MIN, 0.0f))) {
         constexpr float minimum_column_width = 96.0f;
+        ImGui::TableSetupColumn(
+            "##watch_list_row_actions",
+            ImGuiTableColumnFlags_WidthFixed |
+                ImGuiTableColumnFlags_NoHeaderLabel |
+                ImGuiTableColumnFlags_NoSort,
+            28.0f);
         ImGui::TableSetupColumn(
             "Ticker", ImGuiTableColumnFlags_WidthFixed, minimum_column_width);
         ImGui::TableSetupColumn(
@@ -390,6 +407,9 @@ void WatchListWindowRenderer::Draw(
             workstation::WatchListRowState& row = document->rows[row_index];
             ImGui::PushID(row.id.c_str());
             ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton("X##delete_row"))
+                pending_delete_row = row.id;
             ImGui::TableNextColumn();
             RowInteraction& interaction = interactions_[row.id];
             if (!interaction.initialized) {
@@ -510,14 +530,43 @@ void WatchListWindowRenderer::Draw(
                 persistent_changed_ = true;
             }
             ImGui::TableNextColumn();
-            ImGui::TextDisabled("--");
+            const auto* row_snapshot = RowSnapshotFor(watch_snapshot, row.id);
+            ImGui::TextUnformatted(
+                row_snapshot != nullptr && row_snapshot->current_price
+                    ? row_snapshot->current_price->ToString().c_str()
+                    : "--");
             ImGui::TableNextColumn();
-            ImGui::TextDisabled("--");
+            ImGui::TextUnformatted(
+                row_snapshot != nullptr && row_snapshot->previous_close
+                    ? row_snapshot->previous_close->ToString().c_str()
+                    : "--");
             ImGui::TableNextColumn();
-            ImGui::TextDisabled("--");
+            ImGui::TextUnformatted(
+                row_snapshot != nullptr && row_snapshot->session_open
+                    ? row_snapshot->session_open->ToString().c_str()
+                    : "--");
             ImGui::PopID();
         }
         ImGui::EndTable();
+    }
+    if (pending_delete_row) {
+        const auto deleted = document->id == workstation::kWatchListDraftId
+                                 ? workstation::DeleteWatchListRow(
+                                       *document, *pending_delete_row)
+                                 : workstation::DeleteWatchListRow(
+                                       state, document->id, *pending_delete_row);
+        if (deleted) {
+            interactions_.erase(*pending_delete_row);
+            requested_history_.erase(*pending_delete_row);
+            if (document->rows.empty()) {
+                const auto added = document->id == workstation::kWatchListDraftId
+                                       ? workstation::AddWatchListRow(*document)
+                                       : workstation::AddWatchListRow(
+                                             state, document->id);
+                if (added) focus_row_id_ = *added;
+            }
+            persistent_changed_ = true;
+        }
     }
     workspace.EndWindow(window);
     ImGui::PopStyleVar();

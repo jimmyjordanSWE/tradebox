@@ -12,6 +12,7 @@ namespace tradebox::workstation {
 
 inline constexpr std::string_view kWatchListWindowId = "watch-list.window";
 inline constexpr std::string_view kWatchListDraftId = "watch-list.draft";
+inline constexpr std::string_view kWatchListDefaultId = "watch-list.default";
 
 struct WatchListDocumentError {
     std::string message;
@@ -21,6 +22,8 @@ struct WatchListDocumentError {
 CreateWatchListDocument(WorkspaceState& workspace);
 [[nodiscard]] std::expected<void, WatchListDocumentError>
 EnsureWatchListWindow(WorkspaceState& workspace);
+[[nodiscard]] std::expected<std::string, WatchListDocumentError>
+EnsureDefaultWatchList(WorkspaceState& workspace);
 [[nodiscard]] std::expected<std::string, WatchListDocumentError>
 SaveWatchListDocument(WorkspaceState& workspace,
                       WatchListDocumentState document);
@@ -40,6 +43,12 @@ DeleteWatchListDocument(WorkspaceState& workspace,
 AddWatchListRow(WorkspaceState& workspace, std::string_view document_id);
 [[nodiscard]] std::expected<std::string, WatchListDocumentError>
 AddWatchListRow(WatchListDocumentState& document);
+[[nodiscard]] std::expected<void, WatchListDocumentError>
+DeleteWatchListRow(WorkspaceState& workspace, std::string_view document_id,
+                   std::string_view row_id);
+[[nodiscard]] std::expected<void, WatchListDocumentError>
+DeleteWatchListRow(WatchListDocumentState& document,
+                   std::string_view row_id);
 [[nodiscard]] std::expected<void, WatchListDocumentError>
 AddWatchListColumn(WorkspaceState& workspace, std::string_view document_id,
                    WatchListColumnKind kind);

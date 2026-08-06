@@ -239,6 +239,25 @@ TEST(WatchListDocuments, MovesRowsUsingStableRowIdentity) {
     EXPECT_EQ(decoded_document->rows[2].id, first_id);
 }
 
+TEST(WatchListDocuments, DeletesRowsThroughWorkstationOwner) {
+    WorkstationState state = WorkstationState::Defaults();
+    const auto document_id = CreateWatchListDocument(state.workspace);
+    ASSERT_TRUE(document_id);
+    const auto second = AddWatchListRow(state.workspace, *document_id);
+    ASSERT_TRUE(second);
+    auto* document = FindWatchListDocument(state.workspace, *document_id);
+    ASSERT_NE(document, nullptr);
+    ASSERT_EQ(document->rows.size(), 2U);
+
+    const std::string first_id = document->rows.front().id;
+    ASSERT_TRUE(DeleteWatchListRow(
+        state.workspace, *document_id, first_id));
+    ASSERT_EQ(document->rows.size(), 1U);
+    EXPECT_EQ(document->rows.front().id, *second);
+    EXPECT_FALSE(DeleteWatchListRow(
+        state.workspace, *document_id, first_id));
+}
+
 TEST(WatchListDocuments, InitializesAndAddsTableColumns) {
     WorkstationState state = WorkstationState::Defaults();
     const auto created = CreateWatchListDocument(state.workspace);
@@ -315,6 +334,27 @@ TEST(WatchListDocuments, SavesAndManagesOneNamedDocumentLibrary) {
     EXPECT_TRUE(state.workspace.watch_lists.empty());
     EXPECT_TRUE(state.workspace.active_watch_list_id.empty());
     EXPECT_TRUE(state.workspace.windows.contains(std::string(kWatchListWindowId)));
+}
+
+TEST(WatchListDocuments, ReusesOnePersistentDefaultWatchList) {
+    WorkstationState state = WorkstationState::Defaults();
+
+    const auto first = EnsureDefaultWatchList(state.workspace);
+    ASSERT_TRUE(first) << first.error().message;
+    const auto second = EnsureDefaultWatchList(state.workspace);
+    ASSERT_TRUE(second) << second.error().message;
+
+    EXPECT_EQ(*first, kWatchListDefaultId);
+    EXPECT_EQ(*second, kWatchListDefaultId);
+    ASSERT_EQ(state.workspace.watch_lists.size(), 1U);
+    EXPECT_EQ(state.workspace.watch_lists.front().name, "Default");
+    EXPECT_EQ(state.workspace.active_watch_list_id, kWatchListDefaultId);
+    EXPECT_TRUE(state.workspace.windows.empty());
+    ASSERT_TRUE(OpenWatchListDocument(
+        state.workspace, kWatchListDefaultId));
+    EXPECT_TRUE(state.workspace.windows.at(std::string(kWatchListWindowId)).open);
+    EXPECT_FALSE(DeleteWatchListDocument(
+        state.workspace, kWatchListDefaultId));
 }
 
 TEST(WatchListDocuments, DraftRowsUseStableIdentityAndCanBeEditedBeforeSaving) {

@@ -126,6 +126,21 @@ std::expected<void, WatchListDocumentError> EnsureWatchListWindow(
     return EnsureWindow(workspace);
 }
 
+std::expected<std::string, WatchListDocumentError> EnsureDefaultWatchList(
+    WorkspaceState& workspace) {
+    WatchListDocumentState* default_document =
+        FindDocument(workspace, kWatchListDefaultId);
+    if (default_document == nullptr) {
+        workspace.watch_lists.push_back({
+            .id = std::string(kWatchListDefaultId),
+            .name = "Default",
+            .rows = {{.id = NewStableId("watch-list-row")}},
+        });
+    }
+    workspace.active_watch_list_id = std::string(kWatchListDefaultId);
+    return std::string(kWatchListDefaultId);
+}
+
 std::expected<std::string, WatchListDocumentError> SaveWatchListDocument(
     WorkspaceState& workspace, WatchListDocumentState document) {
     if (document.name.empty())
@@ -166,6 +181,9 @@ std::expected<void, WatchListDocumentError> RenameWatchListDocument(
     if (document == nullptr)
         return std::unexpected(
             WatchListDocumentError{"watch list document does not exist"});
+    if (document_id == kWatchListDefaultId)
+        return std::unexpected(WatchListDocumentError{
+            "the default watch list cannot be renamed"});
     if (HasWatchListName(workspace, name, document_id))
         return std::unexpected(
             WatchListDocumentError{"watch list name is already in use"});
@@ -180,6 +198,9 @@ std::expected<void, WatchListDocumentError> DeleteWatchListDocument(
     if (found == workspace.watch_lists.end())
         return std::unexpected(
             WatchListDocumentError{"watch list document does not exist"});
+    if (document_id == kWatchListDefaultId)
+        return std::unexpected(WatchListDocumentError{
+            "the default watch list cannot be deleted"});
     workspace.watch_lists.erase(found);
     if (workspace.active_watch_list_id == document_id)
         workspace.active_watch_list_id.clear();
@@ -200,6 +221,27 @@ std::expected<std::string, WatchListDocumentError> AddWatchListRow(
     const std::string row_id = NewStableId("watch-list-row");
     document.rows.push_back({.id = row_id});
     return row_id;
+}
+
+std::expected<void, WatchListDocumentError> DeleteWatchListRow(
+    WatchListDocumentState& document, std::string_view row_id) {
+    const auto found = std::ranges::find(
+        document.rows, row_id, &WatchListRowState::id);
+    if (found == document.rows.end())
+        return std::unexpected(
+            WatchListDocumentError{"watch list row does not exist"});
+    document.rows.erase(found);
+    return {};
+}
+
+std::expected<void, WatchListDocumentError> DeleteWatchListRow(
+    WorkspaceState& workspace, std::string_view document_id,
+    std::string_view row_id) {
+    WatchListDocumentState* document = FindDocument(workspace, document_id);
+    if (document == nullptr)
+        return std::unexpected(
+            WatchListDocumentError{"watch list document does not exist"});
+    return DeleteWatchListRow(*document, row_id);
 }
 
 std::expected<void, WatchListDocumentError> AddWatchListColumn(
