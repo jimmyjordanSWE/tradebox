@@ -20,6 +20,7 @@ struct WorkspaceWindow {
     bool open = true;
     bool* open_binding = nullptr;
     bool snap_enabled = true;
+    ImGuiWindowFlags flags = ImGuiWindowFlags_None;
 
     bool initialized = false;
     bool reset_geometry = false;
@@ -63,7 +64,8 @@ public:
                                    std::string_view title,
                                    bool* open,
                                    ImVec2 default_offset = ImVec2(24.0f, 24.0f),
-                                   ImVec2 default_size = ImVec2(420.0f, 280.0f));
+                                   ImVec2 default_size = ImVec2(420.0f, 280.0f),
+                                   ImGuiWindowFlags flags = ImGuiWindowFlags_None);
     void EndWindow(std::string_view id);
     void EndWindow(WorkspaceWindow& window);
     void ResetWindow(WorkspaceWindow& window);

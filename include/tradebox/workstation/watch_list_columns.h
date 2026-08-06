@@ -9,7 +9,7 @@ namespace tradebox::workstation {
 enum class WatchListColumnKind {
     Symbol,
     CurrentPrice,
-    ChangeFromOpen,
+    ChangeFromClose,
 };
 
 struct WatchListColumnDefinition {
@@ -22,9 +22,10 @@ inline constexpr std::string_view kWatchListTableId = "watch-list";
 
 inline constexpr std::array<WatchListColumnDefinition, 3>
     kWatchListColumnDefinitions{{
-        {WatchListColumnKind::Symbol, "symbol", "Symbol"},
-        {WatchListColumnKind::CurrentPrice, "current_price", "Current Price"},
-        {WatchListColumnKind::ChangeFromOpen, "change_from_open", "Change from Open"},
+        {WatchListColumnKind::Symbol, "symbol", "Ticker"},
+        {WatchListColumnKind::CurrentPrice, "current_price", "Last Price"},
+        {WatchListColumnKind::ChangeFromClose, "change_from_close",
+         "Change from Close"},
     }};
 
 [[nodiscard]] inline const WatchListColumnDefinition*

@@ -16,6 +16,7 @@
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
+#include <SDL3/SDL_system.h>
 #include <d3d11.h>
 #include <dxgi1_3.h>
 #include <windows.h>
@@ -78,6 +79,11 @@ struct Dx11Renderer {
     bool vsync_requested = true;
     int width = 0;
     int height = 0;
+};
+
+struct ResizePreviewContext {
+    Dx11Renderer* renderer = nullptr;
+    HWND window = nullptr;
 };
 
 struct LaunchOptions {
@@ -227,6 +233,31 @@ bool ResizeRenderer(Dx11Renderer& renderer, int width, int height) {
     }
     renderer.width = width;
     renderer.height = height;
+    return true;
+}
+
+void PresentResizeShield(Dx11Renderer& renderer) {
+    if (!renderer.context || !renderer.swap_chain || !renderer.render_target)
+        return;
+
+    constexpr float kResizeShieldColor[4] = {0.16f, 0.17f, 0.19f, 1.0f};
+    renderer.context->OMSetRenderTargets(
+        1, renderer.render_target.GetAddressOf(), nullptr);
+    renderer.context->ClearRenderTargetView(
+        renderer.render_target.Get(), kResizeShieldColor);
+    static_cast<void>(renderer.swap_chain->Present(0, 0));
+}
+
+bool SDLCALL WindowsMessageHook(void* data, MSG* message) {
+    auto* context = static_cast<ResizePreviewContext*>(data);
+    if (context != nullptr && context->renderer != nullptr &&
+        message != nullptr && message->hwnd == context->window &&
+        message->message == WM_ENTERSIZEMOVE) {
+        // Windows begins its modal resize loop immediately after this message.
+        // Replace the last UI frame once so the compositor stretches a neutral
+        // surface rather than stale workspace content during the drag.
+        PresentResizeShield(*context->renderer);
+    }
     return true;
 }
 
@@ -594,6 +625,8 @@ int RunApplication(const LaunchOptions& options) {
     }
     ImGui_ImplSDL3_InitForD3D(window);
     ImGui_ImplDX11_Init(renderer.device.Get(), renderer.context.Get());
+    ResizePreviewContext resize_preview{&renderer, NativeWindowHandle(window)};
+    SDL_SetWindowsMessageHook(WindowsMessageHook, &resize_preview);
 
     // The window is usable before local database startup completes. In
     // particular, opening a large market-data store or running a one-time
@@ -787,6 +820,7 @@ int RunApplication(const LaunchOptions& options) {
             current_environment,
             workstation_state.account_context.account_id,
             workstation_state.account_context.auto_connect,
+            workstation_state.workspace,
             workstation_state.application, done);
         if (chrome_actions.new_chart) {
             const auto created = tradebox::workstation::CreateChartDocument(
@@ -800,17 +834,11 @@ int RunApplication(const LaunchOptions& options) {
             }
         }
         if (chrome_actions.new_watch_list) {
-            const auto created =
-                tradebox::workstation::CreateWatchListDocument(
-                    workstation_state.workspace);
-            if (!created) {
-                MessageBoxA(nullptr, created.error().message.c_str(),
-                            "Trade Box watch list error",
-                            MB_OK | MB_ICONERROR);
-                done = true;
-            } else {
-                profile_store.MarkDirty();
-            }
+            watch_list_renderer.StartNewDraft(workstation_state.workspace);
+        }
+        if (chrome_actions.open_watch_list_id) {
+            watch_list_renderer.OpenSavedDocument(
+                workstation_state.workspace, *chrome_actions.open_watch_list_id);
         }
         if (chrome_actions.new_debug) debug_renderer.Open();
         if (chrome_actions.imgui_demo) show_imgui_demo = true;
@@ -991,7 +1019,7 @@ int RunApplication(const LaunchOptions& options) {
             true);
         chart_renderer.Draw(workspace, workstation_state.workspace, snapshot);
         watch_list_renderer.Draw(
-            workspace, workstation_state.workspace, snapshot);
+            workspace, workstation_state.workspace, snapshot, gui_fonts.icons);
         const DebugSnapshot debug_snapshot = BuildDebugSnapshot(
             renderer, window, workstation_state.application,
             measured_frames_per_second, measured_frame_time_ms);
@@ -1086,6 +1114,7 @@ int RunApplication(const LaunchOptions& options) {
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
+    SDL_SetWindowsMessageHook(nullptr, nullptr);
     renderer.render_target.Reset();
     renderer.swap_chain.Reset();
     renderer.context.Reset();

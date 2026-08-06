@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <string>
+#include <utility>
 
 namespace tradebox::gui {
 namespace {
@@ -51,26 +52,41 @@ void DrawSettingsPopup(
 struct CreationActions {
     bool new_chart = false;
     bool new_watch_list = false;
+    std::optional<std::string> open_watch_list_id;
     bool new_debug = false;
     bool imgui_demo = false;
 };
 
 CreationActions DrawCreationPopup(ImFont* regular_font, const char* id,
-                                  ImVec2 anchor) {
+                                  ImVec2 anchor,
+                                  const workstation::WorkspaceState& state) {
     ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, {0.0f, 0.0f});
     ImGui::SetNextWindowSizeConstraints({220.0f, 0.0f}, {320.0f, 320.0f});
     if (!ImGui::BeginPopup(id)) return {};
 
     ImGui::PushFont(regular_font, 18.0f);
     const bool new_chart = ImGui::MenuItem("Chart", "");
-    const bool new_watch_list = ImGui::MenuItem("Watch List", "");
+    bool new_watch_list = false;
+    std::optional<std::string> open_watch_list_id;
+    if (ImGui::BeginMenu("Watchlist")) {
+        for (const workstation::WatchListDocumentState& watch_list :
+             state.watch_lists) {
+            if (ImGui::MenuItem(watch_list.name.c_str()))
+                open_watch_list_id = watch_list.id;
+        }
+        if (!state.watch_lists.empty()) ImGui::Separator();
+        new_watch_list = ImGui::MenuItem("Add new...");
+        ImGui::EndMenu();
+    }
     const bool new_debug = ImGui::MenuItem("Debug", "");
     const bool imgui_demo = ImGui::MenuItem("ImGui Demo", "");
-    if (new_chart || new_watch_list || new_debug || imgui_demo)
+    if (new_chart || new_watch_list || open_watch_list_id.has_value() ||
+        new_debug || imgui_demo)
         ImGui::CloseCurrentPopup();
     ImGui::PopFont();
     ImGui::EndPopup();
-    return {new_chart, new_watch_list, new_debug, imgui_demo};
+    return {new_chart, new_watch_list, std::move(open_watch_list_id),
+            new_debug, imgui_demo};
 }
 
 }  // namespace
@@ -86,6 +102,7 @@ ChromeActions DrawApplicationChrome(
     core::AccountEnvironment current_environment,
     std::string_view current_account_id,
     bool& auto_connect,
+    const workstation::WorkspaceState& workspace_state,
     workstation::ApplicationSettings& application_settings, bool& done) {
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     metrics.title_bar_height = 35;
@@ -159,7 +176,8 @@ ChromeActions DrawApplicationChrome(
             fonts.regular, "##create_menu",
             {window_min.x + tool_controls_width -
                  static_cast<float>(metrics.tool_width),
-             account_anchor.y});
+             account_anchor.y},
+            workspace_state);
         actions.new_chart = creation_actions.new_chart;
         actions.new_watch_list = creation_actions.new_watch_list;
         actions.new_debug = creation_actions.new_debug;

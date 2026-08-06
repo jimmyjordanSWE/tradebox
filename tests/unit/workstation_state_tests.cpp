@@ -153,6 +153,7 @@ TEST(WorkstationState, ProfileRoundTripPreservesSemanticState) {
                   .instrument_link_group_id,
               "instrument-link.green");
     ASSERT_EQ(decoded->workspace.watch_lists.size(), 1U);
+    EXPECT_EQ(decoded->workspace.active_watch_list_id, *watch_list_id);
     EXPECT_EQ(decoded->workspace.watch_lists.front().name,
               "Bullish symbols");
     ASSERT_EQ(decoded->workspace.watch_lists.front().rows.size(), 1U);
@@ -184,37 +185,157 @@ TEST(WorkstationState, ProfileRoundTripPreservesSemanticState) {
     EXPECT_EQ(EncodeProfile(*decoded), encoded);
 }
 
+TEST(WatchListDocuments, ClearsAssignedAssetThroughWorkstationOwner) {
+    WorkstationState state = WorkstationState::Defaults();
+    const auto document_id = CreateWatchListDocument(state.workspace);
+    ASSERT_TRUE(document_id);
+    auto* document = FindWatchListDocument(state.workspace, *document_id);
+    ASSERT_NE(document, nullptr);
+    ASSERT_TRUE(AssignWatchListRowAsset(
+        state.workspace, *document_id, document->rows.front().id,
+        "asset-aapl", "AAPL"));
+
+    ASSERT_TRUE(ClearWatchListRowAsset(
+        state.workspace, *document_id, document->rows.front().id));
+    EXPECT_TRUE(document->rows.front().instrument_id.empty());
+    EXPECT_TRUE(document->rows.front().symbol.empty());
+    EXPECT_TRUE(document->rows.front().ticker_input.empty());
+}
+
+TEST(WatchListDocuments, MovesRowsUsingStableRowIdentity) {
+    WorkstationState state = WorkstationState::Defaults();
+    const auto document_id = CreateWatchListDocument(state.workspace);
+    ASSERT_TRUE(document_id);
+    ASSERT_TRUE(AddWatchListRow(state.workspace, *document_id));
+    ASSERT_TRUE(AddWatchListRow(state.workspace, *document_id));
+    auto* document = FindWatchListDocument(state.workspace, *document_id);
+    ASSERT_NE(document, nullptr);
+    ASSERT_EQ(document->rows.size(), 3U);
+    const std::string first_id = document->rows[0].id;
+    const std::string second_id = document->rows[1].id;
+    const std::string third_id = document->rows[2].id;
+
+    const auto moved = MoveWatchListRow(
+        state.workspace, *document_id, first_id, 3U);
+    ASSERT_TRUE(moved);
+    EXPECT_TRUE(*moved);
+    EXPECT_EQ(document->rows[0].id, second_id);
+    EXPECT_EQ(document->rows[1].id, third_id);
+    EXPECT_EQ(document->rows[2].id, first_id);
+
+    const auto no_op = MoveWatchListRow(
+        state.workspace, *document_id, first_id, 3U);
+    ASSERT_TRUE(no_op);
+    EXPECT_FALSE(*no_op);
+
+    const auto decoded = DecodeProfile(EncodeProfile(state));
+    ASSERT_TRUE(decoded);
+    const auto* decoded_document = FindWatchListDocument(
+        decoded->workspace, *document_id);
+    ASSERT_NE(decoded_document, nullptr);
+    ASSERT_EQ(decoded_document->rows.size(), 3U);
+    EXPECT_EQ(decoded_document->rows[0].id, second_id);
+    EXPECT_EQ(decoded_document->rows[1].id, third_id);
+    EXPECT_EQ(decoded_document->rows[2].id, first_id);
+}
+
 TEST(WatchListDocuments, InitializesAndAddsTableColumns) {
     WorkstationState state = WorkstationState::Defaults();
     const auto created = CreateWatchListDocument(state.workspace);
     ASSERT_TRUE(created) << created.error().message;
-    const auto window = state.workspace.windows.find(*created);
+    const auto window = state.workspace.windows.find(
+        std::string(kWatchListWindowId));
     ASSERT_NE(window, state.workspace.windows.end());
     const auto table = window->second.tables.find(
         std::string(kWatchListTableId));
     ASSERT_NE(table, window->second.tables.end());
-    ASSERT_EQ(table->second.columns.size(), 1U);
+    ASSERT_EQ(table->second.columns.size(), 3U);
     EXPECT_EQ(table->second.columns.front().id, "symbol");
 
-    ASSERT_TRUE(AddWatchListColumn(
+    EXPECT_FALSE(AddWatchListColumn(
         state.workspace, *created, WatchListColumnKind::CurrentPrice));
-    ASSERT_TRUE(AddWatchListColumn(
-        state.workspace, *created, WatchListColumnKind::ChangeFromOpen));
+    EXPECT_FALSE(AddWatchListColumn(
+        state.workspace, *created, WatchListColumnKind::ChangeFromClose));
     EXPECT_FALSE(AddWatchListColumn(
         state.workspace, *created, WatchListColumnKind::CurrentPrice));
     ASSERT_EQ(table->second.columns.size(), 3U);
     EXPECT_EQ(table->second.columns[1].id, "current_price");
-    EXPECT_EQ(table->second.columns[2].id, "change_from_open");
+    EXPECT_EQ(table->second.columns[2].id, "change_from_close");
+
+    EXPECT_FALSE(RemoveWatchListColumn(
+        state.workspace, *created, WatchListColumnKind::Symbol));
+    ASSERT_TRUE(RemoveWatchListColumn(
+        state.workspace, *created, WatchListColumnKind::CurrentPrice));
+    ASSERT_EQ(table->second.columns.size(), 2U);
+    EXPECT_EQ(table->second.columns[0].id, "symbol");
+    EXPECT_EQ(table->second.columns[1].id, "change_from_close");
 
     std::string error;
     EXPECT_TRUE(ValidateAndNormalize(state, error)) << error;
     const auto decoded = DecodeProfile(EncodeProfile(state));
     ASSERT_TRUE(decoded) << decoded.error();
-    const auto decoded_window = decoded->workspace.windows.find(*created);
+    const auto decoded_window = decoded->workspace.windows.find(
+        std::string(kWatchListWindowId));
     ASSERT_NE(decoded_window, decoded->workspace.windows.end());
     EXPECT_EQ(decoded_window->second.tables.at(std::string(kWatchListTableId))
                   .columns.size(),
-              3U);
+              2U);
+}
+
+TEST(WatchListDocuments, SavesAndManagesOneNamedDocumentLibrary) {
+    WorkstationState state = WorkstationState::Defaults();
+    WatchListDocumentState draft{
+        .id = std::string(kWatchListDraftId),
+        .name = "Momentum",
+        .rows = {{.id = "row.momentum"}},
+    };
+
+    const auto saved = SaveWatchListDocument(state.workspace, draft);
+    ASSERT_TRUE(saved) << saved.error().message;
+    EXPECT_NE(*saved, kWatchListDraftId);
+    EXPECT_EQ(state.workspace.active_watch_list_id, *saved);
+    ASSERT_EQ(state.workspace.watch_lists.size(), 1U);
+    EXPECT_EQ(state.workspace.watch_lists.front().name, "Momentum");
+    EXPECT_TRUE(state.workspace.windows.contains(std::string(kWatchListWindowId)));
+    EXPECT_EQ(state.workspace.windows.size(), 1U);
+
+    const auto duplicate = SaveWatchListDocument(state.workspace, draft);
+    ASSERT_FALSE(duplicate);
+    EXPECT_EQ(duplicate.error().message,
+              "watch list name is already in use");
+
+    ASSERT_TRUE(RenameWatchListDocument(
+        state.workspace, *saved, "Breakouts"));
+    EXPECT_EQ(FindWatchListDocument(state.workspace, *saved)->name,
+              "Breakouts");
+    ASSERT_TRUE(OpenWatchListDocument(state.workspace, *saved));
+    EXPECT_EQ(state.workspace.active_watch_list_id, *saved);
+
+    ASSERT_TRUE(DeleteWatchListDocument(state.workspace, *saved));
+    EXPECT_TRUE(state.workspace.watch_lists.empty());
+    EXPECT_TRUE(state.workspace.active_watch_list_id.empty());
+    EXPECT_TRUE(state.workspace.windows.contains(std::string(kWatchListWindowId)));
+}
+
+TEST(WatchListDocuments, DraftRowsUseStableIdentityAndCanBeEditedBeforeSaving) {
+    WatchListDocumentState draft{
+        .id = std::string(kWatchListDraftId),
+        .name = "Momentum",
+    };
+    const auto first = AddWatchListRow(draft);
+    const auto second = AddWatchListRow(draft);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    ASSERT_NE(*first, *second);
+
+    ASSERT_TRUE(AssignWatchListRowAsset(
+        draft, *first, "asset:tsla", "TSLA"));
+    const auto assigned = std::ranges::find(
+        draft.rows, *first, &WatchListRowState::id);
+    ASSERT_NE(assigned, draft.rows.end());
+    EXPECT_EQ(assigned->symbol, "TSLA");
+    ASSERT_TRUE(ClearWatchListRowAsset(draft, *first));
+    EXPECT_TRUE(draft.rows.front().symbol.empty());
 }
 
 TEST(WorkstationState, StoreRoundTripsThroughOneProfileFile) {

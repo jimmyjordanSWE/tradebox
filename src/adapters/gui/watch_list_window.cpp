@@ -1,8 +1,12 @@
 #include "watch_list_window.h"
 
 #include "tradebox/workstation/asset_preferences.h"
+#include "tradebox/workstation/stable_id.h"
 #include "tradebox/workstation/watch_list_columns.h"
 #include "tradebox/workstation/watch_list_documents.h"
+
+#include "gui_controls.h"
+#include "watch_list_autocomplete.h"
 
 #include "imgui.h"
 
@@ -45,6 +49,9 @@ const application::UiWatchListRowSnapshot* RowSnapshotFor(
     return found == snapshot->rows.end() ? nullptr : &*found;
 }
 
+constexpr std::string_view kWatchListRowPayload =
+    "tradebox.watch-list-row";
+
 std::string TableColumnLabel(
     const workstation::WatchListColumnDefinition& definition) {
     return std::string(definition.label) + "###" +
@@ -76,6 +83,19 @@ std::vector<workstation::ColumnState*> OrderedColumns(
         return left->id < right->id;
     });
     return result;
+}
+
+int WatchListTickerInputCallback(ImGuiInputTextCallbackData* data) {
+    if (data == nullptr || data->EventFlag != ImGuiInputTextFlags_CallbackHistory ||
+        data->UserData == nullptr)
+        return 0;
+
+    auto* direction = static_cast<int*>(data->UserData);
+    if (data->EventKey == ImGuiKey_DownArrow)
+        *direction = 1;
+    else if (data->EventKey == ImGuiKey_UpArrow)
+        *direction = -1;
+    return 0;
 }
 
 std::optional<core::Decimal> NumericValueFor(
@@ -116,26 +136,158 @@ void SortRows(
 
 }  // namespace
 
+void WatchListWindowRenderer::StartNewDraft(
+    workstation::WorkspaceState& state) {
+    draft_ = workstation::WatchListDocumentState{
+        .id = std::string(workstation::kWatchListDraftId),
+        .name = "Untitled Watch List",
+        .rows = {{.id = workstation::NewStableId("watch-list-row")}},
+    };
+    if (!state.active_watch_list_id.empty()) {
+        state.active_watch_list_id.clear();
+        persistent_changed_ = true;
+    }
+    editing_name_ = false;
+    focus_name_input_ = false;
+    message_.clear();
+    static_cast<void>(workstation::EnsureWatchListWindow(state));
+    state.windows.at(std::string(workstation::kWatchListWindowId)).open = true;
+}
+
+void WatchListWindowRenderer::EnsureSession(
+    workstation::WorkspaceState& state) {
+    static_cast<void>(workstation::EnsureWatchListWindow(state));
+    if (!state.active_watch_list_id.empty()) {
+        if (workstation::FindWatchListDocument(
+                state, state.active_watch_list_id) != nullptr) {
+            draft_.reset();
+            return;
+        }
+        state.active_watch_list_id.clear();
+        persistent_changed_ = true;
+    }
+    if (!draft_) {
+        draft_ = workstation::WatchListDocumentState{
+            .id = std::string(workstation::kWatchListDraftId),
+            .name = "Untitled Watch List",
+            .rows = {{.id = workstation::NewStableId("watch-list-row")}},
+        };
+    }
+}
+
+workstation::WatchListDocumentState*
+WatchListWindowRenderer::ActiveDocument(workstation::WorkspaceState& state) {
+    EnsureSession(state);
+    if (!state.active_watch_list_id.empty())
+        return workstation::FindWatchListDocument(
+            state, state.active_watch_list_id);
+    return draft_ ? &*draft_ : nullptr;
+}
+
+void WatchListWindowRenderer::SaveCurrentDraft(
+    workstation::WorkspaceState& state) {
+    if (!draft_) return;
+    const auto saved = workstation::SaveWatchListDocument(state, *draft_);
+    if (!saved) {
+        message_ = saved.error().message;
+        return;
+    }
+    draft_.reset();
+    editing_name_ = false;
+    focus_name_input_ = false;
+    message_.clear();
+    persistent_changed_ = true;
+}
+
+void WatchListWindowRenderer::OpenSavedDocument(
+    workstation::WorkspaceState& state, std::string_view document_id) {
+    const auto opened =
+        workstation::OpenWatchListDocument(state, document_id);
+    if (!opened) {
+        message_ = opened.error().message;
+        return;
+    }
+    draft_.reset();
+    editing_name_ = false;
+    focus_name_input_ = false;
+    message_.clear();
+    persistent_changed_ = true;
+}
+
+void WatchListWindowRenderer::DeleteSavedDocument(
+    workstation::WorkspaceState& state, std::string_view document_id) {
+    const auto deleted =
+        workstation::DeleteWatchListDocument(state, document_id);
+    if (!deleted) {
+        message_ = deleted.error().message;
+        return;
+    }
+    if (state.active_watch_list_id.empty()) draft_.reset();
+    message_.clear();
+    persistent_changed_ = true;
+}
+
+void WatchListWindowRenderer::CommitName(workstation::WorkspaceState& state) {
+    const std::string next_name(name_input_.data());
+    if (next_name.empty()) {
+        message_ = "Watch list name cannot be empty";
+        return;
+    }
+    if (draft_) {
+        draft_->name = next_name;
+        message_.clear();
+    } else if (!state.active_watch_list_id.empty()) {
+        const auto renamed = workstation::RenameWatchListDocument(
+            state, state.active_watch_list_id, next_name);
+        if (!renamed) {
+            message_ = renamed.error().message;
+            return;
+        }
+        message_.clear();
+        persistent_changed_ = true;
+    }
+    editing_name_ = false;
+    focus_name_input_ = false;
+}
+
 void WatchListWindowRenderer::AppendSnapshotQuery(
     workstation::WorkspaceState& state, application::UiSnapshotQuery& query) {
     queries_.clear();
-    for (const workstation::WatchListDocumentState& document :
-         state.watch_lists) {
-        const auto window = state.windows.find(document.id);
-        if (window == state.windows.end() || !window->second.open) continue;
-        const auto table = window->second.tables.find(
-            std::string(workstation::kWatchListTableId));
+    workstation::WatchListDocumentState* document = ActiveDocument(state);
+    if (document == nullptr) return;
+    application::UiWatchListQuery watch_query{
+        .document_id = document->id,
+    };
+    for (const workstation::WatchListRowState& row : document->rows) {
+        if (row.instrument_id.empty() && !row.ticker_input.empty())
+            query.asset_searches.push_back(row.ticker_input);
+    }
+    if (!query.asset_searches.empty())
+        query.asset_limit = std::max<std::size_t>(query.asset_limit, 8U);
+    queries_.emplace(document->id, std::move(watch_query));
+    query.watch_lists.push_back({.document_id = document->id});
+#if 0
+    workstation::WatchListDocumentState* document = ActiveDocument(state);
+    if (document != nullptr) {
+        const auto window = state.windows.find(
+            std::string(workstation::kWatchListWindowId));
+        const workstation::PersistentTableState* table = nullptr;
+        if (window != state.windows.end()) {
+            const auto table_found = window->second.tables.find(
+                std::string(workstation::kWatchListTableId));
+            if (table_found != window->second.tables.end())
+                table = &table_found->second;
+        }
         const bool needs_change_from_open =
-            table != window->second.tables.end() &&
-            std::ranges::any_of(table->second.columns, [](const auto& column) {
+            table != nullptr &&
+            std::ranges::any_of(table->columns, [](const auto& column) {
                 return column.visible && column.id == "change_from_open";
             });
-
         application::UiWatchListQuery watch_query{
-            .document_id = document.id,
+            .document_id = document->id,
             .needs_change_from_open = needs_change_from_open,
         };
-        for (const workstation::WatchListRowState& row : document.rows) {
+        for (const workstation::WatchListRowState& row : document->rows) {
             if (!row.instrument_id.empty() && !row.symbol.empty()) {
                 query.market_symbols.push_back(row.symbol);
                 watch_query.rows.push_back({
@@ -147,17 +299,22 @@ void WatchListWindowRenderer::AppendSnapshotQuery(
                 query.asset_searches.push_back(row.ticker_input);
             }
         }
-        queries_.emplace(document.id, watch_query);
+        queries_.emplace(document->id, watch_query);
         query.watch_lists.push_back(std::move(watch_query));
     }
     query.asset_preferred_instrument_ids = state.asset_selection_history;
     if (!query.asset_searches.empty())
         query.asset_limit = std::max<std::size_t>(query.asset_limit, 8U);
+#endif
 }
 
 void WatchListWindowRenderer::RequestMissingHistory(
     application::TradingApplication& application,
     const application::ApplicationUiSnapshot& snapshot) {
+    (void)application;
+    (void)snapshot;
+    return;
+#if 0
     for (const application::UiWatchListSnapshot& watch_list :
          snapshot.watch_lists) {
         if (watch_list.daily_range.start_ns >= watch_list.daily_range.end_ns)
@@ -179,24 +336,210 @@ void WatchListWindowRenderer::RequestMissingHistory(
             requested_history_[row.row_id] = watch_list.daily_range;
         }
     }
+#endif
 }
 
 void WatchListWindowRenderer::Draw(
     ui::Workspace& workspace, workstation::WorkspaceState& state,
-    const application::ApplicationUiSnapshot& snapshot) {
-    for (workstation::WatchListDocumentState& document : state.watch_lists) {
-        const auto window_state = state.windows.find(document.id);
-        if (window_state == state.windows.end() || !window_state->second.open)
-            continue;
+    const application::ApplicationUiSnapshot& snapshot, ImFont* icons) {
+    // Deliberately empty first pass. The watch-list window should establish
+    // its visual shell before any document, table, or market-data behavior is
+    // connected to it.
+    (void)icons;
+    EnsureSession(state);
+    workstation::WatchListDocumentState* document = ActiveDocument(state);
+    if (document == nullptr) return;
+    ui::WorkspaceWindow window{
+        .title = "Watch List",
+        .id = std::string(workstation::kWatchListWindowId),
+        .default_offset = {72.0f, 72.0f},
+        .default_size = {720.0f, 480.0f},
+        .open = true,
+        .flags = ImGuiWindowFlags_NoCollapse,
+    };
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    if (!workspace.BeginWindow(window)) {
+        workspace.EndWindow(window);
+        ImGui::PopStyleVar();
+        return;
+    }
+
+    constexpr ImGuiTableFlags table_flags =
+        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_Sortable | ImGuiTableFlags_Resizable |
+        ImGuiTableFlags_SizingFixedFit |
+        ImGuiTableFlags_NoSavedSettings;
+    if (ImGui::BeginTable("watch_list_table", 4, table_flags,
+                          ImVec2(-FLT_MIN, 0.0f))) {
+        constexpr float minimum_column_width = 96.0f;
+        ImGui::TableSetupColumn(
+            "Ticker", ImGuiTableColumnFlags_WidthFixed, minimum_column_width);
+        ImGui::TableSetupColumn(
+            "Last", ImGuiTableColumnFlags_WidthFixed,
+            minimum_column_width);
+        ImGui::TableSetupColumn(
+            "Close", ImGuiTableColumnFlags_WidthFixed,
+            minimum_column_width);
+        ImGui::TableSetupColumn(
+            "Open", ImGuiTableColumnFlags_WidthFixed,
+            minimum_column_width);
+        ImGui::TableHeadersRow();
+
+        for (std::size_t row_index = 0; row_index < document->rows.size();
+             ++row_index) {
+            workstation::WatchListRowState& row = document->rows[row_index];
+            ImGui::PushID(row.id.c_str());
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            RowInteraction& interaction = interactions_[row.id];
+            if (!interaction.initialized) {
+                const auto count = std::min(
+                    row.ticker_input.size(), interaction.ticker.size() - 1U);
+                std::copy_n(row.ticker_input.data(), count,
+                            interaction.ticker.data());
+                interaction.ticker[count] = '\0';
+                interaction.initialized = true;
+            }
+            if (focus_row_id_ == row.id) {
+                ImGui::SetKeyboardFocusHere();
+                focus_row_id_.clear();
+            }
+            interaction.navigation_direction = 0;
+            if (ImGui::InputText(
+                    "##ticker", interaction.ticker.data(),
+                    interaction.ticker.size(),
+                    ImGuiInputTextFlags_CharsUppercase |
+                        ImGuiInputTextFlags_CallbackHistory,
+                    WatchListTickerInputCallback,
+                    &interaction.navigation_direction)) {
+                row.ticker_input = interaction.ticker.data();
+                row.instrument_id.clear();
+                row.symbol.clear();
+                interaction.highlighted_match = -1;
+                persistent_changed_ = true;
+            }
+
+            const auto* matches =
+                row.instrument_id.empty() && !row.ticker_input.empty()
+                    ? MatchesFor(snapshot, row.ticker_input)
+                    : nullptr;
+            const bool select_with_enter =
+                ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter);
+            if (matches != nullptr) {
+                const std::string popup_id = "##ticker_suggestions_" + row.id;
+                const ImVec2 input_min = ImGui::GetItemRectMin();
+                ImGui::SetNextWindowPos(
+                    ImVec2(input_min.x,
+                           input_min.y + ImGui::GetFrameHeight()));
+                ImGui::SetNextWindowBgAlpha(0.98f);
+                constexpr ImGuiWindowFlags popup_flags =
+                    ImGuiWindowFlags_Tooltip |
+                    ImGuiWindowFlags_NoDecoration |
+                    ImGuiWindowFlags_AlwaysAutoResize |
+                    ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                    ImGuiWindowFlags_NoFocusOnAppearing |
+                    ImGuiWindowFlags_NoNav;
+                const bool popup_visible =
+                    ImGui::Begin(popup_id.c_str(), nullptr, popup_flags);
+                if (popup_visible) {
+                    if (matches->matches.empty()) {
+                        ImGui::TextColored(
+                            ImVec4(1.0f, 0.25f, 0.25f, 1.0f),
+                            "No ticker found");
+                    }
+                const std::size_t match_count = matches->matches.size();
+                interaction.highlighted_match =
+                    SelectedWatchListAutocompleteMatch(
+                        interaction.highlighted_match, match_count);
+                if (interaction.navigation_direction != 0)
+                    interaction.highlighted_match =
+                        MoveWatchListAutocompleteMatch(
+                            interaction.highlighted_match, match_count,
+                            interaction.navigation_direction);
+                for (std::size_t match_index = 0;
+                     match_index < match_count; ++match_index) {
+                    const core::TradableAsset& asset =
+                        matches->matches[match_index];
+                    const std::string label = asset.symbol + " - " + asset.name;
+                    const bool selected = interaction.highlighted_match ==
+                                          static_cast<int>(match_index);
+                    if (selected) ImGui::SetItemDefaultFocus();
+                    if (!ImGui::Selectable(
+                            label.c_str(), selected) &&
+                        !(select_with_enter && selected))
+                        continue;
+                    const auto assigned =
+                        document->id == workstation::kWatchListDraftId
+                            ? workstation::AssignWatchListRowAsset(
+                                  *document, row.id, asset.instrument_id,
+                                  asset.symbol)
+                            : workstation::AssignWatchListRowAsset(
+                                  state, document->id, row.id,
+                                  asset.instrument_id, asset.symbol);
+                    if (!assigned) continue;
+                    const auto count = std::min(
+                        asset.symbol.size(), interaction.ticker.size() - 1U);
+                    std::copy_n(asset.symbol.data(), count,
+                                interaction.ticker.data());
+                    interaction.ticker[count] = '\0';
+                    interaction.highlighted_match = -1;
+                    if (row_index + 1U == document->rows.size()) {
+                        if (document->id == workstation::kWatchListDraftId) {
+                            document->rows.push_back({
+                                .id = workstation::NewStableId("watch-list-row")});
+                            focus_row_id_ = document->rows.back().id;
+                        } else {
+                            const auto added = workstation::AddWatchListRow(
+                                state, document->id);
+                            if (added) focus_row_id_ = *added;
+                        }
+                    }
+                    persistent_changed_ = true;
+                }
+                }
+                ImGui::End();
+            }
+            if (select_with_enter &&
+                (matches == nullptr || matches->matches.empty())) {
+                row.ticker_input.clear();
+                row.instrument_id.clear();
+                row.symbol.clear();
+                interaction.ticker[0] = '\0';
+                interaction.highlighted_match = -1;
+                focus_row_id_ = row.id;
+                persistent_changed_ = true;
+            }
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("--");
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("--");
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("--");
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    workspace.EndWindow(window);
+    ImGui::PopStyleVar();
+    return;
+#if 0
+    workstation::WatchListDocumentState* active_document =
+        ActiveDocument(state);
+    if (active_document == nullptr) return;
+    workstation::WatchListDocumentState& document = *active_document;
+    const auto window_state = state.windows.find(
+        std::string(workstation::kWatchListWindowId));
+    if (window_state == state.windows.end() || !window_state->second.open)
+        return;
         auto table = window_state->second.tables.find(
             std::string(workstation::kWatchListTableId));
-        if (table == window_state->second.tables.end()) continue;
+        if (table == window_state->second.tables.end()) return;
         const auto columns = OrderedColumns(table->second);
-        if (columns.empty()) continue;
+        if (columns.empty()) return;
 
         ui::WorkspaceWindow window{
             .title = document.name,
-            .id = document.id,
+            .id = std::string(workstation::kWatchListWindowId),
             .default_offset = {72.0f, 72.0f},
             .default_size = {720.0f, 480.0f},
             .open = true,
@@ -204,11 +547,76 @@ void WatchListWindowRenderer::Draw(
         workspace.ConstrainNextWindowSize({520.0f, 220.0f});
         if (!workspace.BeginWindow(window)) {
             workspace.EndWindow(window);
-            continue;
+            return;
         }
 
         const auto* watch_snapshot = SnapshotFor(snapshot, document.id);
         ImGui::PushID(document.id.c_str());
+        std::optional<std::string> pending_open;
+        std::optional<std::string> pending_delete;
+        bool pending_new = false;
+        bool pending_save = false;
+        ImGui::BeginGroup();
+        if (icons != nullptr) {
+            if (DrawTitleBarToolButton(
+                    "##watch_list_save", 0xe161U, icons,
+                    {34.0f, ImGui::GetFrameHeight()},
+                    ImGui::GetColorU32(ImGuiCol_Text)))
+                pending_save = true;
+            ImGui::SetItemTooltip(draft_ ? "Save watch list" : "Saved");
+        } else if (ImGui::SmallButton("Save##watch_list_save")) {
+            pending_save = true;
+        }
+        ImGui::SameLine();
+        if (!editing_name_) {
+            if (ImGui::Button(document.name.c_str())) {
+                const auto count = std::min(document.name.size(),
+                                            name_input_.size() - 1U);
+                std::copy_n(document.name.data(), count, name_input_.data());
+                name_input_[count] = '\0';
+                editing_name_ = true;
+                focus_name_input_ = true;
+            }
+        } else {
+            ImGui::SetNextItemWidth(220.0f);
+            if (focus_name_input_) {
+                ImGui::SetKeyboardFocusHere();
+                focus_name_input_ = false;
+            }
+            const bool submitted = ImGui::InputText(
+                "##watch_list_name", name_input_.data(), name_input_.size(),
+                ImGuiInputTextFlags_EnterReturnsTrue);
+            if (submitted || ImGui::IsItemDeactivatedAfterEdit())
+                CommitName(state);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Saved lists##watch_list_saved_lists"))
+            ImGui::OpenPopup("watch_list_saved_lists");
+        if (ImGui::BeginPopup("watch_list_saved_lists")) {
+            if (ImGui::MenuItem("+ New watch list")) {
+                pending_new = true;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::Separator();
+            for (const workstation::WatchListDocumentState& saved :
+                 state.watch_lists) {
+                ImGui::PushID(saved.id.c_str());
+                if (ImGui::Selectable(
+                        saved.name.c_str(), saved.id == document.id))
+                    pending_open = saved.id;
+                ImGui::SameLine();
+                if (ImGui::SmallButton("X##delete_watch_list"))
+                    pending_delete = saved.id;
+                ImGui::PopID();
+            }
+            ImGui::EndPopup();
+        }
+        ImGui::EndGroup();
+        if (!message_.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", message_.c_str());
+        }
+        ImGui::Separator();
         const std::string table_id = "##watch_list_table";
         const ImGuiTableFlags table_flags =
             ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_BordersInnerH |
@@ -286,7 +694,11 @@ void WatchListWindowRenderer::Draw(
                 }
             }
 
-            for (workstation::WatchListRowState& row : document.rows) {
+            std::optional<std::pair<std::string, std::size_t>> pending_row_move;
+            bool pending_append_row = false;
+            for (std::size_t row_index = 0; row_index < document.rows.size();
+                 ++row_index) {
+                workstation::WatchListRowState& row = document.rows[row_index];
                 ImGui::PushID(row.id.c_str());
                 ImGui::TableNextRow();
                 for (const std::string& column_id : display_column_ids) {
@@ -302,39 +714,95 @@ void WatchListWindowRenderer::Draw(
                             interaction.ticker[count] = '\0';
                             interaction.initialized = true;
                         }
-                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        ImGui::SmallButton("::##row_drag_handle");
+                        const ImVec2 drag_handle_min = ImGui::GetItemRectMin();
+                        const ImVec2 drag_handle_max = ImGui::GetItemRectMax();
+                        if (ImGui::BeginDragDropSource()) {
+                            ImGui::SetDragDropPayload(
+                                kWatchListRowPayload.data(), row.id.c_str(),
+                                row.id.size() + 1U);
+                            ImGui::TextUnformatted(
+                                row.symbol.empty() ? "Empty watch-list row"
+                                                    : row.symbol.c_str());
+                            ImGui::EndDragDropSource();
+                        }
+                        if (ImGui::BeginDragDropTarget()) {
+                            const ImGuiPayload* payload =
+                                ImGui::AcceptDragDropPayload(
+                                    kWatchListRowPayload.data());
+                            if (payload != nullptr && payload->DataSize > 1U &&
+                                payload->Delivery) {
+                                const std::string_view source_row_id(
+                                    static_cast<const char*>(payload->Data),
+                                    payload->DataSize - 1U);
+                                if (source_row_id != row.id) {
+                                    const float row_center =
+                                        (drag_handle_min.y + drag_handle_max.y) *
+                                        0.5f;
+                                    pending_row_move = {
+                                        std::string(source_row_id),
+                                        row_index +
+                                            (ImGui::GetMousePos().y > row_center
+                                                 ? 1U
+                                                 : 0U)};
+                                }
+                            }
+                            ImGui::EndDragDropTarget();
+                        }
+                        ImGui::SameLine();
+                        const bool populated = !row.instrument_id.empty();
+                        const float clear_button_width =
+                            ImGui::CalcTextSize("X").x +
+                            ImGui::GetStyle().FramePadding.x * 2.0f;
+                        ImGui::SetNextItemWidth(std::max(
+                            1.0f, ImGui::GetContentRegionAvail().x -
+                                       (populated
+                                            ? clear_button_width +
+                                                  ImGui::GetStyle().ItemSpacing.x
+                                            : 0.0f)));
+                        interaction.navigation_direction = 0;
                         if (ImGui::InputText(
                                 "##ticker", interaction.ticker.data(),
                                 interaction.ticker.size(),
-                                ImGuiInputTextFlags_CharsUppercase)) {
+                                ImGuiInputTextFlags_CharsUppercase |
+                                    ImGuiInputTextFlags_CallbackHistory,
+                                WatchListTickerInputCallback,
+                                &interaction.navigation_direction)) {
                             row.ticker_input = interaction.ticker.data();
                             row.instrument_id.clear();
                             row.symbol.clear();
                             interaction.highlighted_match = -1;
                             persistent_changed_ = true;
                         }
+                        bool clear_requested = false;
+                        if (populated) {
+                            ImGui::SameLine();
+                            clear_requested = ImGui::SmallButton(
+                                "X##clear_symbol");
+                        }
+                        const bool select_with_enter =
+                            ImGui::IsItemFocused() &&
+                            ImGui::IsKeyPressed(ImGuiKey_Enter);
                         const auto* matches =
                             row.instrument_id.empty() &&
                                     !row.ticker_input.empty()
                                 ? MatchesFor(snapshot, row.ticker_input)
                                 : nullptr;
                         if (matches != nullptr && !matches->matches.empty()) {
-                            const int last_match = static_cast<int>(
-                                matches->matches.size() - 1U);
-                            if (ImGui::IsItemActive() &&
-                                ImGui::IsKeyPressed(ImGuiKey_DownArrow))
-                                interaction.highlighted_match = std::min(
-                                    interaction.highlighted_match + 1,
-                                    last_match);
-                            if (ImGui::IsItemActive() &&
-                                ImGui::IsKeyPressed(ImGuiKey_UpArrow))
-                                interaction.highlighted_match = std::max(
-                                    interaction.highlighted_match - 1, 0);
-                            const bool select_with_enter =
-                                ImGui::IsItemActive() &&
-                                ImGui::IsKeyPressed(ImGuiKey_Enter);
+                            const std::size_t match_count =
+                                matches->matches.size();
+                            interaction.highlighted_match =
+                                SelectedWatchListAutocompleteMatch(
+                                    interaction.highlighted_match,
+                                    match_count);
+                            if (interaction.navigation_direction != 0)
+                                interaction.highlighted_match =
+                                    MoveWatchListAutocompleteMatch(
+                                        interaction.highlighted_match,
+                                        match_count,
+                                        interaction.navigation_direction);
                             for (std::size_t index = 0;
-                                 index < matches->matches.size(); ++index) {
+                                 index < match_count; ++index) {
                                 const core::TradableAsset& asset =
                                     matches->matches[index];
                                 const std::string label =
@@ -347,9 +815,13 @@ void WatchListWindowRenderer::Draw(
                                     !(select_with_enter && selected))
                                     continue;
                                 const auto assigned =
-                                    workstation::AssignWatchListRowAsset(
-                                        state, document.id, row.id,
-                                        asset.instrument_id, asset.symbol);
+                                    document.id == workstation::kWatchListDraftId
+                                        ? workstation::AssignWatchListRowAsset(
+                                              document, row.id,
+                                              asset.instrument_id, asset.symbol)
+                                        : workstation::AssignWatchListRowAsset(
+                                              state, document.id, row.id,
+                                              asset.instrument_id, asset.symbol);
                                 if (assigned) {
                                     workstation::RecordAssetSelection(
                                         state, asset.instrument_id);
@@ -360,8 +832,24 @@ void WatchListWindowRenderer::Draw(
                                                 interaction.ticker.data());
                                     interaction.ticker[count] = '\0';
                                     interaction.highlighted_match = -1;
+                                    if (&row == &document.rows.back())
+                                        pending_append_row = true;
                                     persistent_changed_ = true;
                                 }
+                            }
+                        }
+                        if (clear_requested) {
+                            const auto cleared =
+                                document.id == workstation::kWatchListDraftId
+                                    ? workstation::ClearWatchListRowAsset(
+                                          document, row.id)
+                                    : workstation::ClearWatchListRowAsset(
+                                          state, document.id, row.id);
+                            if (cleared) {
+                                interaction.ticker[0] = '\0';
+                                interaction.highlighted_match = -1;
+                                interaction.navigation_direction = 0;
+                                persistent_changed_ = true;
                             }
                         }
                     } else if (column_id == "current_price") {
@@ -392,6 +880,27 @@ void WatchListWindowRenderer::Draw(
             }
 
             ImGui::EndTable();
+
+            if (pending_row_move) {
+                const auto moved =
+                    document.id == workstation::kWatchListDraftId
+                        ? workstation::MoveWatchListRow(
+                              document, pending_row_move->first,
+                              pending_row_move->second)
+                        : workstation::MoveWatchListRow(
+                              state, document.id, pending_row_move->first,
+                              pending_row_move->second);
+                if (moved && *moved) persistent_changed_ = true;
+            }
+            if (pending_append_row) {
+                if (document.id == workstation::kWatchListDraftId) {
+                    document.rows.push_back({
+                        .id = workstation::NewStableId("watch-list-row")});
+                } else if (workstation::AddWatchListRow(
+                               state, document.id)) {
+                    persistent_changed_ = true;
+                }
+            }
 
             std::vector<workstation::ColumnState> reordered;
             reordered.reserve(columns.size());
@@ -434,12 +943,20 @@ void WatchListWindowRenderer::Draw(
             ImGui::EndPopup();
         }
         if (ImGui::Button("+ Add row")) {
-            if (workstation::AddWatchListRow(state, document.id))
+            const auto added = document.id == workstation::kWatchListDraftId
+                                   ? workstation::AddWatchListRow(document)
+                                   : workstation::AddWatchListRow(
+                                         state, document.id);
+            if (added && document.id != workstation::kWatchListDraftId)
                 persistent_changed_ = true;
         }
         ImGui::PopID();
         workspace.EndWindow(window);
-    }
+        if (pending_new) StartNewDraft(state);
+        if (pending_save) SaveCurrentDraft(state);
+        if (pending_open) OpenSavedDocument(state, *pending_open);
+        if (pending_delete) DeleteSavedDocument(state, *pending_delete);
+#endif
 }
 
 bool WatchListWindowRenderer::ConsumePersistentChanges() {

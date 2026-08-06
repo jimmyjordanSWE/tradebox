@@ -120,17 +120,20 @@ bool Workspace::BeginWindow(WorkspaceWindow& window) {
     }
     if (!window.open) {
         static_cast<void>(BeginWindow(window.id, window.title, &window.open,
-                                      window.default_offset, window.default_size));
+                                      window.default_offset, window.default_size,
+                                      window.flags));
         return false;
     }
     const bool visible = BeginWindow(window.id, window.title, &window.open,
-                                     window.default_offset, window.default_size);
+                                     window.default_offset, window.default_size,
+                                     window.flags);
     window.began_this_frame = true;
     return visible;
 }
 
 bool Workspace::BeginWindow(std::string_view id, std::string_view title, bool* open,
-                            ImVec2 default_offset, ImVec2 default_size) {
+                            ImVec2 default_offset, ImVec2 default_size,
+                            ImGuiWindowFlags flags) {
     if (open == nullptr) return false;
     if (!*open) {
         if (persistent_state_ != nullptr) {
@@ -169,7 +172,7 @@ bool Workspace::BeginWindow(std::string_view id, std::string_view title, bool* o
                              ImGuiCond_FirstUseEver);
     const std::string label = std::string(title) + "###" + std::string(id);
     const bool open_before = state->open;
-    const bool visible = ImGui::Begin(label.c_str(), &state->open);
+    const bool visible = ImGui::Begin(label.c_str(), &state->open, flags);
     KeepWindowInsideWorkArea();
     if (state->open != open_before) dirty_ = true;
     *open = state->open;

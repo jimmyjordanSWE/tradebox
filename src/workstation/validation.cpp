@@ -2,6 +2,7 @@
 #include "tradebox/workstation/instrument_links.h"
 #include "tradebox/workstation/asset_preferences.h"
 #include "tradebox/workstation/watch_list_columns.h"
+#include "tradebox/workstation/watch_list_documents.h"
 
 #include <algorithm>
 #include <cmath>
@@ -150,45 +151,19 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
 
     std::set<std::string, std::less<>> watch_list_ids;
     std::set<std::string, std::less<>> watch_list_row_ids;
+    for (auto iterator = state.workspace.windows.begin();
+         iterator != state.workspace.windows.end();) {
+        if (iterator->second.kind == "watch-list" &&
+            iterator->first != kWatchListWindowId)
+            iterator = state.workspace.windows.erase(iterator);
+        else
+            ++iterator;
+    }
     for (WatchListDocumentState& watch_list : state.workspace.watch_lists) {
         if (watch_list.id.empty() || watch_list.name.empty() ||
             !watch_list_ids.insert(watch_list.id).second) {
             error = "Watch-list profile contains an invalid or duplicate document ID";
             return false;
-        }
-        auto window = state.workspace.windows.find(watch_list.id);
-        if (window == state.workspace.windows.end()) {
-            state.workspace.windows.emplace(
-                watch_list.id,
-                WindowInstanceState{
-                    .id = watch_list.id,
-                    .kind = "watch-list",
-                    .title = watch_list.name,
-                    .open = true,
-                    .bounds = {72.0f, 72.0f, 720.0f, 480.0f},
-                });
-            window = state.workspace.windows.find(watch_list.id);
-        } else if (window->second.kind != "watch-list") {
-            error = "Watch-list document ID is owned by a non-watch-list window";
-            return false;
-        }
-        PersistentTableState& table =
-            window->second.tables[std::string(kWatchListTableId)];
-        if (!std::ranges::any_of(table.columns, [](const ColumnState& column) {
-                return column.id == "symbol";
-            })) {
-            for (ColumnState& column : table.columns) ++column.order;
-            table.columns.insert(
-                table.columns.begin(),
-                {.id = "symbol", .order = 0, .width = 150.0f,
-                 .visible = true});
-        }
-        std::set<std::string, std::less<>> column_ids;
-        for (const ColumnState& column : table.columns) {
-            if (!column_ids.insert(column.id).second) {
-                error = "Watch-list table contains a duplicate column";
-                return false;
-            }
         }
         for (WatchListRowState& row : watch_list.rows) {
             if (row.id.empty() || !watch_list_row_ids.insert(row.id).second ||
@@ -197,6 +172,28 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
                 return false;
             }
             if (!row.symbol.empty()) row.ticker_input = row.symbol;
+        }
+    }
+    if (!state.workspace.active_watch_list_id.empty() &&
+        !watch_list_ids.contains(state.workspace.active_watch_list_id))
+        state.workspace.active_watch_list_id.clear();
+    if (!watch_list_ids.empty() ||
+        !state.workspace.active_watch_list_id.empty()) {
+        const auto ensured_watch_list_window =
+            EnsureWatchListWindow(state.workspace);
+        if (!ensured_watch_list_window) {
+            error = ensured_watch_list_window.error().message;
+            return false;
+        }
+        PersistentTableState& watch_list_table = state.workspace.windows.at(
+            std::string(kWatchListWindowId))
+            .tables[std::string(kWatchListTableId)];
+        std::set<std::string, std::less<>> watch_list_column_ids;
+        for (const ColumnState& column : watch_list_table.columns) {
+            if (!watch_list_column_ids.insert(column.id).second) {
+                error = "Watch-list table contains a duplicate column";
+                return false;
+            }
         }
     }
 

@@ -309,6 +309,8 @@ std::string EncodeProfile(const WorkstationState& state) {
 
     output << "[workspace]\n";
     output << "selected_symbol = " << Quote(state.workspace.selected_symbol) << '\n';
+    output << "active_watch_list_id = "
+           << Quote(state.workspace.active_watch_list_id) << '\n';
     output << "watchlist = ";
     WriteStringArray(output, state.workspace.watchlist);
     output << '\n';
@@ -509,6 +511,8 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
         }
         if (const toml::table* workspace = root["workspace"].as_table()) {
             state.workspace.selected_symbol = ValueOr(*workspace, "selected_symbol", state.workspace.selected_symbol);
+            state.workspace.active_watch_list_id = ValueOr(
+                *workspace, "active_watch_list_id", std::string{});
             state.workspace.watchlist = ReadStringArray(*workspace, "watchlist");
             state.workspace.asset_selection_history =
                 ReadStringArray(*workspace, "asset_selection_history");

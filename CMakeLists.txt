@@ -311,6 +311,7 @@ if(BUILD_TESTING)
     tests/unit/chart_geometry_tests.cpp
     tests/unit/native_chrome_layout_tests.cpp
     tests/unit/workstation_state_tests.cpp
+    tests/unit/watch_list_autocomplete_tests.cpp
     tests/unit/workspace_dirty_tests.cpp
     src/adapters/gui/workspace.cpp
   )

@@ -6,6 +6,8 @@
 #include "imgui.h"
 
 #include <array>
+#include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -33,6 +35,7 @@ struct ChromeActions {
     AccountPopupAction account = AccountPopupAction::None;
     bool new_chart = false;
     bool new_watch_list = false;
+    std::optional<std::string> open_watch_list_id;
     bool new_debug = false;
     bool imgui_demo = false;
     bool settings_changed = false;
@@ -49,6 +52,7 @@ struct ChromeActions {
     core::AccountEnvironment current_environment,
     std::string_view current_account_id,
     bool& auto_connect,
+    const workstation::WorkspaceState& workspace_state,
     workstation::ApplicationSettings& application_settings, bool& done);
 
 }  // namespace tradebox::gui

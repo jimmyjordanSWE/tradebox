@@ -231,6 +231,8 @@ struct BracketDraftState {
 struct WorkspaceState {
     std::string selected_symbol = "AMD";
     std::vector<std::string> watchlist{"AMD", "AAPL", "NVDA", "SPY"};
+    // Empty means the active watch-list session is an unsaved draft.
+    std::string active_watch_list_id;
     // Most-recently selected stable asset identities, used to make repeated
     // autocomplete choices appear before the alphabetical universe.
     std::vector<std::string> asset_selection_history;
