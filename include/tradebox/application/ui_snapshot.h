@@ -7,7 +7,9 @@
 #include "tradebox/core/types.h"
 #include "tradebox/application/indicator_projection_cache.h"
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -27,9 +29,23 @@ struct UiChartQuery {
     std::vector<core::IndicatorDefinition> indicators;
 };
 
+struct UiWatchListRowQuery {
+    std::string row_id;
+    std::string instrument_id;
+    std::string symbol;
+};
+
+struct UiWatchListQuery {
+    std::string document_id;
+    std::vector<UiWatchListRowQuery> rows;
+    bool needs_change_from_open = false;
+};
+
 struct UiSnapshotQuery {
+    std::int64_t as_of_ns = 0;
     std::vector<std::string> market_symbols;
     std::vector<UiChartQuery> charts;
+    std::vector<UiWatchListQuery> watch_lists;
     std::string asset_search;
     std::vector<std::string> asset_searches;
     std::vector<std::string> asset_preferred_instrument_ids;
@@ -62,12 +78,26 @@ struct UiChartSnapshot {
         indicator_projection;
 };
 
+struct UiWatchListRowSnapshot {
+    std::string row_id;
+    std::optional<core::Decimal> current_price;
+    std::optional<core::Decimal> change_from_open;
+    bool history_missing = false;
+};
+
+struct UiWatchListSnapshot {
+    std::string document_id;
+    core::BarRange daily_range;
+    std::vector<UiWatchListRowSnapshot> rows;
+};
+
 // A complete read model for one render pass. It contains no renderer types and
 // can therefore be assembled and tested independently of the renderer.
 struct ApplicationUiSnapshot {
     core::CoreSnapshot core;
     core::MarketDataFrame markets;
     std::vector<UiChartSnapshot> charts;
+    std::vector<UiWatchListSnapshot> watch_lists;
     std::vector<core::TradableAsset> assets;
     std::vector<UiAssetSearchResult> asset_search_results;
 };

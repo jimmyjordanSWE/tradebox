@@ -1,6 +1,7 @@
 #pragma once
 
 #include "tradebox/workstation/state.h"
+#include "tradebox/workstation/watch_list_columns.h"
 
 #include <expected>
 #include <string>
@@ -20,6 +21,9 @@ CreateWatchListDocument(WorkspaceState& workspace);
     const WorkspaceState& workspace, std::string_view document_id);
 [[nodiscard]] std::expected<std::string, WatchListDocumentError>
 AddWatchListRow(WorkspaceState& workspace, std::string_view document_id);
+[[nodiscard]] std::expected<void, WatchListDocumentError>
+AddWatchListColumn(WorkspaceState& workspace, std::string_view document_id,
+                   WatchListColumnKind kind);
 [[nodiscard]] std::expected<void, WatchListDocumentError>
 AssignWatchListRowAsset(WorkspaceState& workspace,
                         std::string_view document_id,

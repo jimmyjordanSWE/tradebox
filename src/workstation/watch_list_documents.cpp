@@ -56,15 +56,20 @@ CreateWatchListDocument(WorkspaceState& workspace) {
     };
     const std::string document_id = document.id;
     workspace.watch_lists.push_back(std::move(document));
-    workspace.windows.emplace(
-        document_id,
-        WindowInstanceState{
-            .id = document_id,
-            .kind = "watch-list",
-            .title = workspace.watch_lists.back().name,
-            .open = true,
-            .bounds = {72.0f, 72.0f, 720.0f, 480.0f},
-        });
+    WindowInstanceState window{
+        .id = document_id,
+        .kind = "watch-list",
+        .title = workspace.watch_lists.back().name,
+        .open = true,
+        .bounds = {72.0f, 72.0f, 720.0f, 480.0f},
+    };
+    window.tables.emplace(
+        std::string(kWatchListTableId),
+        PersistentTableState{.columns = {{
+            .id = "symbol", .order = 0, .width = 150.0f,
+            .visible = true,
+        }}});
+    workspace.windows.emplace(document_id, std::move(window));
     return document_id;
 }
 
@@ -77,6 +82,41 @@ AddWatchListRow(WorkspaceState& workspace, std::string_view document_id) {
     const std::string row_id = NewStableId("watch-list-row");
     document->rows.push_back({.id = row_id});
     return row_id;
+}
+
+std::expected<void, WatchListDocumentError> AddWatchListColumn(
+    WorkspaceState& workspace, std::string_view document_id,
+    WatchListColumnKind kind) {
+    const auto* definition = FindWatchListColumn(kind);
+    if (definition == nullptr || kind == WatchListColumnKind::Symbol)
+        return std::unexpected(
+            WatchListDocumentError{"watch list column is not addable"});
+    WatchListDocumentState* document = FindDocument(workspace, document_id);
+    if (document == nullptr)
+        return std::unexpected(
+            WatchListDocumentError{"watch list document does not exist"});
+    const auto window = workspace.windows.find(std::string(document_id));
+    if (window == workspace.windows.end() ||
+        window->second.kind != "watch-list")
+        return std::unexpected(WatchListDocumentError{
+            "watch list document has no matching window"});
+    PersistentTableState& table =
+        window->second.tables[std::string(kWatchListTableId)];
+    if (std::ranges::any_of(table.columns, [&](const ColumnState& column) {
+            return column.id == definition->id;
+        }))
+        return std::unexpected(
+            WatchListDocumentError{"watch list column is already present"});
+    int next_order = 0;
+    for (const ColumnState& column : table.columns)
+        next_order = std::max(next_order, column.order + 1);
+    table.columns.push_back({
+        .id = std::string(definition->id),
+        .order = next_order,
+        .width = 140.0f,
+        .visible = true,
+    });
+    return {};
 }
 
 std::expected<void, WatchListDocumentError> AssignWatchListRowAsset(

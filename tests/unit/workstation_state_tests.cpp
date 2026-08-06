@@ -4,6 +4,7 @@
 #include "tradebox/workstation/profile_store.h"
 #include "tradebox/workstation/validation.h"
 #include "tradebox/workstation/watch_list_documents.h"
+#include "tradebox/workstation/watch_list_columns.h"
 #include "tradebox/workstation/asset_preferences.h"
 
 #include <gtest/gtest.h>
@@ -181,6 +182,39 @@ TEST(WorkstationState, ProfileRoundTripPreservesSemanticState) {
     EXPECT_EQ(decoded->workspace.chart_drawings.front().first.price,
               *drawing_price);
     EXPECT_EQ(EncodeProfile(*decoded), encoded);
+}
+
+TEST(WatchListDocuments, InitializesAndAddsTableColumns) {
+    WorkstationState state = WorkstationState::Defaults();
+    const auto created = CreateWatchListDocument(state.workspace);
+    ASSERT_TRUE(created) << created.error().message;
+    const auto window = state.workspace.windows.find(*created);
+    ASSERT_NE(window, state.workspace.windows.end());
+    const auto table = window->second.tables.find(
+        std::string(kWatchListTableId));
+    ASSERT_NE(table, window->second.tables.end());
+    ASSERT_EQ(table->second.columns.size(), 1U);
+    EXPECT_EQ(table->second.columns.front().id, "symbol");
+
+    ASSERT_TRUE(AddWatchListColumn(
+        state.workspace, *created, WatchListColumnKind::CurrentPrice));
+    ASSERT_TRUE(AddWatchListColumn(
+        state.workspace, *created, WatchListColumnKind::ChangeFromOpen));
+    EXPECT_FALSE(AddWatchListColumn(
+        state.workspace, *created, WatchListColumnKind::CurrentPrice));
+    ASSERT_EQ(table->second.columns.size(), 3U);
+    EXPECT_EQ(table->second.columns[1].id, "current_price");
+    EXPECT_EQ(table->second.columns[2].id, "change_from_open");
+
+    std::string error;
+    EXPECT_TRUE(ValidateAndNormalize(state, error)) << error;
+    const auto decoded = DecodeProfile(EncodeProfile(state));
+    ASSERT_TRUE(decoded) << decoded.error();
+    const auto decoded_window = decoded->workspace.windows.find(*created);
+    ASSERT_NE(decoded_window, decoded->workspace.windows.end());
+    EXPECT_EQ(decoded_window->second.tables.at(std::string(kWatchListTableId))
+                  .columns.size(),
+              3U);
 }
 
 TEST(WorkstationState, StoreRoundTripsThroughOneProfileFile) {

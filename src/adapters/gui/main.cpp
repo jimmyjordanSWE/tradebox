@@ -717,6 +717,7 @@ int RunApplication(const LaunchOptions& options) {
             static_cast<void>(application->DrainUiEvents());
         auto snapshot_query = chart_renderer.BuildSnapshotQuery(
             workstation_state.workspace, now_ns);
+        snapshot_query.as_of_ns = now_ns;
         watch_list_renderer.AppendSnapshotQuery(
             workstation_state.workspace, snapshot_query);
         if (application != nullptr) {
@@ -954,6 +955,8 @@ int RunApplication(const LaunchOptions& options) {
         }
         if (application != nullptr)
             chart_renderer.RequestMissingHistory(*application, snapshot);
+        if (application != nullptr)
+            watch_list_renderer.RequestMissingHistory(*application, snapshot);
 
         const ImGuiViewport* viewport = ImGui::GetMainViewport();
         workspace.SetUiScale(workstation_state.application.ui_scale);

@@ -1,6 +1,7 @@
 #include "tradebox/workstation/validation.h"
 #include "tradebox/workstation/instrument_links.h"
 #include "tradebox/workstation/asset_preferences.h"
+#include "tradebox/workstation/watch_list_columns.h"
 
 #include <algorithm>
 #include <cmath>
@@ -155,7 +156,7 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
             error = "Watch-list profile contains an invalid or duplicate document ID";
             return false;
         }
-        const auto window = state.workspace.windows.find(watch_list.id);
+        auto window = state.workspace.windows.find(watch_list.id);
         if (window == state.workspace.windows.end()) {
             state.workspace.windows.emplace(
                 watch_list.id,
@@ -166,9 +167,28 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
                     .open = true,
                     .bounds = {72.0f, 72.0f, 720.0f, 480.0f},
                 });
+            window = state.workspace.windows.find(watch_list.id);
         } else if (window->second.kind != "watch-list") {
             error = "Watch-list document ID is owned by a non-watch-list window";
             return false;
+        }
+        PersistentTableState& table =
+            window->second.tables[std::string(kWatchListTableId)];
+        if (!std::ranges::any_of(table.columns, [](const ColumnState& column) {
+                return column.id == "symbol";
+            })) {
+            for (ColumnState& column : table.columns) ++column.order;
+            table.columns.insert(
+                table.columns.begin(),
+                {.id = "symbol", .order = 0, .width = 150.0f,
+                 .visible = true});
+        }
+        std::set<std::string, std::less<>> column_ids;
+        for (const ColumnState& column : table.columns) {
+            if (!column_ids.insert(column.id).second) {
+                error = "Watch-list table contains a duplicate column";
+                return false;
+            }
         }
         for (WatchListRowState& row : watch_list.rows) {
             if (row.id.empty() || !watch_list_row_ids.insert(row.id).second ||

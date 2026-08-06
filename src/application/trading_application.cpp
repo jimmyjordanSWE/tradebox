@@ -16,6 +16,7 @@
 #include <ranges>
 #include <shared_mutex>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 
 namespace tradebox::application {
@@ -36,6 +37,15 @@ std::int64_t WallClockNowMs() {
 
 constexpr std::int64_t kAssetCatalogRefreshIntervalMs =
     24LL * 60LL * 60LL * 1000LL;
+
+core::BarRange WatchListDailyRange(std::int64_t as_of_ns) {
+    constexpr std::int64_t kDayNs = 24LL * 60LL * 60LL * 1'000'000'000LL;
+    constexpr std::int64_t kLookbackDays = 45;
+    return {
+        as_of_ns - kLookbackDays * kDayNs,
+        as_of_ns + kDayNs,
+    };
+}
 
 class CoreValuationMarketDataSink final
     : public core::IMarketDataSink {
@@ -291,6 +301,49 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
             impl_->indicator_projections.Resolve(
                 projected.series, chart.indicators);
         result.charts.push_back(std::move(projected));
+    }
+    result.watch_lists.reserve(query.watch_lists.size());
+    std::unordered_map<std::string, core::BarSeriesSnapshot> daily_series;
+    for (const UiWatchListQuery& watch_list : query.watch_lists) {
+        UiWatchListSnapshot projected{
+            .document_id = watch_list.document_id,
+        };
+        if (watch_list.needs_change_from_open && query.as_of_ns > 0)
+            projected.daily_range = WatchListDailyRange(query.as_of_ns);
+        projected.rows.reserve(watch_list.rows.size());
+        for (const UiWatchListRowQuery& row : watch_list.rows) {
+            UiWatchListRowSnapshot row_snapshot{.row_id = row.row_id};
+            const std::string& identifier = row.instrument_id.empty()
+                                                ? row.symbol
+                                                : row.instrument_id;
+            const core::MarketDataSnapshot* live =
+                identifier.empty() ? nullptr : result.markets.Find(identifier);
+            if (live != nullptr && live->latest_price)
+                row_snapshot.current_price = live->latest_price->price;
+
+            if (watch_list.needs_change_from_open &&
+                query.as_of_ns > 0 && !row.instrument_id.empty() &&
+                live != nullptr) {
+                auto [daily_position, inserted] = daily_series.try_emplace(
+                    row.instrument_id);
+                auto& daily = daily_position->second;
+                if (inserted) {
+                    daily = BarsFromMarketSnapshot(
+                        {.instrument_id = row.instrument_id,
+                         .feed = impl_->active_market_feed,
+                         .timeframe = "1Day",
+                         .adjustment = core::BarAdjustment::Raw},
+                        projected.daily_range, live);
+                }
+                row_snapshot.history_missing =
+                    !daily.missing_ranges.empty();
+                if (row_snapshot.current_price && daily.current_bar)
+                    row_snapshot.change_from_open =
+                        *row_snapshot.current_price - daily.current_bar->open;
+            }
+            projected.rows.push_back(std::move(row_snapshot));
+        }
+        result.watch_lists.push_back(std::move(projected));
     }
     if (query.asset_limit != 0) {
         std::shared_lock catalog_lock(impl_->asset_catalog_mutex);
