@@ -6,6 +6,7 @@
 #include "tradebox/core/market_data.h"
 #include "tradebox/core/types.h"
 #include "tradebox/core/rest_health.h"
+#include "tradebox/ui/model.h"
 #include "tradebox/application/ui_snapshot.h"
 #include "tradebox/application/market_data_interest.h"
 
@@ -113,6 +114,7 @@ public:
     [[nodiscard]] std::future<core::TickSeries> RequestTicks(
         core::TickQuery query);
     void RefreshAssetCatalog();
+    [[nodiscard]] std::vector<UiEvent> DrainUiEvents();
 
 private:
     [[nodiscard]] core::BarSeriesSnapshot BarsFromMarketSnapshot(

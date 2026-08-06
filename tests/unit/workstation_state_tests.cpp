@@ -3,6 +3,8 @@
 #include "tradebox/workstation/profile_codec.h"
 #include "tradebox/workstation/profile_store.h"
 #include "tradebox/workstation/validation.h"
+#include "tradebox/workstation/watch_list_documents.h"
+#include "tradebox/workstation/asset_preferences.h"
 
 #include <gtest/gtest.h>
 
@@ -66,6 +68,9 @@ TEST(WorkstationState, ProfileRoundTripPreservesSemanticState) {
     WorkstationState source = WorkstationState::Defaults();
     source.profile.name = "Research";
     source.workspace.selected_symbol = "NVDA";
+    RecordAssetSelection(source.workspace, "alpaca:1");
+    RecordAssetSelection(source.workspace, "alpaca:2");
+    RecordAssetSelection(source.workspace, "alpaca:1");
     source.workspace.windows.emplace(
         "tool.activity",
         WindowInstanceState{.id = "tool.activity",
@@ -123,16 +128,35 @@ TEST(WorkstationState, ProfileRoundTripPreservesSemanticState) {
          .kind = ChartDrawingKind::HorizontalLine,
          .first = {.time_ns = 100, .price = *drawing_price},
          .label = "Breakout"}));
+    const auto watch_list_id = CreateWatchListDocument(source.workspace);
+    ASSERT_TRUE(watch_list_id) << watch_list_id.error().message;
+    WatchListDocumentState* watch_list =
+        FindWatchListDocument(source.workspace, *watch_list_id);
+    ASSERT_NE(watch_list, nullptr);
+    watch_list->name = "Bullish symbols";
+    ASSERT_FALSE(watch_list->rows.empty());
+    ASSERT_TRUE(AssignWatchListRowAsset(
+        source.workspace, *watch_list_id, watch_list->rows.front().id,
+        "alpaca:2", "AMD"));
     const std::string encoded = EncodeProfile(source);
     const auto decoded = DecodeProfile(encoded);
     ASSERT_TRUE(decoded) << decoded.error();
     EXPECT_EQ(decoded->profile.name, "Research");
     EXPECT_EQ(decoded->workspace.selected_symbol, "NVDA");
+    ASSERT_EQ(decoded->workspace.asset_selection_history.size(), 2U);
+    EXPECT_EQ(decoded->workspace.asset_selection_history[0], "alpaca:1");
+    EXPECT_EQ(decoded->workspace.asset_selection_history[1], "alpaca:2");
     EXPECT_EQ(decoded->workspace.windows.at("tool.activity").selected_tab,
               "Orders");
     EXPECT_EQ(decoded->workspace.windows.at("tool.activity")
                   .instrument_link_group_id,
               "instrument-link.green");
+    ASSERT_EQ(decoded->workspace.watch_lists.size(), 1U);
+    EXPECT_EQ(decoded->workspace.watch_lists.front().name,
+              "Bullish symbols");
+    ASSERT_EQ(decoded->workspace.watch_lists.front().rows.size(), 1U);
+    EXPECT_EQ(decoded->workspace.watch_lists.front().rows.front().symbol,
+              "AMD");
     const auto* linked = LinkedInstrumentForWindow(
         decoded->workspace, "tool.activity");
     ASSERT_NE(linked, nullptr);

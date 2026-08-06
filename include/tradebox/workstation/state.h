@@ -11,7 +11,7 @@
 
 namespace tradebox::workstation {
 
-inline constexpr int kCurrentSchemaVersion = 2;
+inline constexpr int kCurrentSchemaVersion = 3;
 inline constexpr std::size_t kInstrumentLinkGroupCount = 32;
 
 enum class InstrumentLinkColor : std::uint8_t {
@@ -101,6 +101,19 @@ struct ColumnState {
 
 struct PersistentTableState {
     std::vector<ColumnState> columns;
+};
+
+struct WatchListRowState {
+    std::string id;
+    std::string instrument_id;
+    std::string symbol;
+    std::string ticker_input;
+};
+
+struct WatchListDocumentState {
+    std::string id;
+    std::string name = "Watch List";
+    std::vector<WatchListRowState> rows;
 };
 
 struct WindowInstanceState {
@@ -218,6 +231,9 @@ struct BracketDraftState {
 struct WorkspaceState {
     std::string selected_symbol = "AMD";
     std::vector<std::string> watchlist{"AMD", "AAPL", "NVDA", "SPY"};
+    // Most-recently selected stable asset identities, used to make repeated
+    // autocomplete choices appear before the alphabetical universe.
+    std::vector<std::string> asset_selection_history;
     bool show_active_orders = true;
     bool show_filled_orders = true;
     std::string order_management_symbol;
@@ -230,6 +246,7 @@ struct WorkspaceState {
     std::map<std::string, WindowInstanceState, std::less<>> windows;
     ChartDefaultsState chart_defaults;
     std::vector<ChartDocumentState> charts;
+    std::vector<WatchListDocumentState> watch_lists;
     std::vector<IndicatorSuiteState> indicator_suites;
     std::vector<ChartDrawingState> chart_drawings;
     std::vector<OrderTicketState> order_tickets;

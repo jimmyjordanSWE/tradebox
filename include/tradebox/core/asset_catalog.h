@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,7 @@ struct TradableAsset {
 
 [[nodiscard]] std::vector<TradableAsset> SearchTradableAssets(
     const std::vector<TradableAsset>& assets, std::string query,
-    std::size_t limit = 5);
+    std::size_t limit = 5,
+    std::span<const std::string> preferred_instrument_ids = {});
 
 }  // namespace tradebox::core

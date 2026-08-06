@@ -31,6 +31,8 @@ struct UiSnapshotQuery {
     std::vector<std::string> market_symbols;
     std::vector<UiChartQuery> charts;
     std::string asset_search;
+    std::vector<std::string> asset_searches;
+    std::vector<std::string> asset_preferred_instrument_ids;
     // Zero avoids catalog work during ordinary frames. The GUI opts in while
     // presenting ticker search results.
     std::size_t asset_limit = 0;
@@ -43,6 +45,11 @@ enum class ChartDataStatus {
     Empty,
     MissingHistory,
     Failed,
+};
+
+struct UiAssetSearchResult {
+    std::string query;
+    std::vector<core::TradableAsset> matches;
 };
 
 struct UiChartSnapshot {
@@ -62,6 +69,7 @@ struct ApplicationUiSnapshot {
     core::MarketDataFrame markets;
     std::vector<UiChartSnapshot> charts;
     std::vector<core::TradableAsset> assets;
+    std::vector<UiAssetSearchResult> asset_search_results;
 };
 
 }  // namespace tradebox::application

@@ -1,5 +1,7 @@
 #include "chart_window.h"
 
+#include "tradebox/workstation/asset_preferences.h"
+
 #include "chart_geometry.h"
 #include "tradebox/application/chart_query.h"
 #include "tradebox/workstation/chart_documents.h"
@@ -236,6 +238,8 @@ void ChartWindowRenderer::DrawChartWindow(
             const auto assigned = workstation::AssignChartInstrument(
                 state, chart.id, asset.instrument_id, asset.symbol);
             if (!assigned) continue;
+            workstation::RecordAssetSelection(
+                state, asset.instrument_id);
             const auto count = std::min(asset.symbol.size(),
                                         interaction.ticker.size() - 1);
             std::copy_n(asset.symbol.data(), count, interaction.ticker.data());

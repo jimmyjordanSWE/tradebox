@@ -1,5 +1,6 @@
 #include "tradebox/workstation/validation.h"
 #include "tradebox/workstation/instrument_links.h"
+#include "tradebox/workstation/asset_preferences.h"
 
 #include <algorithm>
 #include <cmath>
@@ -104,6 +105,22 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
     if (state.workspace.selected_symbol.empty() && !state.workspace.watchlist.empty())
         state.workspace.selected_symbol = state.workspace.watchlist.front();
 
+    std::set<std::string, std::less<>> selected_assets;
+    std::vector<std::string> normalized_selection_history;
+    normalized_selection_history.reserve(
+        std::min(state.workspace.asset_selection_history.size(),
+                 kAssetSelectionHistoryLimit));
+    for (const std::string& instrument_id :
+         state.workspace.asset_selection_history) {
+        if (!instrument_id.empty() && selected_assets.insert(instrument_id).second)
+            normalized_selection_history.push_back(instrument_id);
+        if (normalized_selection_history.size() ==
+            kAssetSelectionHistoryLimit)
+            break;
+    }
+    state.workspace.asset_selection_history =
+        std::move(normalized_selection_history);
+
     for (auto& [id, window] : state.workspace.windows) {
         if (id.empty() || window.id != id || window.kind.empty()) {
             error = "Window profile contains an invalid stable ID";
@@ -127,6 +144,39 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
                 }
                 column.width = std::clamp(column.width, 0.0f, 100000.0f);
             }
+        }
+    }
+
+    std::set<std::string, std::less<>> watch_list_ids;
+    std::set<std::string, std::less<>> watch_list_row_ids;
+    for (WatchListDocumentState& watch_list : state.workspace.watch_lists) {
+        if (watch_list.id.empty() || watch_list.name.empty() ||
+            !watch_list_ids.insert(watch_list.id).second) {
+            error = "Watch-list profile contains an invalid or duplicate document ID";
+            return false;
+        }
+        const auto window = state.workspace.windows.find(watch_list.id);
+        if (window == state.workspace.windows.end()) {
+            state.workspace.windows.emplace(
+                watch_list.id,
+                WindowInstanceState{
+                    .id = watch_list.id,
+                    .kind = "watch-list",
+                    .title = watch_list.name,
+                    .open = true,
+                    .bounds = {72.0f, 72.0f, 720.0f, 480.0f},
+                });
+        } else if (window->second.kind != "watch-list") {
+            error = "Watch-list document ID is owned by a non-watch-list window";
+            return false;
+        }
+        for (WatchListRowState& row : watch_list.rows) {
+            if (row.id.empty() || !watch_list_row_ids.insert(row.id).second ||
+                row.instrument_id.empty() != row.symbol.empty()) {
+                error = "Watch-list profile contains an invalid row";
+                return false;
+            }
+            if (!row.symbol.empty()) row.ticker_input = row.symbol;
         }
     }
 

@@ -97,6 +97,7 @@ public:
     explicit Impl(Database& database)
         : database(database),
           owned_events(std::make_unique<UiEventQueue>()),
+          event_queue(owned_events.get()),
           journal(database),
           order_journal(database),
           core(journal, clock),
@@ -111,6 +112,7 @@ public:
          core::IOrderCommandJournal& external_order_journal)
         : database(database),
           owned_events(std::make_unique<UiEventQueue>()),
+          event_queue(owned_events.get()),
           journal(database),
           order_journal(database),
           core(journal, clock),
@@ -123,6 +125,7 @@ public:
 
     Impl(UiEventQueue& events, Database& database)
         : database(database),
+          event_queue(&events),
           journal(database),
           order_journal(database),
           core(journal, clock),
@@ -135,6 +138,7 @@ public:
 
     Database& database;
     std::unique_ptr<UiEventQueue> owned_events;
+    UiEventQueue* event_queue = nullptr;
     persistence::DatabaseEventJournal journal;
     persistence::DatabaseOrderCommandJournal order_journal;
     core::SystemClock clock;
@@ -250,13 +254,30 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
     }
     if (query.asset_limit != 0) {
         const auto catalog = impl_->database.LoadAssetCatalog();
-        result.assets = core::SearchTradableAssets(
-            catalog, query.asset_search, query.asset_limit);
-        if (result.assets.empty() && !query.asset_search.empty()) {
-            const auto stored =
-                impl_->database.LoadKnownProviderBarAssets();
-            result.assets = core::SearchTradableAssets(
-                stored, query.asset_search, query.asset_limit);
+        const auto stored = impl_->database.LoadKnownProviderBarAssets();
+        const auto search = [&](const std::string& text) {
+            auto matches = core::SearchTradableAssets(
+                catalog, text, query.asset_limit,
+                query.asset_preferred_instrument_ids);
+            if (matches.empty() && !text.empty())
+                matches = core::SearchTradableAssets(
+                    stored, text, query.asset_limit,
+                    query.asset_preferred_instrument_ids);
+            return matches;
+        };
+        if (!query.asset_search.empty()) {
+            result.assets = search(query.asset_search);
+            result.asset_search_results.push_back({
+                query.asset_search, result.assets});
+        }
+        for (const std::string& text : query.asset_searches) {
+            if (text.empty() || std::ranges::any_of(
+                                    result.asset_search_results,
+                                    [&](const UiAssetSearchResult& existing) {
+                                        return existing.query == text;
+                                    }))
+                continue;
+            result.asset_search_results.push_back({text, search(text)});
         }
     }
     return result;
@@ -650,6 +671,15 @@ std::future<core::TickSeries> TradingApplication::RequestTicks(
 
 void TradingApplication::RefreshAssetCatalog() {
     impl_->broker.RequestAssetCatalog();
+}
+
+std::vector<UiEvent> TradingApplication::DrainUiEvents() {
+    if (impl_->event_queue == nullptr) return {};
+    std::vector<UiEvent> events = impl_->event_queue->Drain();
+    for (const UiEvent& event : events)
+        if (event.type == UiEventType::AssetCatalogReady)
+            impl_->database.SaveAssetCatalog(event.assets);
+    return events;
 }
 
 }  // namespace tradebox::application

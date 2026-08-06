@@ -312,6 +312,9 @@ std::string EncodeProfile(const WorkstationState& state) {
     output << "watchlist = ";
     WriteStringArray(output, state.workspace.watchlist);
     output << '\n';
+    output << "asset_selection_history = ";
+    WriteStringArray(output, state.workspace.asset_selection_history);
+    output << '\n';
     output << "show_active_orders = " << (state.workspace.show_active_orders ? "true" : "false") << '\n';
     output << "show_filled_orders = " << (state.workspace.show_filled_orders ? "true" : "false") << '\n';
     output << "order_management_symbol = " << Quote(state.workspace.order_management_symbol) << '\n';
@@ -383,6 +386,21 @@ std::string EncodeProfile(const WorkstationState& state) {
                 output << "visible = " << (column.visible ? "true" : "false") << '\n';
                 output << "sort_direction = " << Quote(column.sort_direction) << "\n\n";
             }
+        }
+    }
+
+    for (const WatchListDocumentState& watch_list :
+         state.workspace.watch_lists) {
+        output << "[[watch_lists]]\n";
+        output << "id = " << Quote(watch_list.id) << '\n';
+        output << "name = " << Quote(watch_list.name) << "\n\n";
+        for (const WatchListRowState& row : watch_list.rows) {
+            output << "[[watch_lists.rows]]\n";
+            output << "id = " << Quote(row.id) << '\n';
+            output << "instrument_id = " << Quote(row.instrument_id) << '\n';
+            output << "symbol = " << Quote(row.symbol) << '\n';
+            output << "ticker_input = " << Quote(row.ticker_input)
+                   << "\n\n";
         }
     }
 
@@ -466,7 +484,7 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
             state.profile.name = ValueOr(*profile, "name", state.profile.name);
         }
         const int source_schema_version = state.profile.schema_version;
-        if (source_schema_version != 1 &&
+        if (source_schema_version != 1 && source_schema_version != 2 &&
             source_schema_version != kCurrentSchemaVersion)
             return std::unexpected(
                 "Unsupported workstation profile schema version");
@@ -492,6 +510,8 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
         if (const toml::table* workspace = root["workspace"].as_table()) {
             state.workspace.selected_symbol = ValueOr(*workspace, "selected_symbol", state.workspace.selected_symbol);
             state.workspace.watchlist = ReadStringArray(*workspace, "watchlist");
+            state.workspace.asset_selection_history =
+                ReadStringArray(*workspace, "asset_selection_history");
             state.workspace.show_active_orders = ValueOr(*workspace, "show_active_orders", true);
             state.workspace.show_filled_orders = ValueOr(*workspace, "show_filled_orders", true);
             state.workspace.order_management_symbol = ValueOr(*workspace, "order_management_symbol", std::string{});
@@ -601,6 +621,35 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
                     }
                 }
                 state.workspace.windows.emplace(id, std::move(window));
+            }
+        }
+        state.workspace.watch_lists.clear();
+        if (const toml::array* watch_lists = root["watch_lists"].as_array()) {
+            for (const toml::node& node : *watch_lists) {
+                const toml::table* watch_list = node.as_table();
+                if (watch_list == nullptr) continue;
+                WatchListDocumentState document{
+                    .id = ValueOr(*watch_list, "id", std::string{}),
+                    .name = ValueOr(*watch_list, "name",
+                                    std::string{"Watch List"}),
+                };
+                if (const toml::array* rows =
+                        (*watch_list)["rows"].as_array()) {
+                    for (const toml::node& row_node : *rows) {
+                        const toml::table* row = row_node.as_table();
+                        if (row == nullptr) continue;
+                        document.rows.push_back({
+                            .id = ValueOr(*row, "id", std::string{}),
+                            .instrument_id = ValueOr(
+                                *row, "instrument_id", std::string{}),
+                            .symbol = ValueOr(
+                                *row, "symbol", std::string{}),
+                            .ticker_input = ValueOr(
+                                *row, "ticker_input", std::string{}),
+                        });
+                    }
+                }
+                state.workspace.watch_lists.push_back(std::move(document));
             }
         }
         state.workspace.charts.clear();

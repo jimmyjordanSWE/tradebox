@@ -4,8 +4,10 @@
 #include "tradebox/ui/workspace.h"
 #include "tradebox/workstation/chart_documents.h"
 #include "tradebox/workstation/profile_store.h"
+#include "tradebox/workstation/watch_list_documents.h"
 
 #include "chart_window.h"
+#include "watch_list_window.h"
 #include "account_popup.h"
 #include "application_chrome.h"
 #include "gui_support.h"
@@ -421,6 +423,7 @@ int RunApplication(const LaunchOptions& options) {
     tradebox::ui::Workspace workspace;
     workspace.SetPersistentState(&workstation_state.workspace);
     tradebox::gui::ChartWindowRenderer chart_renderer;
+    tradebox::gui::WatchListWindowRenderer watch_list_renderer;
 
     if (!profile_existed || chart_created) profile_store.MarkDirty();
 
@@ -501,8 +504,12 @@ int RunApplication(const LaunchOptions& options) {
         const auto now = std::chrono::time_point_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now());
         const std::int64_t now_ns = now.time_since_epoch().count();
-        const auto snapshot_query = chart_renderer.BuildSnapshotQuery(
+        if (application != nullptr)
+            static_cast<void>(application->DrainUiEvents());
+        auto snapshot_query = chart_renderer.BuildSnapshotQuery(
             workstation_state.workspace, now_ns);
+        watch_list_renderer.AppendSnapshotQuery(
+            workstation_state.workspace, snapshot_query);
         if (application != nullptr) {
             static_cast<void>(application->UpdateMarketDataInterest({
                 .consumer_id = "ui.visible",
@@ -557,6 +564,19 @@ int RunApplication(const LaunchOptions& options) {
             if (!created) {
                 MessageBoxA(nullptr, created.error().message.c_str(),
                             "Trade Box chart error", MB_OK | MB_ICONERROR);
+                done = true;
+            } else {
+                profile_store.MarkDirty();
+            }
+        }
+        if (chrome_actions.new_watch_list) {
+            const auto created =
+                tradebox::workstation::CreateWatchListDocument(
+                    workstation_state.workspace);
+            if (!created) {
+                MessageBoxA(nullptr, created.error().message.c_str(),
+                            "Trade Box watch list error",
+                            MB_OK | MB_ICONERROR);
                 done = true;
             } else {
                 profile_store.MarkDirty();
@@ -737,6 +757,8 @@ int RunApplication(const LaunchOptions& options) {
                                 static_cast<float>(chrome_metrics.title_bar_height))},
             true);
         chart_renderer.Draw(workspace, workstation_state.workspace, snapshot);
+        watch_list_renderer.Draw(
+            workspace, workstation_state.workspace, snapshot);
         if (application != nullptr) {
             for (const auto& retry : chart_renderer.ConsumeHistoryRetries())
                 application->RequestMarketHistory(retry);
@@ -749,6 +771,7 @@ int RunApplication(const LaunchOptions& options) {
                       static_cast<float>(chrome_metrics.title_bar_height));
 
         if (chart_renderer.ConsumePersistentChanges() ||
+            watch_list_renderer.ConsumePersistentChanges() ||
             workspace.ConsumeDirty())
             profile_store.MarkDirty();
 

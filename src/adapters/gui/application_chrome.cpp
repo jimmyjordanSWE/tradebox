@@ -50,6 +50,7 @@ void DrawSettingsPopup(
 
 struct CreationActions {
     bool new_chart = false;
+    bool new_watch_list = false;
     bool imgui_demo = false;
 };
 
@@ -61,12 +62,13 @@ CreationActions DrawCreationPopup(ImFont* regular_font, const char* id,
 
     ImGui::PushFont(regular_font, 18.0f);
     const bool new_chart = ImGui::MenuItem("Chart", "");
+    const bool new_watch_list = ImGui::MenuItem("Watch List", "");
     const bool imgui_demo = ImGui::MenuItem("ImGui Demo", "");
-    if (new_chart || imgui_demo)
+    if (new_chart || new_watch_list || imgui_demo)
         ImGui::CloseCurrentPopup();
     ImGui::PopFont();
     ImGui::EndPopup();
-    return {new_chart, imgui_demo};
+    return {new_chart, new_watch_list, imgui_demo};
 }
 
 }  // namespace
@@ -157,6 +159,7 @@ ChromeActions DrawApplicationChrome(
                  static_cast<float>(metrics.tool_width),
              account_anchor.y});
         actions.new_chart = creation_actions.new_chart;
+        actions.new_watch_list = creation_actions.new_watch_list;
         actions.imgui_demo = creation_actions.imgui_demo;
 
         ImGui::SetCursorPos({window_size.x - caption_controls_width, 0.0f});

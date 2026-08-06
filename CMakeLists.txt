@@ -143,6 +143,7 @@ tradebox_enable_strict_warnings(tradebox_platform)
 
 add_library(tradebox_workstation STATIC
   src/workstation/chart_documents.cpp
+  src/workstation/asset_preferences.cpp
   src/workstation/defaults.cpp
   src/workstation/instrument_links.cpp
   src/workstation/profile_codec.cpp
@@ -150,6 +151,7 @@ add_library(tradebox_workstation STATIC
   src/workstation/profile_store.cpp
   src/workstation/stable_id.cpp
   src/workstation/validation.cpp
+  src/workstation/watch_list_documents.cpp
 )
 target_include_directories(tradebox_workstation PUBLIC include)
 target_compile_features(tradebox_workstation PUBLIC cxx_std_23)
@@ -211,6 +213,7 @@ add_executable(tradebox_gui WIN32
   src/adapters/gui/application_chrome.cpp
   src/adapters/gui/chart_geometry.cpp
   src/adapters/gui/chart_window.cpp
+  src/adapters/gui/watch_list_window.cpp
   src/adapters/gui/gui_controls.cpp
   src/adapters/gui/gui_support.cpp
   src/adapters/gui/main.cpp
@@ -256,6 +259,7 @@ if(BUILD_TESTING)
   FetchContent_MakeAvailable(googletest)
 
   add_executable(tradebox_core_tests
+    tests/unit/asset_catalog_tests.cpp
     tests/unit/bar_store_tests.cpp
     tests/unit/decimal_tests.cpp
     tests/unit/indicator_tests.cpp
