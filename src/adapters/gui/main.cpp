@@ -199,20 +199,35 @@ HWND NativeWindowHandle(SDL_Window* window) {
 }
 
 bool ResizeRenderer(Dx11Renderer& renderer, int width, int height) {
-    if (width <= 0 || height <= 0) return true;
+    // SDL can report a zero-sized drawable while a borderless window is being
+    // minimized or resized. There is no valid swap-chain surface to render to
+    // in that state; the frame loop handles it by skipping presentation.
+    if (width <= 0 || height <= 0) return false;
     if (renderer.render_target && renderer.width == width &&
         renderer.height == height)
         return true;
 
+    // ResizeBuffers requires every reference to the current back buffers to
+    // be released. ImGui restores most of the pipeline state after drawing,
+    // but clearing the context here also releases any retained views before
+    // DXGI is asked to replace the buffers.
     renderer.context->OMSetRenderTargets(0, nullptr, nullptr);
+    renderer.context->ClearState();
+    renderer.context->Flush();
     renderer.render_target.Reset();
     if (FAILED(renderer.swap_chain->ResizeBuffers(
             0, static_cast<UINT>(width), static_cast<UINT>(height),
-            DXGI_FORMAT_UNKNOWN, 0)))
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)))
         return false;
+    if (!CreateRenderTarget(renderer)) {
+        renderer.width = 0;
+        renderer.height = 0;
+        return false;
+    }
     renderer.width = width;
     renderer.height = height;
-    return CreateRenderTarget(renderer);
+    return true;
 }
 
 bool CreateRenderer(SDL_Window* window, Dx11Renderer& renderer) {
@@ -644,6 +659,11 @@ int RunApplication(const LaunchOptions& options) {
             static_cast<Uint64>(options.run_for_ms))
             done = true;
 
+        if ((SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) != 0) {
+            SDL_Delay(10);
+            continue;
+        }
+
         if (renderer.frame_latency_waitable != nullptr)
             static_cast<void>(WaitForSingleObject(
                 renderer.frame_latency_waitable, 1000));
@@ -1009,8 +1029,11 @@ int RunApplication(const LaunchOptions& options) {
         int width = 0;
         int height = 0;
         SDL_GetWindowSizeInPixels(window, &width, &height);
+        if (width <= 0 || height <= 0) continue;
         if (!ResizeRenderer(renderer, width, height)) {
-            done = true;
+            // A resize can temporarily fail while Windows is changing the
+            // client area. The next frame retries against the current size
+            // instead of treating the condition as a close request.
             continue;
         }
         const float clear_color[4] = {0.035f, 0.043f, 0.060f, 1.0f};
@@ -1021,8 +1044,13 @@ int RunApplication(const LaunchOptions& options) {
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         renderer.vsync_requested =
             workstation_state.application.vsync_requested;
-        renderer.swap_chain->Present(
+        const HRESULT present_result = renderer.swap_chain->Present(
             renderer.vsync_requested ? 1 : 0, 0);
+        if (FAILED(present_result)) {
+            // Do not turn a transient presentation failure during a resize
+            // into an application-close request; retry on the next frame.
+            continue;
+        }
     }
 
     // Ensure background startup futures have completed before their owned
