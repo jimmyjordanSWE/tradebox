@@ -213,6 +213,7 @@ add_executable(tradebox_gui WIN32
   src/adapters/gui/application_chrome.cpp
   src/adapters/gui/chart_geometry.cpp
   src/adapters/gui/chart_window.cpp
+  src/adapters/gui/debug_window.cpp
   src/adapters/gui/watch_list_window.cpp
   src/adapters/gui/gui_controls.cpp
   src/adapters/gui/gui_support.cpp

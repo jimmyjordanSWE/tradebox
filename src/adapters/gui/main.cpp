@@ -7,6 +7,7 @@
 #include "tradebox/workstation/watch_list_documents.h"
 
 #include "chart_window.h"
+#include "debug_window.h"
 #include "watch_list_window.h"
 #include "account_popup.h"
 #include "application_chrome.h"
@@ -24,6 +25,8 @@
 #include <array>
 #include <cmath>
 #include <chrono>
+#include <cstdint>
+#include <cwchar>
 #include <cstdlib>
 #include <filesystem>
 #include <future>
@@ -45,6 +48,8 @@ using tradebox::gui::ChromeActions;
 using tradebox::gui::ChromeMetrics;
 using tradebox::gui::DrawApplicationChrome;
 using tradebox::gui::DrawImGuiDemo;
+using tradebox::gui::DebugSnapshot;
+using tradebox::gui::DebugWindowRenderer;
 using tradebox::gui::GuiFonts;
 using tradebox::gui::ConfigureImGuiStyle;
 
@@ -64,6 +69,12 @@ struct Dx11Renderer {
     ComPtr<IDXGISwapChain> swap_chain;
     ComPtr<ID3D11RenderTargetView> render_target;
     HANDLE frame_latency_waitable = nullptr;
+    D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_0;
+    std::string adapter_name;
+    std::uint32_t adapter_vendor_id = 0;
+    std::uint32_t adapter_device_id = 0;
+    std::uint64_t dedicated_video_memory = 0;
+    std::uint64_t shared_system_memory = 0;
     bool vsync_requested = true;
     int width = 0;
     int height = 0;
@@ -91,6 +102,34 @@ struct MarketTimeZone {
     DYNAMIC_TIME_ZONE_INFORMATION value{};
     bool available = false;
 };
+
+std::string WideToUtf8(const wchar_t* value) {
+    if (value == nullptr || *value == L'\0') return {};
+    const int length = static_cast<int>(std::wcslen(value));
+    const int size = WideCharToMultiByte(
+        CP_UTF8, 0, value, length, nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return {};
+    std::string result(static_cast<std::size_t>(size), '\0');
+    static_cast<void>(WideCharToMultiByte(
+        CP_UTF8, 0, value, length, result.data(), size, nullptr, nullptr));
+    return result;
+}
+
+std::string FeatureLevelName(D3D_FEATURE_LEVEL level) {
+    switch (level) {
+    case D3D_FEATURE_LEVEL_9_1: return "9.1";
+    case D3D_FEATURE_LEVEL_9_2: return "9.2";
+    case D3D_FEATURE_LEVEL_9_3: return "9.3";
+    case D3D_FEATURE_LEVEL_10_0: return "10.0";
+    case D3D_FEATURE_LEVEL_10_1: return "10.1";
+    case D3D_FEATURE_LEVEL_11_0: return "11.0";
+    case D3D_FEATURE_LEVEL_11_1: return "11.1";
+    case D3D_FEATURE_LEVEL_12_0: return "12.0";
+    case D3D_FEATURE_LEVEL_12_1: return "12.1";
+    case D3D_FEATURE_LEVEL_12_2: return "12.2";
+    default: return "Unknown";
+    }
+}
 
 
 DatabaseStartupResult OpenDatabaseInBackground() {
@@ -195,6 +234,17 @@ bool CreateRenderer(SDL_Window* window, Dx11Renderer& renderer) {
         FAILED(dxgi_device->GetAdapter(adapter.GetAddressOf())) ||
         FAILED(adapter->GetParent(IID_PPV_ARGS(factory.GetAddressOf()))))
         return false;
+    renderer.feature_level = feature_level;
+    DXGI_ADAPTER_DESC adapter_description{};
+    if (SUCCEEDED(adapter->GetDesc(&adapter_description))) {
+        renderer.adapter_name = WideToUtf8(adapter_description.Description);
+        renderer.adapter_vendor_id = adapter_description.VendorId;
+        renderer.adapter_device_id = adapter_description.DeviceId;
+        renderer.dedicated_video_memory =
+            adapter_description.DedicatedVideoMemory;
+        renderer.shared_system_memory =
+            adapter_description.SharedSystemMemory;
+    }
 
     DXGI_SWAP_CHAIN_DESC description{};
     description.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -220,6 +270,64 @@ bool CreateRenderer(SDL_Window* window, Dx11Renderer& renderer) {
 
     SDL_GetWindowSizeInPixels(window, &renderer.width, &renderer.height);
     return CreateRenderTarget(renderer);
+}
+
+DebugSnapshot BuildDebugSnapshot(
+    const Dx11Renderer& renderer, SDL_Window* window,
+    const tradebox::workstation::ApplicationSettings& settings,
+    double frames_per_second, double frame_time_ms) {
+    DebugSnapshot snapshot;
+    snapshot.frames_per_second = frames_per_second;
+    snapshot.frame_time_ms = frame_time_ms;
+    snapshot.vsync_requested = settings.vsync_requested;
+    snapshot.frame_latency_waitable =
+        renderer.frame_latency_waitable != nullptr;
+    snapshot.maximum_frame_rate = settings.maximum_frame_rate;
+    SDL_GetWindowSizeInPixels(
+        window, &snapshot.window_width, &snapshot.window_height);
+    const SDL_DisplayID display = SDL_GetDisplayForWindow(window);
+    if (display != 0) {
+        if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display);
+            mode != nullptr) {
+            snapshot.display_width = mode->w;
+            snapshot.display_height = mode->h;
+            snapshot.display_refresh_rate = mode->refresh_rate;
+        }
+    }
+    snapshot.adapter_name = renderer.adapter_name;
+    snapshot.adapter_vendor_id = renderer.adapter_vendor_id;
+    snapshot.adapter_device_id = renderer.adapter_device_id;
+    snapshot.dedicated_video_memory = renderer.dedicated_video_memory;
+    snapshot.shared_system_memory = renderer.shared_system_memory;
+    snapshot.feature_level = FeatureLevelName(renderer.feature_level);
+    const int sdl_version = SDL_GetVersion();
+    snapshot.sdl_version =
+        std::to_string(SDL_VERSIONNUM_MAJOR(sdl_version)) + "." +
+        std::to_string(SDL_VERSIONNUM_MINOR(sdl_version)) + "." +
+        std::to_string(SDL_VERSIONNUM_MICRO(sdl_version));
+    snapshot.platform = SDL_GetPlatform();
+    snapshot.logical_cpu_cores = SDL_GetNumLogicalCPUCores();
+    snapshot.system_memory_mb = SDL_GetSystemRAM();
+#if defined(_MSC_VER)
+    snapshot.compiler = "MSVC " + std::to_string(_MSC_VER);
+#else
+    snapshot.compiler = "Unknown compiler";
+#endif
+#if defined(_MSVC_STL_VERSION)
+    snapshot.stl = "MSVC STL " + std::to_string(_MSVC_STL_VERSION);
+#else
+    snapshot.stl = "Unknown STL";
+#endif
+#if defined(_MSVC_LANG)
+    snapshot.cxx_standard =
+        "__cplusplus=" + std::to_string(__cplusplus) +
+        ", _MSVC_LANG=" + std::to_string(_MSVC_LANG);
+#else
+    snapshot.cxx_standard = "__cplusplus=" + std::to_string(__cplusplus);
+#endif
+    snapshot.steady_clock =
+        std::chrono::steady_clock::is_steady ? "steady" : "not steady";
+    return snapshot;
 }
 
 std::filesystem::path AssetPath(std::string_view relative_path) {
@@ -486,6 +594,7 @@ int RunApplication(const LaunchOptions& options) {
     tradebox::ui::Workspace workspace;
     workspace.SetPersistentState(&workstation_state.workspace);
     tradebox::gui::ChartWindowRenderer chart_renderer;
+    DebugWindowRenderer debug_renderer;
     tradebox::gui::WatchListWindowRenderer watch_list_renderer;
 
     if (!profile_existed || chart_created) profile_store.MarkDirty();
@@ -506,7 +615,23 @@ int RunApplication(const LaunchOptions& options) {
     bool show_imgui_demo = false;
     const MarketTimeZone market_time_zone = LoadMarketTimeZone();
     const Uint64 started_at = SDL_GetTicks();
+    auto previous_frame_start = std::chrono::steady_clock::now();
+    double measured_frames_per_second = 0.0;
+    double measured_frame_time_ms = 0.0;
     while (!done) {
+        const auto frame_start = std::chrono::steady_clock::now();
+        measured_frame_time_ms = std::chrono::duration<double, std::milli>(
+                                     frame_start - previous_frame_start)
+                                     .count();
+        if (measured_frame_time_ms > 0.0) {
+            const double instantaneous_fps = 1000.0 / measured_frame_time_ms;
+            measured_frames_per_second =
+                measured_frames_per_second == 0.0
+                    ? instantaneous_fps
+                    : measured_frames_per_second * 0.9 +
+                          instantaneous_fps * 0.1;
+        }
+        previous_frame_start = frame_start;
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL3_ProcessEvent(&event);
@@ -666,6 +791,7 @@ int RunApplication(const LaunchOptions& options) {
                 profile_store.MarkDirty();
             }
         }
+        if (chrome_actions.new_debug) debug_renderer.Open();
         if (chrome_actions.imgui_demo) show_imgui_demo = true;
         if (chrome_actions.settings_changed) profile_store.MarkDirty();
 
@@ -843,6 +969,11 @@ int RunApplication(const LaunchOptions& options) {
         chart_renderer.Draw(workspace, workstation_state.workspace, snapshot);
         watch_list_renderer.Draw(
             workspace, workstation_state.workspace, snapshot);
+        const DebugSnapshot debug_snapshot = BuildDebugSnapshot(
+            renderer, window, workstation_state.application,
+            measured_frames_per_second, measured_frame_time_ms);
+        debug_renderer.Draw(
+            workspace, workstation_state.workspace, debug_snapshot);
         if (application != nullptr) {
             for (const auto& retry : chart_renderer.ConsumeHistoryRetries())
                 application->RequestMarketHistory(retry);

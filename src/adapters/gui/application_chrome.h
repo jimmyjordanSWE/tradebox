@@ -33,6 +33,7 @@ struct ChromeActions {
     AccountPopupAction account = AccountPopupAction::None;
     bool new_chart = false;
     bool new_watch_list = false;
+    bool new_debug = false;
     bool imgui_demo = false;
     bool settings_changed = false;
 };
