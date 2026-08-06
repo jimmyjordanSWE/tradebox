@@ -12,6 +12,7 @@
 #include "tradebox/platform/credentials.h"
 
 #include <algorithm>
+#include <chrono>
 #include <ranges>
 #include <shared_mutex>
 #include <type_traits>
@@ -26,6 +27,15 @@ void ClearSensitiveString(std::string& value) noexcept {
         bytes[index] = '\0';
     value.clear();
 }
+
+std::int64_t WallClockNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+constexpr std::int64_t kAssetCatalogRefreshIntervalMs =
+    24LL * 60LL * 60LL * 1000LL;
 
 class CoreValuationMarketDataSink final
     : public core::IMarketDataSink {
@@ -149,6 +159,18 @@ public:
         std::unique_lock lock(asset_catalog_mutex);
         asset_catalog = std::move(catalog);
         stored_asset_catalog = std::move(stored);
+    }
+
+    [[nodiscard]] bool AssetCatalogIsFresh(std::int64_t now_ms) const {
+        std::shared_lock lock(asset_catalog_mutex);
+        if (asset_catalog.empty()) return false;
+        const auto newest = std::ranges::max_element(
+            asset_catalog, {}, &core::TradableAsset::received_at_ms);
+        return newest != asset_catalog.end() &&
+               newest->received_at_ms > 0 &&
+               newest->received_at_ms <= now_ms &&
+               now_ms - newest->received_at_ms <
+                   kAssetCatalogRefreshIntervalMs;
     }
 
     Database& database;
@@ -484,7 +506,8 @@ TradingApplication::Connect(ConnectionRequest request) {
         std::move(credentials),
         impl_->active_market_symbols,
         request.market_data_feed);
-    impl_->broker.RequestAssetCatalog();
+    if (!impl_->AssetCatalogIsFresh(WallClockNowMs()))
+        impl_->broker.RequestAssetCatalog();
     return receipt;
 }
 

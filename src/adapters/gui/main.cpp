@@ -80,6 +80,13 @@ struct DatabaseStartupResult {
     std::string error;
 };
 
+struct ApplicationStartupResult {
+    // Destruction order matters: the application borrows the database.
+    std::unique_ptr<tradebox::application::TradingApplication> application;
+    std::unique_ptr<Database> database;
+    std::string error;
+};
+
 struct MarketTimeZone {
     DYNAMIC_TIME_ZONE_INFORMATION value{};
     bool available = false;
@@ -92,6 +99,18 @@ DatabaseStartupResult OpenDatabaseInBackground() {
     if (!database->Open(error))
         return {nullptr, std::move(error)};
     return {std::move(database), {}};
+}
+
+ApplicationStartupResult OpenApplicationInBackground(
+    std::unique_ptr<Database> database, UiEventQueue& events) {
+    try {
+        auto application =
+            std::make_unique<tradebox::application::TradingApplication>(
+                events, *database);
+        return {std::move(application), std::move(database), {}};
+    } catch (const std::exception& error) {
+        return {nullptr, std::move(database), error.what()};
+    }
 }
 
 MarketTimeZone LoadMarketTimeZone() {
@@ -325,6 +344,31 @@ std::vector<std::string> VisibleMarketSymbols(
     return result;
 }
 
+void DrawStartupOverlay(std::string_view status) {
+    if (status.empty()) return;
+    const std::string text(status);
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav;
+    ImGui::SetNextWindowPos(viewport->WorkPos, ImGuiCond_Always);
+    ImGui::SetNextWindowSize(viewport->WorkSize, ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0.0f, 0.0f});
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, {0.025f, 0.031f, 0.045f, 0.82f});
+    if (ImGui::Begin("##startup_overlay", nullptr, flags)) {
+        const ImVec2 size = ImGui::GetWindowSize();
+        const ImVec2 text_size = ImGui::CalcTextSize(text.c_str());
+        ImGui::SetCursorPos({
+            std::max(24.0f, (size.x - text_size.x) * 0.5f),
+            std::max(24.0f, (size.y - text_size.y) * 0.5f)});
+        ImGui::TextUnformatted(text.c_str());
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
+}
+
 void ClearCredentialInputs(AccountPopupState& state) {
     SecureZeroMemory(state.api_key.data(), state.api_key.size());
     state.api_key.fill('\0');
@@ -435,8 +479,10 @@ int RunApplication(const LaunchOptions& options) {
     UiEventQueue events;
     std::future<DatabaseStartupResult> database_startup = std::async(
         std::launch::async, OpenDatabaseInBackground);
+    std::future<ApplicationStartupResult> application_startup;
     std::unique_ptr<Database> database;
     std::unique_ptr<tradebox::application::TradingApplication> application;
+    std::string startup_status = "Opening local market database...";
     tradebox::ui::Workspace workspace;
     workspace.SetPersistentState(&workstation_state.workspace);
     tradebox::gui::ChartWindowRenderer chart_renderer;
@@ -477,19 +523,36 @@ int RunApplication(const LaunchOptions& options) {
             static_cast<void>(WaitForSingleObject(
                 renderer.frame_latency_waitable, 1000));
 
-        if (!application && database_startup.wait_for(
-                std::chrono::milliseconds(0)) == std::future_status::ready) {
+        if (!application && !application_startup.valid() &&
+            database_startup.wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::ready) {
             DatabaseStartupResult result = database_startup.get();
             if (!result.error.empty()) {
-                MessageBoxA(nullptr, result.error.c_str(),
-                            "Trade Box database error",
-                            MB_OK | MB_ICONERROR);
-                done = true;
+                startup_status = "Database startup failed: " + result.error;
+            } else {
+                startup_status =
+                    "Starting trading services and loading cached data...";
+                application_startup = std::async(
+                    std::launch::async,
+                    [&events](std::unique_ptr<Database> ready_database) {
+                        return OpenApplicationInBackground(
+                            std::move(ready_database), events);
+                    },
+                    std::move(result.database));
+            }
+        }
+
+        if (!application && application_startup.valid() &&
+            application_startup.wait_for(std::chrono::milliseconds(0)) ==
+                std::future_status::ready) {
+            ApplicationStartupResult result = application_startup.get();
+            if (!result.error.empty()) {
+                startup_status = "Trading services startup failed: " +
+                                 result.error;
             } else {
                 database = std::move(result.database);
-                application = std::make_unique<
-                    tradebox::application::TradingApplication>(
-                    events, *database);
+                application = std::move(result.application);
+                startup_status.clear();
                 SDL_SetWindowTitle(window, "Trade Box");
                 if (workstation_state.account_context.auto_connect) {
                     const tradebox::core::AccountEnvironment environment =
@@ -788,6 +851,8 @@ int RunApplication(const LaunchOptions& options) {
         }
         workspace.EndFrame();
 
+        DrawStartupOverlay(startup_status);
+
         DrawImGuiDemo(show_imgui_demo,
                       static_cast<float>(chrome_metrics.title_bar_height));
 
@@ -826,19 +891,27 @@ int RunApplication(const LaunchOptions& options) {
             renderer.vsync_requested ? 1 : 0, 0);
     }
 
-    // Ensure the background initializer has completed before its future and
-    // the database-owning objects leave scope.
-    if (!application && database_startup.valid()) {
+    // Ensure background startup futures have completed before their owned
+    // objects leave scope. The normal path never waits here because startup
+    // is already complete before the application is used.
+    if (application_startup.valid()) {
+        ApplicationStartupResult result = application_startup.get();
+        if (!result.error.empty()) {
+            MessageBoxA(nullptr, result.error.c_str(),
+                        "Trade Box startup error", MB_OK | MB_ICONERROR);
+        } else {
+            database = std::move(result.database);
+            application = std::move(result.application);
+        }
+    }
+    if (database_startup.valid()) {
         DatabaseStartupResult result = database_startup.get();
         if (!result.error.empty())
             MessageBoxA(nullptr, result.error.c_str(),
                         "Trade Box database error",
                         MB_OK | MB_ICONERROR);
-        else {
+        else
             database = std::move(result.database);
-            application = std::make_unique<
-                tradebox::application::TradingApplication>(events, *database);
-        }
     }
 
     CaptureNativeWindowState(window, workstation_state.native_window);
