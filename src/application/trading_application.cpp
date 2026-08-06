@@ -239,6 +239,13 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
         if (!identifier.empty())
             visible_market_identifiers.push_back(identifier);
     }
+    for (const UiWatchListQuery& watch_list : query.watch_lists)
+        for (const UiWatchListRowQuery& row : watch_list.rows) {
+            if (!row.instrument_id.empty())
+                visible_market_identifiers.push_back(row.instrument_id);
+            else if (!row.symbol.empty())
+                visible_market_identifiers.push_back(row.symbol);
+        }
     result.markets = impl_->market_data.SnapshotFrame(
         visible_market_identifiers);
 
@@ -318,12 +325,13 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
                                                 : row.instrument_id;
             const core::MarketDataSnapshot* live =
                 identifier.empty() ? nullptr : result.markets.Find(identifier);
+            if (live == nullptr && !row.symbol.empty())
+                live = result.markets.Find(row.symbol);
             if (live != nullptr && live->latest_price)
                 row_snapshot.current_price = live->latest_price->price;
 
             if (watch_list.needs_change_from_open &&
-                query.as_of_ns > 0 && !row.instrument_id.empty() &&
-                live != nullptr) {
+                query.as_of_ns > 0 && !row.instrument_id.empty()) {
                 auto [daily_position, inserted] = daily_series.try_emplace(
                     row.instrument_id);
                 auto& daily = daily_position->second;

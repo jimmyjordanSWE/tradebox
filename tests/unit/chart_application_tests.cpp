@@ -304,4 +304,33 @@ TEST(ChartApplicationSnapshotTest, PublishesOnlyUniqueRequestedMarkets) {
     EXPECT_EQ(snapshot.markets.Find("NVDA"), nullptr);
 }
 
+TEST(ChartApplicationSnapshotTest,
+     WatchListResolvesStableIdentityBeforeLiveEventsArrive) {
+    TemporaryDatabase temporary;
+    Database database;
+    std::string error;
+    ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+    tradebox::application::TradingApplication application(database);
+
+    const auto now = std::chrono::time_point_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now());
+    const auto snapshot = application.SnapshotForUi({
+        .as_of_ns = now.time_since_epoch().count(),
+        .watch_lists = {{
+            .document_id = "watch-list.default",
+            .rows = {{
+                .row_id = "row.aapl",
+                .instrument_id = "asset-aapl",
+                .symbol = "AAPL",
+            }},
+            .needs_change_from_open = true,
+        }},
+    });
+
+    ASSERT_NE(snapshot.markets.Find("asset-aapl"), nullptr);
+    ASSERT_EQ(snapshot.watch_lists.size(), 1U);
+    ASSERT_EQ(snapshot.watch_lists.front().rows.size(), 1U);
+    EXPECT_TRUE(snapshot.watch_lists.front().rows.front().history_missing);
+}
+
 }  // namespace
