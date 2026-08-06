@@ -143,6 +143,11 @@ public:
     CoreValuationMarketDataSink valuation_market_data;
     core::BarStore bars;
     HistoryRequestTracker history_requests;
+    mutable IndicatorProjectionCache indicator_projections;
+    MarketDataInterestCoordinator market_interests;
+    core::MarketDataFeed active_market_feed =
+        core::MarketDataFeed::Iex;
+    std::vector<std::string> active_market_symbols;
     AlpacaService broker;
     OrderExecutionService order_execution;
 };
@@ -169,9 +174,19 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
     const UiSnapshotQuery& query) const {
     ApplicationUiSnapshot result;
     result.core = Snapshot();
-    result.markets.reserve(query.market_symbols.size());
-    for (const std::string& symbol : query.market_symbols)
-        result.markets.push_back(MarketData(symbol));
+    std::vector<std::string> visible_market_identifiers =
+        query.market_symbols;
+    visible_market_identifiers.reserve(
+        visible_market_identifiers.size() + query.charts.size());
+    for (const UiChartQuery& chart : query.charts) {
+        const std::string& identifier = chart.key.instrument_id.empty()
+                                            ? chart.symbol
+                                            : chart.key.instrument_id;
+        if (!identifier.empty())
+            visible_market_identifiers.push_back(identifier);
+    }
+    result.markets = impl_->market_data.SnapshotFrame(
+        visible_market_identifiers);
 
     result.charts.reserve(query.charts.size());
     for (const UiChartQuery& chart : query.charts) {
@@ -190,7 +205,15 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
             continue;
         }
 
-        projected.series = Bars(chart.key, chart.range);
+        const std::string& identifier = chart.key.instrument_id.empty()
+                                            ? chart.symbol
+                                            : chart.key.instrument_id;
+        const core::MarketDataSnapshot* live =
+            result.markets.Find(identifier);
+        projected.series = live == nullptr
+                               ? core::BarSeriesSnapshot{}
+                               : BarsFromMarketSnapshot(
+                                     chart.key, chart.range, live);
         const auto request = impl_->history_requests.StatusFor(
             chart.key, chart.range);
         if (request && request->state ==
@@ -220,27 +243,9 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
             projected.status = ChartDataStatus::Ready;
         }
 
-        std::vector<core::MarketBar> indicator_bars =
-            projected.series.bars;
-        if (projected.series.current_bar) {
-            const auto position = std::ranges::lower_bound(
-                indicator_bars, projected.series.current_bar->start_ns,
-                {}, &core::MarketBar::start_ns);
-            if (position != indicator_bars.end() &&
-                position->start_ns ==
-                    projected.series.current_bar->start_ns)
-                *position = *projected.series.current_bar;
-            else
-                indicator_bars.insert(
-                    position, *projected.series.current_bar);
-        }
-        auto indicators = core::EvaluateIndicators(
-            chart.indicators, indicator_bars);
-        if (indicators)
-            projected.indicators = std::move(*indicators);
-        else
-            projected.indicator_errors.push_back(
-                indicators.error().message);
+        projected.indicator_projection =
+            impl_->indicator_projections.Resolve(
+                projected.series, chart.indicators);
         result.charts.push_back(std::move(projected));
     }
     if (query.asset_limit != 0) {
@@ -284,6 +289,12 @@ core::ChangedInstruments TradingApplication::ChangedMarketInstruments(
 core::BarSeriesSnapshot TradingApplication::Bars(
     const core::BarSeriesKey& key,
     core::BarRange range) const {
+    return BarsFromMarketSnapshot(key, range, nullptr);
+}
+
+core::BarSeriesSnapshot TradingApplication::BarsFromMarketSnapshot(
+    const core::BarSeriesKey& key, core::BarRange range,
+    const core::MarketDataSnapshot* published_live) const {
     core::BarSeriesSnapshot snapshot =
         impl_->bars.Bars(key, range);
     if (!snapshot.missing_ranges.empty()) {
@@ -308,11 +319,16 @@ core::BarSeriesSnapshot TradingApplication::Bars(
         snapshot = impl_->bars.Bars(key, range);
     }
 
-    const std::string identifier =
-        key.instrument_id.empty() ? snapshot.symbol
-                                  : key.instrument_id;
-    const core::MarketDataSnapshot live =
-        impl_->market_data.Snapshot(identifier);
+    core::MarketDataSnapshot owned_live;
+    if (published_live == nullptr) {
+        const std::string identifier = key.instrument_id.empty()
+                                           ? snapshot.symbol
+                                           : key.instrument_id;
+        owned_live = impl_->market_data.Snapshot(identifier);
+        published_live = &owned_live;
+    }
+    const core::MarketDataSnapshot& live = *published_live;
+
     std::vector<core::MarketBar> base_minutes;
     const auto duration =
         core::FixedBarDurationNs(key.timeframe);
@@ -417,9 +433,19 @@ TradingApplication::Connect(ConnectionRequest request) {
         request.environment == core::AccountEnvironment::Paper);
     ClearSensitiveString(request.api_key);
     ClearSensitiveString(request.api_secret);
-    impl_->broker.Connect(std::move(credentials),
-                          request.market_symbols,
-                          request.market_data_feed);
+    impl_->active_market_feed = request.market_data_feed;
+    const auto bootstrap = impl_->market_interests.Upsert({
+        .consumer_id = "connection.bootstrap",
+        .feed = request.market_data_feed,
+        .symbols = request.market_symbols,
+        .priority = MarketDataInterestPriority::UserVisible,
+    });
+    impl_->active_market_symbols =
+        bootstrap ? bootstrap->Symbols() : std::vector<std::string>{};
+    impl_->broker.Connect(
+        std::move(credentials),
+        impl_->active_market_symbols,
+        request.market_data_feed);
     impl_->broker.RequestAssetCatalog();
     return receipt;
 }
@@ -551,7 +577,45 @@ TradingApplication::MarketDataHealth() const {
 
 void TradingApplication::RefreshMarketSymbols(
     const std::vector<std::string>& symbols) {
-    impl_->broker.RefreshSymbols(symbols);
+    static_cast<void>(UpdateMarketDataInterest({
+        .consumer_id = "legacy.market-symbols",
+        .feed = impl_->active_market_feed,
+        .symbols = symbols,
+        .priority = MarketDataInterestPriority::UserVisible,
+    }));
+}
+
+std::expected<MarketDataSubscriptionPlan, std::string>
+TradingApplication::UpdateMarketDataInterest(
+    MarketDataInterest interest) {
+    auto updated = impl_->market_interests.Upsert(std::move(interest));
+    if (!updated) return updated;
+    std::vector<std::string> planned =
+        impl_->market_interests.Plan(
+            impl_->active_market_feed).Symbols();
+    if (planned != impl_->active_market_symbols) {
+        impl_->active_market_symbols = planned;
+        impl_->broker.RefreshSymbols(impl_->active_market_symbols);
+    }
+    return updated;
+}
+
+bool TradingApplication::RemoveMarketDataInterest(
+    std::string_view consumer_id) {
+    if (!impl_->market_interests.Remove(consumer_id)) return false;
+    std::vector<std::string> planned =
+        impl_->market_interests.Plan(
+            impl_->active_market_feed).Symbols();
+    if (planned != impl_->active_market_symbols) {
+        impl_->active_market_symbols = planned;
+        impl_->broker.RefreshSymbols(impl_->active_market_symbols);
+    }
+    return true;
+}
+
+MarketDataSubscriptionPlan TradingApplication::MarketDataSubscriptions(
+    core::MarketDataFeed feed) const {
+    return impl_->market_interests.Plan(feed);
 }
 
 void TradingApplication::RequestMarketHistory(

@@ -293,17 +293,16 @@ bool CaptureNativeWindowState(
     return changed;
 }
 
-std::vector<std::string> ConnectionSymbols(
-    const tradebox::workstation::WorkspaceState& workspace) {
-    std::vector<std::string> result;
-    const auto add = [&result](const std::string& symbol) {
-        if (symbol.empty() ||
-            std::ranges::find(result, symbol) != result.end())
-            return;
-        result.push_back(symbol);
-    };
-    for (const std::string& symbol : workspace.watchlist) add(symbol);
-    for (const auto& chart : workspace.charts) add(chart.symbol);
+std::vector<std::string> VisibleMarketSymbols(
+    const tradebox::application::UiSnapshotQuery& query) {
+    std::vector<std::string> result = query.market_symbols;
+    for (const auto& chart : query.charts)
+        if (!chart.symbol.empty()) result.push_back(chart.symbol);
+    std::ranges::sort(result);
+    const auto unique = std::ranges::unique(result);
+    result.erase(unique.begin(), unique.end());
+    std::erase_if(result,
+                  [](const std::string& symbol) { return symbol.empty(); });
     return result;
 }
 
@@ -479,8 +478,6 @@ int RunApplication(const LaunchOptions& options) {
                         tradebox::application::ConnectionRequest request;
                         request.environment = environment;
                         request.credential_slot = slot;
-                        request.market_symbols =
-                            ConnectionSymbols(workstation_state.workspace);
                         request.market_data_feed =
                             tradebox::core::MarketDataFeed::Iex;
                         const auto receipt =
@@ -506,6 +503,15 @@ int RunApplication(const LaunchOptions& options) {
         const std::int64_t now_ns = now.time_since_epoch().count();
         const auto snapshot_query = chart_renderer.BuildSnapshotQuery(
             workstation_state.workspace, now_ns);
+        if (application != nullptr) {
+            static_cast<void>(application->UpdateMarketDataInterest({
+                .consumer_id = "ui.visible",
+                .feed = tradebox::core::MarketDataFeed::Iex,
+                .symbols = VisibleMarketSymbols(snapshot_query),
+                .priority = tradebox::application::
+                    MarketDataInterestPriority::UserVisible,
+            }));
+        }
         const tradebox::application::ApplicationUiSnapshot snapshot =
             application != nullptr
                 ? application->SnapshotForUi(snapshot_query)
@@ -672,8 +678,6 @@ int RunApplication(const LaunchOptions& options) {
                 request.environment =
                     target_environment;
                 request.credential_slot = target_credential_slot;
-                request.market_symbols =
-                    ConnectionSymbols(workstation_state.workspace);
                 request.market_data_feed =
                     tradebox::core::MarketDataFeed::Iex;
                 const auto receipt = application->Connect(std::move(request));

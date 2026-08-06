@@ -1,4 +1,5 @@
 #include "tradebox/workstation/validation.h"
+#include "tradebox/workstation/instrument_links.h"
 
 #include <algorithm>
 #include <cmath>
@@ -71,6 +72,28 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
         std::clamp(state.application.maximum_frame_rate, 0, 10000);
     NormalizeBounds(state.native_window.bounds, 640.0f, 480.0f);
 
+    std::set<std::string, std::less<>> link_group_ids;
+    std::set<InstrumentLinkColor> link_group_colors;
+    for (InstrumentLinkGroupState& group :
+         state.workspace.instrument_link_groups) {
+        const auto color_index = static_cast<std::size_t>(group.color);
+        if (color_index >= kInstrumentLinkGroupCount || group.id.empty() ||
+            group.id != InstrumentLinkGroupId(group.color) ||
+            !link_group_ids.insert(group.id).second ||
+            !link_group_colors.insert(group.color).second) {
+            error = "Instrument link groups contain invalid or duplicate identity";
+            return false;
+        }
+        if (group.name.empty())
+            group.name = std::string(InstrumentLinkColorName(group.color));
+        if (group.selected_instrument &&
+            (group.selected_instrument->instrument_id.empty() ||
+             group.selected_instrument->symbol.empty())) {
+            error = "Instrument link selection requires stable identity and symbol";
+            return false;
+        }
+    }
+
     std::set<std::string, std::less<>> watchlist;
     std::vector<std::string> unique_watchlist;
     for (const std::string& symbol : state.workspace.watchlist) {
@@ -82,8 +105,13 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
         state.workspace.selected_symbol = state.workspace.watchlist.front();
 
     for (auto& [id, window] : state.workspace.windows) {
-        if (id.empty() || window.id != id) {
+        if (id.empty() || window.id != id || window.kind.empty()) {
             error = "Window profile contains an invalid stable ID";
+            return false;
+        }
+        if (!window.instrument_link_group_id.empty() &&
+            !link_group_ids.contains(window.instrument_link_group_id)) {
+            error = "Window profile references an unknown instrument link group";
             return false;
         }
         NormalizeBounds(window.bounds, 160.0f, 100.0f);

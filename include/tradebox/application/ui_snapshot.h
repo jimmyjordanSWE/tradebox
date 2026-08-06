@@ -5,7 +5,9 @@
 #include "tradebox/core/indicator.h"
 #include "tradebox/core/market_data.h"
 #include "tradebox/core/types.h"
+#include "tradebox/application/indicator_projection_cache.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -49,15 +51,15 @@ struct UiChartSnapshot {
     std::string message;
     bool retryable = false;
     core::BarSeriesSnapshot series;
-    std::vector<core::IndicatorSeries> indicators;
-    std::vector<std::string> indicator_errors;
+    std::shared_ptr<const IndicatorProjectionSnapshot>
+        indicator_projection;
 };
 
 // A complete read model for one render pass. It contains no renderer types and
 // can therefore be assembled and tested independently of the renderer.
 struct ApplicationUiSnapshot {
     core::CoreSnapshot core;
-    std::vector<core::MarketDataSnapshot> markets;
+    core::MarketDataFrame markets;
     std::vector<UiChartSnapshot> charts;
     std::vector<core::TradableAsset> assets;
 };

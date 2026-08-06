@@ -79,6 +79,9 @@ application::UiSnapshotQuery ChartWindowRenderer::BuildSnapshotQuery(
     queries_.clear();
     persistent_changed_ = false;
     for (ChartDocumentState& chart : state.charts) {
+        const auto window = state.windows.find(chart.id);
+        if (window == state.windows.end() || !window->second.open)
+            continue;
         static_cast<void>(Interaction(chart));
         const auto& interaction = interactions_.at(chart.id);
         if (query.asset_search.empty() && interaction.ticker[0] != '\0')

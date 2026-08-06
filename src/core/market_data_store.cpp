@@ -134,15 +134,43 @@ void MarketDataStore::IngestBatch(
 MarketDataSnapshot MarketDataStore::Snapshot(
     const std::string& symbol) const {
     std::scoped_lock lock(mutex_);
+    return SnapshotLocked(symbol);
+}
+
+MarketDataFrame MarketDataStore::SnapshotFrame(
+    std::span<const std::string> identifiers) const {
+    std::scoped_lock lock(mutex_);
+    MarketDataFrame result{
+        .publication_revision = next_change_sequence_ - 1,
+    };
+    result.instruments.reserve(identifiers.size());
+    std::unordered_set<std::string> published;
+    for (const std::string& identifier : identifiers) {
+        if (identifier.empty()) continue;
+        MarketDataSnapshot snapshot = SnapshotLocked(identifier);
+        const std::string& key = snapshot.instrument_id.empty()
+                                     ? snapshot.symbol
+                                     : snapshot.instrument_id;
+        if (!published.insert(key).second) continue;
+        result.instruments.push_back(
+            std::make_shared<const MarketDataSnapshot>(
+                std::move(snapshot)));
+    }
+    return result;
+}
+
+MarketDataSnapshot MarketDataStore::SnapshotLocked(
+    std::string_view symbol) const {
+    const std::string identifier(symbol);
     MarketDataSnapshot result{
-        .symbol = symbol,
+        .symbol = identifier,
         .feed = feed_,
         .stream_status = stream_status_,
-        .trades_subscribed = trade_subscriptions_.contains(symbol),
-        .quotes_subscribed = quote_subscriptions_.contains(symbol),
+        .trades_subscribed = trade_subscriptions_.contains(identifier),
+        .quotes_subscribed = quote_subscriptions_.contains(identifier),
         .statuses_subscribed =
             status_subscriptions_.contains("*") ||
-            status_subscriptions_.contains(symbol),
+            status_subscriptions_.contains(identifier),
         .status_message = status_message_,
     };
     const SymbolState* state = FindState(symbol);

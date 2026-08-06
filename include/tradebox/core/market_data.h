@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -177,6 +178,25 @@ struct MarketDataSnapshot {
     std::int64_t last_received_at_ms = 0;
     std::string status_message;
     std::optional<TradePressureSnapshot> trade_pressure;
+};
+
+// One coherent, immutable publication captured from the authoritative market
+// store. Repeated consumers retain shared handles instead of copying market
+// state, and every instrument in the frame is observed under one store lock.
+struct MarketDataFrame {
+    std::uint64_t publication_revision = 0;
+    std::vector<std::shared_ptr<const MarketDataSnapshot>> instruments;
+
+    [[nodiscard]] const MarketDataSnapshot* Find(
+        std::string_view identifier) const {
+        for (const auto& snapshot : instruments) {
+            if (snapshot &&
+                (snapshot->instrument_id == identifier ||
+                 snapshot->symbol == identifier))
+                return snapshot.get();
+        }
+        return nullptr;
+    }
 };
 
 struct SequencedMarketDataEvent {

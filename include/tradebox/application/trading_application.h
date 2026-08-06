@@ -7,6 +7,7 @@
 #include "tradebox/core/types.h"
 #include "tradebox/core/rest_health.h"
 #include "tradebox/application/ui_snapshot.h"
+#include "tradebox/application/market_data_interest.h"
 
 #include <expected>
 #include <future>
@@ -96,6 +97,12 @@ public:
     MarketDataHealth() const;
 
     void RefreshMarketSymbols(const std::vector<std::string>& symbols);
+    [[nodiscard]] std::expected<MarketDataSubscriptionPlan, std::string>
+    UpdateMarketDataInterest(MarketDataInterest interest);
+    [[nodiscard]] bool RemoveMarketDataInterest(
+        std::string_view consumer_id);
+    [[nodiscard]] MarketDataSubscriptionPlan MarketDataSubscriptions(
+        core::MarketDataFeed feed) const;
     void RequestMarketHistory(const std::string& symbol,
                               const std::string& timeframe = "1Day");
     void RequestMarketHistory(const std::string& symbol,
@@ -108,6 +115,10 @@ public:
     void RefreshAssetCatalog();
 
 private:
+    [[nodiscard]] core::BarSeriesSnapshot BarsFromMarketSnapshot(
+        const core::BarSeriesKey& key, core::BarRange range,
+        const core::MarketDataSnapshot* live) const;
+
     class Impl;
     std::unique_ptr<Impl> impl_;
 };

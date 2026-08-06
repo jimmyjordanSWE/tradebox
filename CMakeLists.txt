@@ -144,6 +144,7 @@ tradebox_enable_strict_warnings(tradebox_platform)
 add_library(tradebox_workstation STATIC
   src/workstation/chart_documents.cpp
   src/workstation/defaults.cpp
+  src/workstation/instrument_links.cpp
   src/workstation/profile_codec.cpp
   src/workstation/profile_lock.cpp
   src/workstation/profile_store.cpp
@@ -189,6 +190,8 @@ tradebox_enable_strict_warnings(tradebox_broker_alpaca)
 add_library(tradebox_application STATIC
   src/application/chart_query.cpp
   src/application/history_request_tracker.cpp
+  src/application/indicator_projection_cache.cpp
+  src/application/market_data_interest.cpp
   src/application/order_execution_service.cpp
   src/application/trading_application.cpp
 )
@@ -283,6 +286,7 @@ if(BUILD_TESTING)
     tests/unit/alpaca_stream_supervision_tests.cpp
     tests/unit/credential_store_tests.cpp
     tests/unit/database_order_command_journal_tests.cpp
+    tests/unit/market_data_interest_tests.cpp
     tests/unit/order_execution_service_tests.cpp
   )
   target_compile_features(tradebox_order_pipeline_tests PRIVATE cxx_std_23)

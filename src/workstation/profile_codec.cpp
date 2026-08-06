@@ -1,5 +1,6 @@
 #include "tradebox/workstation/profile_codec.h"
 
+#include "tradebox/workstation/instrument_links.h"
 #include "tradebox/workstation/validation.h"
 
 #include <toml++/toml.hpp>
@@ -87,6 +88,15 @@ core::MarketDataFeed ReadFeed(const toml::table& table,
     if (value == "iex") return core::MarketDataFeed::Iex;
     if (value == "sip") return core::MarketDataFeed::Sip;
     throw std::runtime_error("Unsupported chart market-data feed: " + value);
+}
+
+InstrumentLinkColor ReadInstrumentLinkColor(const toml::table& table) {
+    const std::string value = ValueOr(table, "color", std::string{});
+    for (std::size_t index = 0; index < kInstrumentLinkGroupCount; ++index) {
+        const auto color = static_cast<InstrumentLinkColor>(index);
+        if (value == InstrumentLinkColorName(color)) return color;
+    }
+    throw std::runtime_error("Unsupported instrument link color: " + value);
 }
 
 const char* AdjustmentName(core::BarAdjustment adjustment) {
@@ -332,6 +342,25 @@ std::string EncodeProfile(const WorkstationState& state) {
         output << "short_entry = " << (draft.short_entry ? "true" : "false") << "\n\n";
     }
 
+    for (const InstrumentLinkGroupState& group :
+         state.workspace.instrument_link_groups) {
+        output << "[[instrument_link_groups]]\n";
+        output << "id = " << Quote(group.id) << '\n';
+        output << "name = " << Quote(group.name) << '\n';
+        output << "color = "
+               << Quote(InstrumentLinkColorName(group.color)) << '\n';
+        output << "assigned = "
+               << (group.selected_instrument ? "true" : "false") << '\n';
+        output << "instrument_id = "
+               << Quote(group.selected_instrument
+                            ? group.selected_instrument->instrument_id
+                            : std::string{}) << '\n';
+        output << "symbol = "
+               << Quote(group.selected_instrument
+                            ? group.selected_instrument->symbol
+                            : std::string{}) << "\n\n";
+    }
+
     for (const auto& [id, window] : state.workspace.windows) {
         output << "[windows." << Key(id) << "]\n";
         output << "id = " << Quote(window.id) << '\n';
@@ -341,6 +370,8 @@ std::string EncodeProfile(const WorkstationState& state) {
         WriteRect(output, window.bounds);
         output << "display_id = " << Quote(window.display_id) << '\n';
         output << "selected_tab = " << Quote(window.selected_tab) << "\n\n";
+        output << "instrument_link_group_id = "
+               << Quote(window.instrument_link_group_id) << "\n\n";
         for (const auto& [table_id, table] : window.tables) {
             output << "[windows." << Key(id) << ".tables." << Key(table_id) << "]\n";
             for (const ColumnState& column : table.columns) {
@@ -434,6 +465,12 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
             state.profile.id = ValueOr(*profile, "id", std::string{});
             state.profile.name = ValueOr(*profile, "name", state.profile.name);
         }
+        const int source_schema_version = state.profile.schema_version;
+        if (source_schema_version != 1 &&
+            source_schema_version != kCurrentSchemaVersion)
+            return std::unexpected(
+                "Unsupported workstation profile schema version");
+        state.profile.schema_version = kCurrentSchemaVersion;
         if (const toml::table* application = root["application"].as_table()) {
             state.application.ui_scale = ValueOr(*application, "ui_scale", state.application.ui_scale);
             state.application.window_snap_pixels = ValueOr(*application, "window_snap_pixels", state.application.window_snap_pixels);
@@ -498,6 +535,34 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
                 state.workspace.bracket_drafts.emplace(std::string(key.str()), draft);
             }
         }
+        if (const toml::array* groups =
+                root["instrument_link_groups"].as_array()) {
+            if (groups->size() != kInstrumentLinkGroupCount)
+                return std::unexpected(
+                    "Instrument link profile must contain exactly 32 groups");
+            std::size_t index = 0;
+            for (const toml::node& node : *groups) {
+                const toml::table* group = node.as_table();
+                if (group == nullptr)
+                    return std::unexpected(
+                        "Instrument link profile contains an invalid group");
+                InstrumentLinkGroupState value{
+                    .id = ValueOr(*group, "id", std::string{}),
+                    .name = ValueOr(*group, "name", std::string{}),
+                    .color = ReadInstrumentLinkColor(*group),
+                };
+                if (ValueOr(*group, "assigned", false)) {
+                    value.selected_instrument = InstrumentSelectionState{
+                        .instrument_id = ValueOr(
+                            *group, "instrument_id", std::string{}),
+                        .symbol = ValueOr(
+                            *group, "symbol", std::string{}),
+                    };
+                }
+                state.workspace.instrument_link_groups[index++] =
+                    std::move(value);
+            }
+        }
         state.workspace.windows.clear();
         if (const toml::table* windows = root["windows"].as_table()) {
             for (const auto& [key, node] : *windows) {
@@ -512,6 +577,8 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
                 window.bounds = ReadRect(*window_table, {24, 24, 420, 280});
                 window.display_id = ValueOr(*window_table, "display_id", std::string{});
                 window.selected_tab = ValueOr(*window_table, "selected_tab", std::string{});
+                window.instrument_link_group_id = ValueOr(
+                    *window_table, "instrument_link_group_id", std::string{});
                 if (const toml::table* tables = (*window_table)["tables"].as_table()) {
                     for (const auto& [table_key, table_node] : *tables) {
                         const toml::table* table_value = table_node.as_table();

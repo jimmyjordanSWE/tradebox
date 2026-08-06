@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -26,6 +27,8 @@ public:
         std::vector<MarketDataEventPtr> events) override;
     MarketDataSnapshot Snapshot(
         const std::string& symbol) const override;
+    MarketDataFrame SnapshotFrame(
+        std::span<const std::string> identifiers) const;
     MarketDataDelta Delta(
         const std::string& symbol, std::uint64_t after_sequence,
         std::size_t maximum_events) const override;
@@ -102,6 +105,8 @@ private:
     SymbolState& StateFor(std::string_view instrument_id,
                           std::string_view symbol);
     const SymbolState* FindState(std::string_view identifier) const;
+    MarketDataSnapshot SnapshotLocked(
+        std::string_view identifier) const;
     void RecordChange(SymbolState& state);
     bool InsertTrade(SymbolState& state,
                      MarketDataEventPtr owner,

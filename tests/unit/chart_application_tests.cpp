@@ -194,9 +194,12 @@ TEST(ChartApplicationSnapshotTest, ExposesExplicitStatesAndAssetSearch) {
         },
     };
     snapshot = application.SnapshotForUi({.charts = {calculated}});
-    ASSERT_EQ(snapshot.charts.front().indicators.size(), 2U);
-    ASSERT_EQ(snapshot.charts.front().indicators.back().points.size(), 1U);
-    EXPECT_EQ(snapshot.charts.front().indicators.back().points.front().value,
+    ASSERT_TRUE(snapshot.charts.front().indicator_projection);
+    ASSERT_EQ(snapshot.charts.front().indicator_projection->series.size(), 2U);
+    ASSERT_EQ(snapshot.charts.front().indicator_projection->series.back()
+                  .points.size(), 1U);
+    EXPECT_EQ(snapshot.charts.front().indicator_projection->series.back()
+                  .points.front().value,
               *volume);
 }
 
@@ -228,6 +231,22 @@ TEST(ChartApplicationSnapshotTest, FindsStoredBarInstrumentWithoutCatalog) {
     ASSERT_EQ(snapshot.assets.size(), 1U);
     EXPECT_EQ(snapshot.assets.front().symbol, "AAPL");
     EXPECT_EQ(snapshot.assets.front().instrument_id, "asset-aapl");
+}
+
+TEST(ChartApplicationSnapshotTest, PublishesOnlyUniqueRequestedMarkets) {
+    TemporaryDatabase temporary;
+    Database database;
+    std::string error;
+    ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+    tradebox::application::TradingApplication application(database);
+
+    const auto snapshot = application.SnapshotForUi({
+        .market_symbols = {"AAPL", "AAPL", "MSFT"},
+    });
+    ASSERT_EQ(snapshot.markets.instruments.size(), 2U);
+    EXPECT_NE(snapshot.markets.Find("AAPL"), nullptr);
+    EXPECT_NE(snapshot.markets.Find("MSFT"), nullptr);
+    EXPECT_EQ(snapshot.markets.Find("NVDA"), nullptr);
 }
 
 }  // namespace

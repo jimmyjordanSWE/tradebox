@@ -1,4 +1,5 @@
 #include "tradebox/workstation/chart_documents.h"
+#include "tradebox/workstation/instrument_links.h"
 #include "tradebox/workstation/profile_codec.h"
 #include "tradebox/workstation/profile_store.h"
 #include "tradebox/workstation/validation.h"
@@ -54,6 +55,11 @@ TEST(WorkstationState, DefaultsAreValidAndStable) {
     EXPECT_TRUE(state.workspace.indicator_suites.empty());
     EXPECT_TRUE(state.workspace.chart_drawings.empty());
     EXPECT_TRUE(state.workspace.order_tickets.empty());
+    EXPECT_EQ(state.workspace.instrument_link_groups.size(), 32U);
+    EXPECT_EQ(state.workspace.instrument_link_groups.front().id,
+              "instrument-link.red");
+    EXPECT_EQ(state.workspace.instrument_link_groups.back().id,
+              "instrument-link.white");
 }
 
 TEST(WorkstationState, ProfileRoundTripPreservesSemanticState) {
@@ -69,6 +75,22 @@ TEST(WorkstationState, ProfileRoundTripPreservesSemanticState) {
                             .bounds = {40.0f, 40.0f, 900.0f, 600.0f},
                             .selected_tab = "Positions"});
     source.workspace.windows.at("tool.activity").selected_tab = "Orders";
+    ASSERT_TRUE(ApplyInstrumentLinkCommand(
+        source.workspace,
+        RenameInstrumentLinkGroup{
+            .group_id = "instrument-link.green",
+            .name = "Bullish watch list"}));
+    ASSERT_TRUE(ApplyInstrumentLinkCommand(
+        source.workspace,
+        SelectInstrumentLinkGroupInstrument{
+            .group_id = "instrument-link.green",
+            .instrument = {.instrument_id = "alpaca:1",
+                           .symbol = "NVDA"}}));
+    ASSERT_TRUE(ApplyInstrumentLinkCommand(
+        source.workspace,
+        BindWindowInstrumentLink{
+            .window_id = "tool.activity",
+            .group_id = "instrument-link.green"}));
     source.workspace.windows.at("tool.activity").tables["orders"].columns = {
         {.id = "symbol", .order = 2, .width = 180.0f, .visible = true,
          .sort_direction = "ascending"},
@@ -108,6 +130,16 @@ TEST(WorkstationState, ProfileRoundTripPreservesSemanticState) {
     EXPECT_EQ(decoded->workspace.selected_symbol, "NVDA");
     EXPECT_EQ(decoded->workspace.windows.at("tool.activity").selected_tab,
               "Orders");
+    EXPECT_EQ(decoded->workspace.windows.at("tool.activity")
+                  .instrument_link_group_id,
+              "instrument-link.green");
+    const auto* linked = LinkedInstrumentForWindow(
+        decoded->workspace, "tool.activity");
+    ASSERT_NE(linked, nullptr);
+    EXPECT_EQ(linked->instrument_id, "alpaca:1");
+    EXPECT_EQ(FindInstrumentLinkGroup(
+                  decoded->workspace, "instrument-link.green")->name,
+              "Bullish watch list");
     ASSERT_EQ(decoded->workspace.charts.size(), 1U);
     EXPECT_EQ(decoded->workspace.charts.front().timeframe, "5Min");
     ASSERT_EQ(decoded->workspace.charts.front().indicators.size(), 3U);
@@ -320,6 +352,48 @@ TEST(WorkstationState, RejectsUnsupportedProfileSchema) {
     encoded.replace(version, current.size(), "schema_version = 999");
     const auto decoded = DecodeProfile(encoded);
     EXPECT_FALSE(decoded);
+}
+
+TEST(WorkstationState, MigratesSchemaOneWithDefaultLinkGroups) {
+    const auto decoded = DecodeProfile(
+        "[profile]\n"
+        "schema_version = 1\n"
+        "id = \"legacy-profile\"\n"
+        "name = \"Legacy\"\n");
+    ASSERT_TRUE(decoded) << decoded.error();
+    EXPECT_EQ(decoded->profile.schema_version, kCurrentSchemaVersion);
+    EXPECT_EQ(decoded->workspace.instrument_link_groups.size(), 32U);
+    EXPECT_EQ(decoded->workspace.instrument_link_groups[11].id,
+              "instrument-link.blue");
+}
+
+TEST(InstrumentLinks, CommandsPreserveLocalWindowStateAndPublishOneContext) {
+    WorkstationState state = WorkstationState::Defaults();
+    state.workspace.windows.emplace(
+        "chart:1",
+        WindowInstanceState{.id = "chart:1", .kind = "chart"});
+    ASSERT_TRUE(ApplyInstrumentLinkCommand(
+        state.workspace,
+        BindWindowInstrumentLink{.window_id = "chart:1",
+                                 .group_id = "instrument-link.blue"}));
+    EXPECT_EQ(LinkedInstrumentForWindow(state.workspace, "chart:1"),
+              nullptr);
+    ASSERT_TRUE(ApplyInstrumentLinkCommand(
+        state.workspace,
+        SelectInstrumentLinkGroupInstrument{
+            .group_id = "instrument-link.blue",
+            .instrument = {.instrument_id = "asset:nvda",
+                           .symbol = "NVDA"}}));
+    const auto* selected = LinkedInstrumentForWindow(
+        state.workspace, "chart:1");
+    ASSERT_NE(selected, nullptr);
+    EXPECT_EQ(selected->symbol, "NVDA");
+    ASSERT_TRUE(ApplyInstrumentLinkCommand(
+        state.workspace,
+        ClearInstrumentLinkGroupInstrument{
+            .group_id = "instrument-link.blue"}));
+    EXPECT_EQ(LinkedInstrumentForWindow(state.workspace, "chart:1"),
+              nullptr);
 }
 
 }  // namespace

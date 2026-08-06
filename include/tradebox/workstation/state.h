@@ -3,6 +3,7 @@
 #include "tradebox/core/indicator.h"
 
 #include <cstdint>
+#include <array>
 #include <map>
 #include <optional>
 #include <string>
@@ -10,7 +11,57 @@
 
 namespace tradebox::workstation {
 
-inline constexpr int kCurrentSchemaVersion = 1;
+inline constexpr int kCurrentSchemaVersion = 2;
+inline constexpr std::size_t kInstrumentLinkGroupCount = 32;
+
+enum class InstrumentLinkColor : std::uint8_t {
+    Red,
+    Crimson,
+    Orange,
+    Amber,
+    Yellow,
+    Lime,
+    Green,
+    Emerald,
+    Teal,
+    Cyan,
+    Sky,
+    Blue,
+    Indigo,
+    Violet,
+    Purple,
+    Magenta,
+    Rose,
+    Coral,
+    Peach,
+    Gold,
+    Olive,
+    Mint,
+    Aqua,
+    Navy,
+    Lavender,
+    Plum,
+    Maroon,
+    Brown,
+    Slate,
+    Gray,
+    Black,
+    White,
+};
+
+struct InstrumentSelectionState {
+    std::string instrument_id;
+    std::string symbol;
+
+    bool operator==(const InstrumentSelectionState&) const = default;
+};
+
+struct InstrumentLinkGroupState {
+    std::string id;
+    std::string name;
+    InstrumentLinkColor color = InstrumentLinkColor::Red;
+    std::optional<InstrumentSelectionState> selected_instrument;
+};
 
 struct LogicalRect {
     float x = 0.0f;
@@ -60,6 +111,7 @@ struct WindowInstanceState {
     LogicalRect bounds{};
     std::string display_id;
     std::string selected_tab;
+    std::string instrument_link_group_id;
     std::map<std::string, PersistentTableState, std::less<>> tables;
 };
 
@@ -173,6 +225,8 @@ struct WorkspaceState {
     float quick_long_buying_power_percent = 100.0f;
     float quick_short_buying_power_percent = 80.0f;
     std::map<std::string, BracketDraftState, std::less<>> bracket_drafts;
+    std::array<InstrumentLinkGroupState, kInstrumentLinkGroupCount>
+        instrument_link_groups;
     std::map<std::string, WindowInstanceState, std::less<>> windows;
     ChartDefaultsState chart_defaults;
     std::vector<ChartDocumentState> charts;

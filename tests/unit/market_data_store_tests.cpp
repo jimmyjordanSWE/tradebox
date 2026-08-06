@@ -759,4 +759,28 @@ TEST(MarketDataStore,
     EXPECT_EQ(snapshot.trading_status->status_code, "H");
 }
 
+TEST(MarketDataStore, CapturesOneImmutableFrameAndDeduplicatesAliases) {
+    MarketDataStore store;
+    store.Ingest(TradeReceived{.trade = {
+        .instrument_id = "asset-aapl",
+        .symbol = "AAPL",
+        .trade_id = "1",
+        .price = D("201.25"),
+        .size = D("10"),
+        .conditions = {"@"},
+        .tape = "C",
+        .event_time_ns = 100,
+    }});
+    const std::vector<std::string> requested{
+        "AAPL", "asset-aapl", "AAPL"};
+    const MarketDataFrame frame = store.SnapshotFrame(requested);
+    ASSERT_EQ(frame.instruments.size(), 1U);
+    ASSERT_NE(frame.Find("AAPL"), nullptr);
+    EXPECT_EQ(frame.Find("AAPL"), frame.Find("asset-aapl"));
+    ASSERT_TRUE(frame.Find("AAPL")->latest_price);
+    EXPECT_EQ(frame.Find("AAPL")->latest_price->price.ToString(),
+              "201.25");
+    EXPECT_GT(frame.publication_revision, 0U);
+}
+
 }  // namespace
