@@ -33,4 +33,5 @@ compile_commands.json
 *.userprefs
 Thumbs.db
 desktop.ini
+imgui.ini
 

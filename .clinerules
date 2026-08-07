@@ -1,0 +1,23 @@
+# DeepSeek V4 Flash via Fireworks AI — Cline optimization
+
+## Context window
+- Keep responses concise. Prefer showing only changed/added lines, not full files.
+- Use `replace_in_file` with SEARCH/REPLACE blocks for targeted edits.
+- Use `write_to_file` only for new files or complete rewrites.
+
+## Workflow
+- Always check PLAN.md first for current progress.
+- After each change, update PLAN.md progress log.
+- Commit after each completed sub-item (e.g., "phase-1.2: bracket order UI").
+- Use `git add -A; git commit -m "..."` (PowerShell syntax, not `&&`).
+
+## Code style
+- Follow existing patterns exactly (see positions_window.cpp for table windows, trade_hotkey_window.cpp for simple windows).
+- Use `std::expected` for error returns, not exceptions.
+- Use `std::ranges` algorithms, not raw loops where possible.
+- Keep GUI renderers stateless — use `ConsumePersistentChanges()` pattern.
+- Never include adapter headers in core files (enforced by architecture tests).
+
+## When blocked
+- If a change would require a new system or bypass an existing one, stop and explain the gap.
+- Do not create parallel paths or compatibility shims.

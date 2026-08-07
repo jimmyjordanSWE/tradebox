@@ -127,3 +127,5 @@ A desktop application that connects to Alpaca, displays real-time market data on
 | 2026-08-07 | — | Architecture analysis complete | ✅ |
 | 2026-08-07 | — | 1.0 roadmap created | ✅ |
 | 2026-08-07 | — | PLAN.md created | ✅ |
+| 2026-08-07 | 1.1 | Order ticket window GUI (header, impl, CMake, main.cpp registration) | ✅ |
+| 2026-08-07 | — | Committed: phase-1.1 order ticket window | ✅ |
