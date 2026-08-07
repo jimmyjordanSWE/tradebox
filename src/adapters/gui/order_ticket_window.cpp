@@ -62,6 +62,20 @@ int SideIndex(std::string_view side) {
     return 0;
 }
 
+void CopyString(std::array<char, 96>& destination,
+                  const std::string& source) {
+    const std::size_t count =
+        std::min(source.size(), destination.size() - 1);
+    std::copy_n(source.begin(), count, destination.begin());
+    destination[count] = '\0';
+}
+
+std::string FormatPercent(float percent) {
+    // Bracket sliders edit with "%.1f" precision; mirror that here so the
+    // value carried in the order is exactly what the user saw.
+    return std::format("{:.1f}", percent);
+}
+
 void DrawOrderResult(const std::optional<core::OrderCommandResult>& result) {
     if (!result) return;
     const bool accepted = result->AcceptedByBroker();
@@ -91,7 +105,7 @@ void DrawOrderResult(const std::optional<core::OrderCommandResult>& result) {
 
 void OrderTicketWindowRenderer::Draw(
     ui::Workspace& workspace, workstation::WorkspaceState& state,
-    const application::ApplicationUiSnapshot& snapshot) {
+    [[maybe_unused]] const application::ApplicationUiSnapshot& snapshot) {
     auto [persisted, inserted] = EnsureWindow(state);
     if (inserted) persistent_changed_ = true;
     if (!persisted.open) return;
@@ -130,6 +144,14 @@ void OrderTicketWindowRenderer::Draw(
         ticket = &state.order_tickets.back();
     }
 
+    InteractionState& interaction = Interaction(*ticket);
+    if (!interaction.initialized) {
+        CopyString(interaction.amount, ticket->amount);
+        CopyString(interaction.limit_price, ticket->limit_price);
+        CopyString(interaction.stop_price, ticket->stop_price);
+        interaction.initialized = true;
+    }
+
     // Symbol display
     if (!symbol.empty()) {
         ImGui::TextUnformatted(symbol.c_str());
@@ -154,7 +176,7 @@ void OrderTicketWindowRenderer::Draw(
     }
 
     // Quantity / Notional
-    const bool is_notional = ticket->amount_is_notional;
+    bool is_notional = ticket->amount_is_notional;
     if (ImGui::Checkbox("Notional", &is_notional)) {
         ticket->amount_is_notional = is_notional;
         persistent_changed_ = true;
@@ -162,18 +184,22 @@ void OrderTicketWindowRenderer::Draw(
     ImGui::SameLine();
     ImGui::SetNextItemWidth(140.0f);
     std::string amount_label = is_notional ? "Notional $" : "Quantity";
-    if (ImGui::InputText(amount_label.c_str(), &ticket->amount,
+    if (ImGui::InputText(amount_label.c_str(), interaction.amount.data(),
+                         interaction.amount.size(),
                          ImGuiInputTextFlags_CharsDecimal |
                              ImGuiInputTextFlags_AutoSelectAll)) {
+        ticket->amount = interaction.amount.data();
         persistent_changed_ = true;
     }
 
     // Limit price (for limit, stop_limit)
     if (type == 1 || type == 3) {
         ImGui::SetNextItemWidth(140.0f);
-        if (ImGui::InputText("Limit Price", &ticket->limit_price,
+        if (ImGui::InputText("Limit Price", interaction.limit_price.data(),
+                             interaction.limit_price.size(),
                              ImGuiInputTextFlags_CharsDecimal |
                                  ImGuiInputTextFlags_AutoSelectAll)) {
+            ticket->limit_price = interaction.limit_price.data();
             persistent_changed_ = true;
         }
     }
@@ -182,9 +208,11 @@ void OrderTicketWindowRenderer::Draw(
     if (type >= 2) {
         const char* stop_label = (type == 4) ? "Trail $" : "Stop Price";
         ImGui::SetNextItemWidth(140.0f);
-        if (ImGui::InputText(stop_label, &ticket->stop_price,
+        if (ImGui::InputText(stop_label, interaction.stop_price.data(),
+                             interaction.stop_price.size(),
                              ImGuiInputTextFlags_CharsDecimal |
                                  ImGuiInputTextFlags_AutoSelectAll)) {
+            ticket->stop_price = interaction.stop_price.data();
             persistent_changed_ = true;
         }
     }
@@ -307,18 +335,21 @@ void OrderTicketWindowRenderer::Draw(
             request.time_in_force = core::TimeInForce::Fok;
         }
 
-        // Parse amount
+        // Parse amount; leave the field unset when the text is not a valid
+        // decimal so the order validator can report it.
         if (ticket->amount_is_notional) {
-            request.notional = core::Decimal::Parse(ticket->amount);
+            if (auto parsed = core::Decimal::Parse(ticket->amount); parsed)
+                request.notional = *parsed;
         } else {
-            request.qty = core::Decimal::Parse(ticket->amount);
+            if (auto parsed = core::Decimal::Parse(ticket->amount); parsed)
+                request.qty = *parsed;
         }
 
         // Parse prices
-        if (!ticket->limit_price.empty())
-            request.limit_price = core::Decimal::Parse(ticket->limit_price);
-        if (!ticket->stop_price.empty())
-            request.stop_price = core::Decimal::Parse(ticket->stop_price);
+        if (auto parsed = core::Decimal::Parse(ticket->limit_price); parsed)
+            request.limit_price = *parsed;
+        if (auto parsed = core::Decimal::Parse(ticket->stop_price); parsed)
+            request.stop_price = *parsed;
 
         // Attach bracket (take-profit / stop-loss) if enabled.
         if (bracket.target_percent > 0.0f || bracket.stop_percent > 0.0f) {
@@ -330,14 +361,14 @@ void OrderTicketWindowRenderer::Draw(
                 // (e.g. last trade). We store the percentage and let the
                 // broker adapter compute the absolute price.
                 request.take_profit = core::TakeProfit{
-                    .limit_price = core::Decimal::FromFloat(
-                        bracket.target_percent),
+                    .limit_price = *core::Decimal::Parse(
+                        FormatPercent(bracket.target_percent)),
                 };
             }
             if (bracket.stop_percent > 0.0f) {
                 request.stop_loss = core::StopLoss{
-                    .stop_price = core::Decimal::FromFloat(
-                        bracket.stop_percent),
+                    .stop_price = *core::Decimal::Parse(
+                        FormatPercent(bracket.stop_percent)),
                 };
             }
         }
@@ -430,6 +461,12 @@ bool OrderTicketWindowRenderer::ConsumePersistentChanges() {
     const bool changed = persistent_changed_;
     persistent_changed_ = false;
     return changed;
+}
+
+OrderTicketWindowRenderer::InteractionState&
+OrderTicketWindowRenderer::Interaction(
+    const workstation::OrderTicketState& ticket) {
+    return interactions_.try_emplace(ticket.id, InteractionState{}).first->second;
 }
 
 }  // namespace tradebox::gui

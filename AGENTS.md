@@ -243,6 +243,13 @@ idea or old plan outside the repository is not implementation authority.
   JSON, SQLite, or other adapter dependencies in `tradebox_core`.
 - Do not add or upgrade a dependency without explicit user approval. Dependency
   versions are pinned deliberately in `CMakeLists.txt`.
+- Build through `build.bat` from a Windows shell (`cmd //c build.bat` in
+  git-bash, `.\build.bat` in PowerShell). It locates the installed Visual Studio
+  C++ toolchain itself and loads the vcvars64 environment, so no VS developer
+  prompt or manual PATH/INCLUDE/LIB setup is needed. Do not invoke raw `cmake`
+  from a bare shell and do not reuse a stale `build/` cache after a toolchain
+  change; the script reconfigures (`--fresh`) automatically when the detected
+  compiler differs from the recorded one.
 - Keep strict compiler warnings clean. Do not suppress a warning globally or
   weaken a build/test check to make a change pass.
 - Add tests for behavior, regression fixes, serialization, and boundary rules

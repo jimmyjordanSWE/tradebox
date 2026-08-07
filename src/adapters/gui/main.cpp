@@ -1142,7 +1142,7 @@ int RunApplication(const LaunchOptions& options) {
     }
 
     // Destroy the application and database first so that all background
-    // threads (AlpacaService workers, database writer) are joined and all
+    // threads (broker service workers, database writer) are joined and all
     // pending writes are flushed before the profile lock is released.
     application.reset();
     database.reset();
