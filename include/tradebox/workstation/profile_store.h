@@ -21,6 +21,13 @@ struct ProfileDescriptor {
 
 class ProfileStore {
 public:
+    ProfileStore() = default;
+    ~ProfileStore() { Close(); }
+    ProfileStore(const ProfileStore&) = delete;
+    ProfileStore& operator=(const ProfileStore&) = delete;
+    ProfileStore(ProfileStore&&) = delete;
+    ProfileStore& operator=(ProfileStore&&) = delete;
+
     [[nodiscard]] static std::filesystem::path DefaultDirectory();
     [[nodiscard]] static std::filesystem::path DefaultProfilePath();
     [[nodiscard]] static std::vector<ProfileDescriptor> Discover(

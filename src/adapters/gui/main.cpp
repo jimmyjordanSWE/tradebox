@@ -1140,6 +1140,10 @@ int RunApplication(const LaunchOptions& options) {
         MessageBoxA(nullptr, flush_error.c_str(),
                     "Trade Box profile error", MB_OK | MB_ICONERROR);
     }
+    // Release the profile lock before shutting down graphics and window
+    // subsystems, so that a crash in those paths does not leave a stale lock
+    // file that prevents the next launch.
+    profile_store.Close();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplSDL3_Shutdown();
