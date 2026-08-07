@@ -1140,6 +1140,13 @@ int RunApplication(const LaunchOptions& options) {
         MessageBoxA(nullptr, flush_error.c_str(),
                     "Trade Box profile error", MB_OK | MB_ICONERROR);
     }
+
+    // Destroy the application and database first so that all background
+    // threads (AlpacaService workers, database writer) are joined and all
+    // pending writes are flushed before the profile lock is released.
+    application.reset();
+    database.reset();
+
     // Release the profile lock before shutting down graphics and window
     // subsystems, so that a crash in those paths does not leave a stale lock
     // file that prevents the next launch.
