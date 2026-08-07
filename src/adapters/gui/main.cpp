@@ -8,6 +8,7 @@
 
 #include "chart_window.h"
 #include "debug_window.h"
+#include "order_ticket_window.h"
 #include "positions_window.h"
 #include "watch_list_window.h"
 #include "trade_hotkey_window.h"
@@ -645,6 +646,7 @@ int RunApplication(const LaunchOptions& options) {
     DebugWindowRenderer debug_renderer;
     tradebox::gui::WatchListWindowRenderer watch_list_renderer;
     tradebox::gui::TradeHotkeyWindowRenderer trade_hotkey_renderer;
+    tradebox::gui::OrderTicketWindowRenderer order_ticket_renderer;
     tradebox::gui::PositionsWindowRenderer positions_renderer;
     tradebox::gui::OrdersWindowRenderer orders_renderer;
 
@@ -1037,6 +1039,8 @@ int RunApplication(const LaunchOptions& options) {
         watch_list_renderer.Draw(
             workspace, workstation_state.workspace, snapshot, gui_fonts.mono,
             gui_fonts.icons);
+        order_ticket_renderer.Draw(
+            workspace, workstation_state.workspace, snapshot);
         trade_hotkey_renderer.Draw(workspace, workstation_state.workspace);
         positions_renderer.Draw(
             workspace, workstation_state.workspace, snapshot);
@@ -1062,6 +1066,7 @@ int RunApplication(const LaunchOptions& options) {
 
         if (chart_renderer.ConsumePersistentChanges() ||
             watch_list_renderer.ConsumePersistentChanges() ||
+            order_ticket_renderer.ConsumePersistentChanges() ||
             trade_hotkey_renderer.ConsumePersistentChanges() ||
             positions_renderer.ConsumePersistentChanges() ||
             orders_renderer.ConsumePersistentChanges() ||

@@ -215,6 +215,7 @@ add_executable(tradebox_gui WIN32
   src/adapters/gui/chart_geometry.cpp
   src/adapters/gui/chart_window.cpp
   src/adapters/gui/debug_window.cpp
+  src/adapters/gui/order_ticket_window.cpp
   src/adapters/gui/positions_window.cpp
   src/adapters/gui/trade_hotkey_window.cpp
   src/adapters/gui/watch_list_window.cpp
