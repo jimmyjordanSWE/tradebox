@@ -323,7 +323,7 @@ TEST(ChartApplicationSnapshotTest,
                 .instrument_id = "asset-aapl",
                 .symbol = "AAPL",
             }},
-            .needs_change_from_open = true,
+            .needs_change_from_close = true,
         }},
     });
 

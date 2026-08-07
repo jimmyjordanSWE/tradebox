@@ -293,7 +293,9 @@ std::string EncodeProfile(const WorkstationState& state) {
     output << "ui_scale = " << state.application.ui_scale << '\n';
     output << "window_snap_pixels = " << state.application.window_snap_pixels << '\n';
     output << "vsync_requested = " << (state.application.vsync_requested ? "true" : "false") << '\n';
-    output << "maximum_frame_rate = " << state.application.maximum_frame_rate << "\n\n";
+    output << "maximum_frame_rate = " << state.application.maximum_frame_rate << '\n';
+    output << "account_risk_per_trade_percent = "
+           << state.application.account_risk_per_trade_percent << "\n\n";
 
     output << "[native_window]\n";
     WriteRect(output, state.native_window.bounds);
@@ -496,6 +498,9 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
             state.application.window_snap_pixels = ValueOr(*application, "window_snap_pixels", state.application.window_snap_pixels);
             state.application.vsync_requested = ValueOr(*application, "vsync_requested", state.application.vsync_requested);
             state.application.maximum_frame_rate = ValueOr(*application, "maximum_frame_rate", state.application.maximum_frame_rate);
+            state.application.account_risk_per_trade_percent = ValueOr(
+                *application, "account_risk_per_trade_percent",
+                state.application.account_risk_per_trade_percent);
         }
         if (const toml::table* native = root["native_window"].as_table()) {
             state.native_window.bounds = ReadRect(*native, state.native_window.bounds);

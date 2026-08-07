@@ -45,6 +45,16 @@ void DrawSettingsPopup(
             std::clamp(maximum_frame_rate, 30, 240);
         changed = true;
     }
+    ImGui::SeparatorText("Trade Hotkey");
+    ImGui::SetNextItemWidth(90.0f);
+    if (ImGui::InputFloat("Account risk per trade",
+                          &settings.account_risk_per_trade_percent,
+                          0.05f, 0.25f,
+                          "%.2f%%")) {
+        settings.account_risk_per_trade_percent = std::clamp(
+            settings.account_risk_per_trade_percent, 0.01f, 100.0f);
+        changed = true;
+    }
     ImGui::PopFont();
     ImGui::EndPopup();
 }
@@ -52,6 +62,8 @@ void DrawSettingsPopup(
 struct CreationActions {
     bool new_chart = false;
     bool new_watch_list = false;
+    bool new_positions = false;
+    bool new_orders = false;
     std::optional<std::string> open_watch_list_id;
     bool new_debug = false;
     bool imgui_demo = false;
@@ -67,6 +79,8 @@ CreationActions DrawCreationPopup(ImFont* regular_font, const char* id,
     ImGui::PushFont(regular_font, 18.0f);
     const bool new_chart = ImGui::MenuItem("Chart", "");
     bool new_watch_list = false;
+    bool new_positions = false;
+    bool new_orders = false;
     std::optional<std::string> open_watch_list_id;
     if (ImGui::BeginMenu("Watchlist")) {
         for (const workstation::WatchListDocumentState& watch_list :
@@ -78,15 +92,17 @@ CreationActions DrawCreationPopup(ImFont* regular_font, const char* id,
         new_watch_list = ImGui::MenuItem("Add new...");
         ImGui::EndMenu();
     }
+    new_positions = ImGui::MenuItem("Positions", "");
+    new_orders = ImGui::MenuItem("Orders", "");
     const bool new_debug = ImGui::MenuItem("Debug", "");
     const bool imgui_demo = ImGui::MenuItem("ImGui Demo", "");
     if (new_chart || new_watch_list || open_watch_list_id.has_value() ||
-        new_debug || imgui_demo)
+        new_positions || new_orders || new_debug || imgui_demo)
         ImGui::CloseCurrentPopup();
     ImGui::PopFont();
     ImGui::EndPopup();
-    return {new_chart, new_watch_list, std::move(open_watch_list_id),
-            new_debug, imgui_demo};
+    return {new_chart, new_watch_list, new_positions, new_orders,
+            std::move(open_watch_list_id), new_debug, imgui_demo};
 }
 
 }  // namespace
@@ -180,6 +196,8 @@ ChromeActions DrawApplicationChrome(
             workspace_state);
         actions.new_chart = creation_actions.new_chart;
         actions.new_watch_list = creation_actions.new_watch_list;
+        actions.new_positions = creation_actions.new_positions;
+        actions.new_orders = creation_actions.new_orders;
         actions.open_watch_list_id = creation_actions.open_watch_list_id;
         actions.new_debug = creation_actions.new_debug;
         actions.imgui_demo = creation_actions.imgui_demo;

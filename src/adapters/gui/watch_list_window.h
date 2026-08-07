@@ -24,7 +24,7 @@ public:
         const application::ApplicationUiSnapshot& snapshot);
     void Draw(ui::Workspace& workspace, workstation::WorkspaceState& state,
               const application::ApplicationUiSnapshot& snapshot,
-              ImFont* icons);
+              ImFont* mono, ImFont* icons);
     [[nodiscard]] bool ConsumePersistentChanges();
 
 private:

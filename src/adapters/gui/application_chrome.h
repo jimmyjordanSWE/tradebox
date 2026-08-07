@@ -24,6 +24,7 @@ struct ChromeMetrics {
 
 struct GuiFonts {
     ImFont* regular = nullptr;
+    ImFont* mono = nullptr;
     ImFont* title = nullptr;
     ImFont* icons = nullptr;
     std::array<ImWchar, 11> icon_ranges{
@@ -35,6 +36,8 @@ struct ChromeActions {
     AccountPopupAction account = AccountPopupAction::None;
     bool new_chart = false;
     bool new_watch_list = false;
+    bool new_positions = false;
+    bool new_orders = false;
     std::optional<std::string> open_watch_list_id;
     bool new_debug = false;
     bool imgui_demo = false;

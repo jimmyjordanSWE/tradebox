@@ -47,6 +47,35 @@ core::BarRange WatchListDailyRange(std::int64_t as_of_ns) {
     };
 }
 
+std::optional<core::Decimal> PercentageChange(
+    const core::Decimal& current, const core::Decimal& reference) {
+    if (reference.IsZero()) return std::nullopt;
+    const auto ratio = (current - reference).Divide(reference, 9);
+    const auto hundred = core::Decimal::Parse("100");
+    if (!ratio || !hundred) return std::nullopt;
+    return *ratio * *hundred;
+}
+
+void PopulateWatchListDailyReferences(
+    const core::BarSeriesSnapshot& daily,
+    UiWatchListRowSnapshot& row) {
+    const core::MarketBar* current = daily.current_bar
+                                         ? &*daily.current_bar
+                                         : daily.bars.empty()
+                                               ? nullptr
+                                               : &daily.bars.back();
+    if (current == nullptr) return;
+    row.session_open = current->open;
+    for (auto bar = daily.bars.rbegin(); bar != daily.bars.rend(); ++bar) {
+        if (bar->start_ns < current->start_ns) {
+            row.previous_close = bar->close;
+            return;
+        }
+    }
+    if (daily.previous_session_close)
+        row.previous_close = *daily.previous_session_close;
+}
+
 class CoreValuationMarketDataSink final
     : public core::IMarketDataSink {
 public:
@@ -246,6 +275,13 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
             else if (!row.symbol.empty())
                 visible_market_identifiers.push_back(row.symbol);
         }
+    if (query.include_position_markets)
+        for (const core::PositionState& position : result.core.positions) {
+            if (!position.asset_id.empty())
+                visible_market_identifiers.push_back(position.asset_id);
+            else if (!position.symbol.empty())
+                visible_market_identifiers.push_back(position.symbol);
+        }
     result.markets = impl_->market_data.SnapshotFrame(
         visible_market_identifiers);
 
@@ -315,7 +351,7 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
         UiWatchListSnapshot projected{
             .document_id = watch_list.document_id,
         };
-        if (watch_list.needs_change_from_open && query.as_of_ns > 0)
+        if (watch_list.needs_change_from_close && query.as_of_ns > 0)
             projected.daily_range = WatchListDailyRange(query.as_of_ns);
         projected.rows.reserve(watch_list.rows.size());
         for (const UiWatchListRowQuery& row : watch_list.rows) {
@@ -330,7 +366,7 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
             if (live != nullptr && live->latest_price)
                 row_snapshot.current_price = live->latest_price->price;
 
-            if (watch_list.needs_change_from_open &&
+            if (watch_list.needs_change_from_close &&
                 query.as_of_ns > 0 && !row.instrument_id.empty()) {
                 auto [daily_position, inserted] = daily_series.try_emplace(
                     row.instrument_id);
@@ -340,21 +376,25 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
                         {.instrument_id = row.instrument_id,
                          .feed = impl_->active_market_feed,
                          .timeframe = "1Day",
-                         .adjustment = core::BarAdjustment::Raw},
+                         .adjustment = core::BarAdjustment::All},
                         projected.daily_range, live);
                 }
                 row_snapshot.history_missing =
                     !daily.missing_ranges.empty();
-                if (daily.previous_session_close)
-                    row_snapshot.previous_close =
-                        *daily.previous_session_close;
-                if (daily.current_bar)
-                    row_snapshot.session_open = daily.current_bar->open;
+                PopulateWatchListDailyReferences(daily, row_snapshot);
                 if (!row_snapshot.current_price && daily.current_bar)
                     row_snapshot.current_price = daily.current_bar->close;
-                if (row_snapshot.current_price && daily.current_bar)
-                    row_snapshot.change_from_open =
-                        *row_snapshot.current_price - daily.current_bar->open;
+                if (row_snapshot.current_price && row_snapshot.previous_close) {
+                    row_snapshot.change_from_close =
+                        *row_snapshot.current_price - *row_snapshot.previous_close;
+                    row_snapshot.change_from_previous_close_percent =
+                        PercentageChange(*row_snapshot.current_price,
+                                         *row_snapshot.previous_close);
+                }
+                if (row_snapshot.current_price && row_snapshot.session_open)
+                    row_snapshot.change_from_session_open_percent =
+                        PercentageChange(*row_snapshot.current_price,
+                                         *row_snapshot.session_open);
             }
             projected.rows.push_back(std::move(row_snapshot));
         }

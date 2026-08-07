@@ -8,7 +8,10 @@
 
 #include "chart_window.h"
 #include "debug_window.h"
+#include "positions_window.h"
 #include "watch_list_window.h"
+#include "trade_hotkey_window.h"
+#include "tradebox/workstation/positions_orders_windows.h"
 #include "account_popup.h"
 #include "application_chrome.h"
 #include "gui_support.h"
@@ -391,13 +394,18 @@ bool LoadGuiFonts(GuiFonts& fonts) {
         AssetPath("fonts/B612-Regular.ttf").string().c_str(),
         kRegularFontSize,
         nullptr, io.Fonts->GetGlyphRangesDefault());
+    fonts.mono = io.Fonts->AddFontFromFileTTF(
+        AssetPath("fonts/B612Mono-Regular.ttf").string().c_str(),
+        kRegularFontSize,
+        nullptr, io.Fonts->GetGlyphRangesDefault());
     fonts.title = io.Fonts->AddFontFromFileTTF(
         AssetPath("fonts/B612-Regular.ttf").string().c_str(),
         kTitleFontSize, nullptr, io.Fonts->GetGlyphRangesDefault());
     fonts.icons = io.Fonts->AddFontFromFileTTF(
         AssetPath("fonts/MaterialSymbolsRounded.ttf").string().c_str(),
         kToolIconSize, nullptr, fonts.icon_ranges.data());
-    if (fonts.regular == nullptr || fonts.title == nullptr ||
+    if (fonts.regular == nullptr || fonts.mono == nullptr ||
+        fonts.title == nullptr ||
         fonts.icons == nullptr)
         return false;
     io.FontDefault = fonts.regular;
@@ -486,10 +494,14 @@ bool CaptureNativeWindowState(
 }
 
 std::vector<std::string> VisibleMarketSymbols(
-    const tradebox::application::UiSnapshotQuery& query) {
+    const tradebox::application::UiSnapshotQuery& query,
+    const tradebox::core::CoreSnapshot& core) {
     std::vector<std::string> result = query.market_symbols;
     for (const auto& chart : query.charts)
         if (!chart.symbol.empty()) result.push_back(chart.symbol);
+    if (query.include_position_markets)
+        for (const auto& position : core.positions)
+            result.push_back(position.symbol);
     std::ranges::sort(result);
     const auto unique = std::ranges::unique(result);
     result.erase(unique.begin(), unique.end());
@@ -632,6 +644,9 @@ int RunApplication(const LaunchOptions& options) {
     tradebox::gui::ChartWindowRenderer chart_renderer;
     DebugWindowRenderer debug_renderer;
     tradebox::gui::WatchListWindowRenderer watch_list_renderer;
+    tradebox::gui::TradeHotkeyWindowRenderer trade_hotkey_renderer;
+    tradebox::gui::PositionsWindowRenderer positions_renderer;
+    tradebox::gui::OrdersWindowRenderer orders_renderer;
 
     if (!profile_existed) profile_store.MarkDirty();
 
@@ -761,11 +776,14 @@ int RunApplication(const LaunchOptions& options) {
         snapshot_query.as_of_ns = now_ns;
         watch_list_renderer.AppendSnapshotQuery(
             workstation_state.workspace, snapshot_query);
+        positions_renderer.AppendSnapshotQuery(
+            workstation_state.workspace, snapshot_query);
         if (application != nullptr) {
+            const auto core_snapshot = application->Snapshot();
             static_cast<void>(application->UpdateMarketDataInterest({
                 .consumer_id = "ui.visible",
                 .feed = tradebox::core::MarketDataFeed::Iex,
-                .symbols = VisibleMarketSymbols(snapshot_query),
+                .symbols = VisibleMarketSymbols(snapshot_query, core_snapshot),
                 .priority = tradebox::application::
                     MarketDataInterestPriority::UserVisible,
             }));
@@ -823,6 +841,16 @@ int RunApplication(const LaunchOptions& options) {
         }
         if (chrome_actions.new_watch_list) {
             watch_list_renderer.StartNewDraft(workstation_state.workspace);
+        }
+        if (chrome_actions.new_positions) {
+            const auto created = tradebox::workstation::CreatePositionsWindow(
+                workstation_state.workspace);
+            if (created) profile_store.MarkDirty();
+        }
+        if (chrome_actions.new_orders) {
+            const auto created = tradebox::workstation::CreateOrdersWindow(
+                workstation_state.workspace);
+            if (created) profile_store.MarkDirty();
         }
         if (chrome_actions.open_watch_list_id) {
             watch_list_renderer.OpenSavedDocument(
@@ -1007,7 +1035,13 @@ int RunApplication(const LaunchOptions& options) {
             true);
         chart_renderer.Draw(workspace, workstation_state.workspace, snapshot);
         watch_list_renderer.Draw(
-            workspace, workstation_state.workspace, snapshot, gui_fonts.icons);
+            workspace, workstation_state.workspace, snapshot, gui_fonts.mono,
+            gui_fonts.icons);
+        trade_hotkey_renderer.Draw(workspace, workstation_state.workspace);
+        positions_renderer.Draw(
+            workspace, workstation_state.workspace, snapshot);
+        orders_renderer.Draw(
+            workspace, workstation_state.workspace, snapshot);
         const DebugSnapshot debug_snapshot = BuildDebugSnapshot(
             renderer, window, workstation_state.application,
             measured_frames_per_second, measured_frame_time_ms);
@@ -1028,6 +1062,9 @@ int RunApplication(const LaunchOptions& options) {
 
         if (chart_renderer.ConsumePersistentChanges() ||
             watch_list_renderer.ConsumePersistentChanges() ||
+            trade_hotkey_renderer.ConsumePersistentChanges() ||
+            positions_renderer.ConsumePersistentChanges() ||
+            orders_renderer.ConsumePersistentChanges() ||
             workspace.ConsumeDirty())
             profile_store.MarkDirty();
 

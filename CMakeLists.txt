@@ -149,6 +149,7 @@ add_library(tradebox_workstation STATIC
   src/workstation/profile_codec.cpp
   src/workstation/profile_lock.cpp
   src/workstation/profile_store.cpp
+  src/workstation/positions_orders_windows.cpp
   src/workstation/stable_id.cpp
   src/workstation/validation.cpp
   src/workstation/watch_list_documents.cpp
@@ -214,6 +215,8 @@ add_executable(tradebox_gui WIN32
   src/adapters/gui/chart_geometry.cpp
   src/adapters/gui/chart_window.cpp
   src/adapters/gui/debug_window.cpp
+  src/adapters/gui/positions_window.cpp
+  src/adapters/gui/trade_hotkey_window.cpp
   src/adapters/gui/watch_list_window.cpp
   src/adapters/gui/gui_controls.cpp
   src/adapters/gui/gui_support.cpp

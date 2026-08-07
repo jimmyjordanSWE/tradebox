@@ -73,6 +73,8 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
         std::clamp(state.application.window_snap_pixels, 1, 1000);
     state.application.maximum_frame_rate =
         std::clamp(state.application.maximum_frame_rate, 0, 10000);
+    state.application.account_risk_per_trade_percent = std::clamp(
+        state.application.account_risk_per_trade_percent, 0.01f, 100.0f);
     NormalizeBounds(state.native_window.bounds, 640.0f, 480.0f);
 
     std::set<std::string, std::less<>> link_group_ids;
@@ -282,8 +284,8 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
             error = "Bracket draft profile contains an empty symbol";
             return false;
         }
-        draft.target_percent = std::clamp(draft.target_percent, 0.01f, 100.0f);
-        draft.stop_percent = std::clamp(draft.stop_percent, 0.01f, 100.0f);
+        draft.target_percent = std::clamp(draft.target_percent, 0.25f, 5.0f);
+        draft.stop_percent = std::clamp(draft.stop_percent, 0.25f, 5.0f);
     }
     return true;
 }

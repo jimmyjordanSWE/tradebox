@@ -2,6 +2,7 @@
 #include "tradebox/workstation/instrument_links.h"
 #include "tradebox/workstation/profile_codec.h"
 #include "tradebox/workstation/profile_store.h"
+#include "tradebox/workstation/positions_orders_windows.h"
 #include "tradebox/workstation/validation.h"
 #include "tradebox/workstation/watch_list_documents.h"
 #include "tradebox/workstation/watch_list_columns.h"
@@ -65,10 +66,57 @@ TEST(WorkstationState, DefaultsAreValidAndStable) {
               "instrument-link.white");
 }
 
+TEST(PositionsAndOrdersWindows, CreateSeparatePersistentWindows) {
+    WorkstationState state = WorkstationState::Defaults();
+    ASSERT_TRUE(CreatePositionsWindow(state.workspace));
+    ASSERT_TRUE(CreateOrdersWindow(state.workspace));
+
+    const auto positions = state.workspace.windows.find(
+        std::string(kPositionsWindowId));
+    ASSERT_NE(positions, state.workspace.windows.end());
+    EXPECT_EQ(positions->second.kind, "positions");
+    EXPECT_EQ(positions->second.title, "Positions");
+    ASSERT_TRUE(positions->second.tables.contains(
+        std::string(kPositionsTableId)));
+    EXPECT_EQ(positions->second.tables.at(std::string(kPositionsTableId))
+                  .columns.size(), 7U);
+
+    const auto orders = state.workspace.windows.find(
+        std::string(kOrdersWindowId));
+    ASSERT_NE(orders, state.workspace.windows.end());
+    EXPECT_EQ(orders->second.kind, "orders");
+    EXPECT_EQ(orders->second.title, "Orders");
+    ASSERT_TRUE(orders->second.tables.contains(std::string(kOrdersTableId)));
+    EXPECT_EQ(orders->second.tables.at(std::string(kOrdersTableId))
+                  .columns.size(), 9U);
+
+    ASSERT_TRUE(AddPositionColumn(state.workspace, "day_pnl"));
+    EXPECT_TRUE(RemovePositionColumn(state.workspace, "day_pnl"));
+    EXPECT_FALSE(RemovePositionColumn(state.workspace, "symbol"));
+    ASSERT_TRUE(AddOrderColumn(state.workspace, "client_order_id"));
+    EXPECT_TRUE(RemoveOrderColumn(state.workspace, "client_order_id"));
+    EXPECT_FALSE(RemoveOrderColumn(state.workspace, "symbol"));
+    EXPECT_NE(FindPositionColumn("valuation_received_ms"), nullptr);
+    EXPECT_NE(FindOrderColumn("filled_at"), nullptr);
+    EXPECT_NE(FindOrderColumn("canceled_at"), nullptr);
+    EXPECT_NE(FindOrderColumn("failed_at"), nullptr);
+
+    const auto decoded = DecodeProfile(EncodeProfile(state));
+    ASSERT_TRUE(decoded) << decoded.error();
+    EXPECT_TRUE(decoded->workspace.windows.contains(
+        std::string(kPositionsWindowId)));
+    EXPECT_TRUE(decoded->workspace.windows.contains(
+        std::string(kOrdersWindowId)));
+}
+
 TEST(WorkstationState, ProfileRoundTripPreservesSemanticState) {
     WorkstationState source = WorkstationState::Defaults();
     source.profile.name = "Research";
+    source.application.account_risk_per_trade_percent = 1.25f;
     source.workspace.selected_symbol = "NVDA";
+    source.workspace.bracket_drafts.emplace(
+        "NVDA", BracketDraftState{.target_percent = 0.75f,
+                                   .stop_percent = 0.50f});
     RecordAssetSelection(source.workspace, "alpaca:1");
     RecordAssetSelection(source.workspace, "alpaca:2");
     RecordAssetSelection(source.workspace, "alpaca:1");
@@ -143,7 +191,10 @@ TEST(WorkstationState, ProfileRoundTripPreservesSemanticState) {
     const auto decoded = DecodeProfile(encoded);
     ASSERT_TRUE(decoded) << decoded.error();
     EXPECT_EQ(decoded->profile.name, "Research");
+    EXPECT_FLOAT_EQ(decoded->application.account_risk_per_trade_percent,
+                    1.25f);
     EXPECT_EQ(decoded->workspace.selected_symbol, "NVDA");
+    ASSERT_TRUE(decoded->workspace.bracket_drafts.contains("NVDA"));
     ASSERT_EQ(decoded->workspace.asset_selection_history.size(), 2U);
     EXPECT_EQ(decoded->workspace.asset_selection_history[0], "alpaca:1");
     EXPECT_EQ(decoded->workspace.asset_selection_history[1], "alpaca:2");
@@ -256,6 +307,24 @@ TEST(WatchListDocuments, DeletesRowsThroughWorkstationOwner) {
     EXPECT_EQ(document->rows.front().id, *second);
     EXPECT_FALSE(DeleteWatchListRow(
         state.workspace, *document_id, first_id));
+}
+
+TEST(WatchListDocuments, KeepsOneEmptyDraftRowAtTheEnd) {
+    WatchListDocumentState document{
+        .id = "watch-list.test",
+        .rows = {
+            {.id = "empty.first"},
+            {.id = "populated", .instrument_id = "asset-aapl", .symbol = "AAPL",
+             .ticker_input = "AAPL"},
+            {.id = "empty.second"},
+        },
+    };
+
+    EXPECT_TRUE(EnsureWatchListTrailingEmptyRow(document));
+    ASSERT_EQ(document.rows.size(), 2U);
+    EXPECT_EQ(document.rows.front().id, "populated");
+    EXPECT_EQ(document.rows.back().id, "empty.first");
+    EXPECT_FALSE(EnsureWatchListTrailingEmptyRow(document));
 }
 
 TEST(WatchListDocuments, InitializesAndAddsTableColumns) {

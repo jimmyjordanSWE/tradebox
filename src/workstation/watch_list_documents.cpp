@@ -223,6 +223,29 @@ std::expected<std::string, WatchListDocumentError> AddWatchListRow(
     return row_id;
 }
 
+bool EnsureWatchListTrailingEmptyRow(WatchListDocumentState& document) {
+    const auto empty_row = [](const WatchListRowState& row) {
+        return row.instrument_id.empty() && row.symbol.empty() &&
+               row.ticker_input.empty();
+    };
+    const auto first_empty = std::ranges::find_if(document.rows, empty_row);
+    if (first_empty == document.rows.end()) {
+        static_cast<void>(AddWatchListRow(document));
+        return true;
+    }
+    const bool already_last = std::next(first_empty) == document.rows.end();
+    const bool has_another_empty = std::ranges::find_if(
+        std::next(first_empty), document.rows.end(), empty_row) !=
+        document.rows.end();
+    if (already_last && !has_another_empty) return false;
+
+    WatchListRowState trailing = std::move(*first_empty);
+    document.rows.erase(first_empty);
+    std::erase_if(document.rows, empty_row);
+    document.rows.push_back(std::move(trailing));
+    return true;
+}
+
 std::expected<void, WatchListDocumentError> DeleteWatchListRow(
     WatchListDocumentState& document, std::string_view row_id) {
     const auto found = std::ranges::find(

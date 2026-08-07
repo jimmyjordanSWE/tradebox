@@ -1,6 +1,7 @@
 # Build and IDE output
 /build/
 /build-*/
+/build_verify/
 /.vs/
 /.vscode/
 CMakeUserPresets.json

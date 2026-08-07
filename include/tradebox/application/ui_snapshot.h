@@ -38,7 +38,7 @@ struct UiWatchListRowQuery {
 struct UiWatchListQuery {
     std::string document_id;
     std::vector<UiWatchListRowQuery> rows;
-    bool needs_change_from_open = false;
+    bool needs_change_from_close = false;
 };
 
 struct UiSnapshotQuery {
@@ -46,6 +46,9 @@ struct UiSnapshotQuery {
     std::vector<std::string> market_symbols;
     std::vector<UiChartQuery> charts;
     std::vector<UiWatchListQuery> watch_lists;
+    // Requests live market snapshots for the symbols currently held in the
+    // authoritative position projection.
+    bool include_position_markets = false;
     std::string asset_search;
     std::vector<std::string> asset_searches;
     std::vector<std::string> asset_preferred_instrument_ids;
@@ -83,7 +86,9 @@ struct UiWatchListRowSnapshot {
     std::optional<core::Decimal> current_price;
     std::optional<core::Decimal> previous_close;
     std::optional<core::Decimal> session_open;
-    std::optional<core::Decimal> change_from_open;
+    std::optional<core::Decimal> change_from_previous_close_percent;
+    std::optional<core::Decimal> change_from_session_open_percent;
+    std::optional<core::Decimal> change_from_close;
     bool history_missing = false;
 };
 

@@ -12,8 +12,12 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
+#include <iomanip>
 #include <optional>
+#include <numeric>
 #include <ranges>
+#include <sstream>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -72,12 +76,32 @@ std::string SignedDecimal(const core::Decimal& value) {
     return text;
 }
 
+std::string PercentageText(const core::Decimal& value) {
+    std::ostringstream text;
+    if (!value.IsZero() && value.ToString().front() != '-') text << '+';
+    text << std::fixed << std::setprecision(2) << value.ToDisplayDouble()
+         << "%";
+    return text.str();
+}
+
+void DrawPercentage(const std::optional<core::Decimal>& value) {
+    if (!value) {
+        ImGui::TextUnformatted("--");
+        return;
+    }
+    const ImVec4 color = value->ToString().front() == '-'
+                             ? ImVec4(0.95f, 0.30f, 0.30f, 1.0f)
+                             : ImVec4(0.35f, 0.85f, 0.45f, 1.0f);
+    const std::string text = PercentageText(*value);
+    ImGui::TextColored(color, "%s", text.c_str());
+}
+
 std::vector<workstation::ColumnState*> OrderedColumns(
     workstation::PersistentTableState& table) {
     std::vector<workstation::ColumnState*> result;
     result.reserve(table.columns.size());
     for (workstation::ColumnState& column : table.columns)
-        result.push_back(&column);
+        if (column.visible) result.push_back(&column);
     std::ranges::stable_sort(result, [](const auto* left, const auto* right) {
         if (left->order != right->order) return left->order < right->order;
         return left->id < right->id;
@@ -105,8 +129,8 @@ std::optional<core::Decimal> NumericValueFor(
     const auto* row_snapshot = RowSnapshotFor(snapshot, row.id);
     if (row_snapshot == nullptr) return std::nullopt;
     if (column_id == "current_price") return row_snapshot->current_price;
-    if (column_id == "change_from_open")
-        return row_snapshot->change_from_open;
+    if (column_id == "change_from_close")
+        return row_snapshot->change_from_close;
     return std::nullopt;
 }
 
@@ -256,9 +280,26 @@ void WatchListWindowRenderer::AppendSnapshotQuery(
     queries_.clear();
     workstation::WatchListDocumentState* document = ActiveDocument(state);
     if (document == nullptr) return;
+    if (workstation::EnsureWatchListTrailingEmptyRow(*document))
+        persistent_changed_ = true;
+    const auto window = state.windows.find(
+        std::string(workstation::kWatchListWindowId));
+    bool needs_change_from_close = false;
+    if (window != state.windows.end()) {
+        const auto table = window->second.tables.find(
+            std::string(workstation::kWatchListTableId));
+        if (table != window->second.tables.end()) {
+            needs_change_from_close = std::ranges::any_of(
+                table->second.columns,
+                [](const workstation::ColumnState& column) {
+                    return column.visible &&
+                           column.id == "change_from_close";
+                });
+        }
+    }
     application::UiWatchListQuery watch_query{
         .document_id = document->id,
-        .needs_change_from_open = true,
+        .needs_change_from_close = needs_change_from_close,
     };
     for (const workstation::WatchListRowState& row : document->rows) {
         if (!row.instrument_id.empty() && !row.symbol.empty()) {
@@ -274,48 +315,9 @@ void WatchListWindowRenderer::AppendSnapshotQuery(
     }
     if (!query.asset_searches.empty())
         query.asset_limit = std::max<std::size_t>(query.asset_limit, 8U);
+    query.watch_lists.push_back(watch_query);
     queries_.emplace(document->id, std::move(watch_query));
-    query.watch_lists.push_back({.document_id = document->id});
-#if 0
-    workstation::WatchListDocumentState* document = ActiveDocument(state);
-    if (document != nullptr) {
-        const auto window = state.windows.find(
-            std::string(workstation::kWatchListWindowId));
-        const workstation::PersistentTableState* table = nullptr;
-        if (window != state.windows.end()) {
-            const auto table_found = window->second.tables.find(
-                std::string(workstation::kWatchListTableId));
-            if (table_found != window->second.tables.end())
-                table = &table_found->second;
-        }
-        const bool needs_change_from_open =
-            table != nullptr &&
-            std::ranges::any_of(table->columns, [](const auto& column) {
-                return column.visible && column.id == "change_from_open";
-            });
-        application::UiWatchListQuery watch_query{
-            .document_id = document->id,
-            .needs_change_from_open = needs_change_from_open,
-        };
-        for (const workstation::WatchListRowState& row : document->rows) {
-            if (!row.instrument_id.empty() && !row.symbol.empty()) {
-                query.market_symbols.push_back(row.symbol);
-                watch_query.rows.push_back({
-                    .row_id = row.id,
-                    .instrument_id = row.instrument_id,
-                    .symbol = row.symbol,
-                });
-            } else if (!row.ticker_input.empty()) {
-                query.asset_searches.push_back(row.ticker_input);
-            }
-        }
-        queries_.emplace(document->id, watch_query);
-        query.watch_lists.push_back(std::move(watch_query));
-    }
     query.asset_preferred_instrument_ids = state.asset_selection_history;
-    if (!query.asset_searches.empty())
-        query.asset_limit = std::max<std::size_t>(query.asset_limit, 8U);
-#endif
 }
 
 void WatchListWindowRenderer::RequestMissingHistory(
@@ -346,7 +348,10 @@ void WatchListWindowRenderer::RequestMissingHistory(
 
 void WatchListWindowRenderer::Draw(
     ui::Workspace& workspace, workstation::WorkspaceState& state,
-    const application::ApplicationUiSnapshot& snapshot, ImFont* icons) {
+    const application::ApplicationUiSnapshot& snapshot, ImFont* mono,
+    ImFont* icons) {
+    (void)mono;
+#if 0
     // Deliberately empty first pass. The watch-list window should establish
     // its visual shell before any document, table, or market-data behavior is
     // connected to it.
@@ -368,8 +373,10 @@ void WatchListWindowRenderer::Draw(
         .flags = ImGuiWindowFlags_NoCollapse,
     };
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    if (mono != nullptr) ImGui::PushFont(mono);
     if (!workspace.BeginWindow(window)) {
         workspace.EndWindow(window);
+        if (mono != nullptr) ImGui::PopFont();
         ImGui::PopStyleVar();
         return;
     }
@@ -402,13 +409,65 @@ void WatchListWindowRenderer::Draw(
             minimum_column_width);
         ImGui::TableHeadersRow();
 
-        for (std::size_t row_index = 0; row_index < document->rows.size();
-             ++row_index) {
+        std::vector<std::size_t> row_indices(document->rows.size());
+        std::iota(row_indices.begin(), row_indices.end(), 0U);
+        if (const ImGuiTableSortSpecs* sort_specs =
+                ImGui::TableGetSortSpecs();
+            sort_specs != nullptr && sort_specs->SpecsCount > 0) {
+            const ImGuiTableColumnSortSpecs& spec = sort_specs->Specs[0];
+            const bool descending =
+                spec.SortDirection == ImGuiSortDirection_Descending;
+            const auto value_for = [&](const workstation::WatchListRowState& row)
+                -> std::optional<core::Decimal> {
+                const auto* row_snapshot = RowSnapshotFor(watch_snapshot, row.id);
+                if (row_snapshot == nullptr) return std::nullopt;
+                if (spec.ColumnIndex == 2) return row_snapshot->current_price;
+                if (spec.ColumnIndex == 3)
+                    return row_snapshot->change_from_previous_close_percent;
+                if (spec.ColumnIndex == 4)
+                    return row_snapshot->change_from_session_open_percent;
+                return std::nullopt;
+            };
+            const auto empty_row = [](const auto& row) {
+                return row.instrument_id.empty() && row.symbol.empty() &&
+                       row.ticker_input.empty();
+            };
+            std::ranges::stable_sort(row_indices, [&](std::size_t left_index,
+                                                       std::size_t right_index) {
+                const auto& left = document->rows[left_index];
+                const auto& right = document->rows[right_index];
+                const bool left_empty = empty_row(left);
+                const bool right_empty = empty_row(right);
+                if (left_empty != right_empty) return !left_empty;
+                if (spec.ColumnIndex == 1 && left.symbol != right.symbol)
+                    return descending ? left.symbol > right.symbol
+                                      : left.symbol < right.symbol;
+                const auto left_value = value_for(left);
+                const auto right_value = value_for(right);
+                if (left_value && right_value && *left_value != *right_value)
+                    return descending ? *left_value > *right_value
+                                      : *left_value < *right_value;
+                if (left_value.has_value() != right_value.has_value())
+                    return left_value.has_value();
+                return left.id < right.id;
+            });
+        }
+
+        for (const std::size_t row_index : row_indices) {
             workstation::WatchListRowState& row = document->rows[row_index];
             ImGui::PushID(row.id.c_str());
             ImGui::TableNextRow();
+            const bool selected_row =
+                !row.symbol.empty() && row.symbol == state.selected_symbol;
+            if (selected_row) {
+                ImGui::TableSetBgColor(
+                    ImGuiTableBgTarget_RowBg0,
+                    ImGui::GetColorU32(ImGuiCol_Header));
+            }
             ImGui::TableNextColumn();
-            if (ImGui::SmallButton("X##delete_row"))
+            const bool empty_row = row.instrument_id.empty() && row.symbol.empty() &&
+                                   row.ticker_input.empty();
+            if (!empty_row && ImGui::SmallButton("X##delete_row"))
                 pending_delete_row = row.id;
             ImGui::TableNextColumn();
             RowInteraction& interaction = interactions_[row.id];
@@ -420,23 +479,31 @@ void WatchListWindowRenderer::Draw(
                 interaction.ticker[count] = '\0';
                 interaction.initialized = true;
             }
-            if (focus_row_id_ == row.id) {
-                ImGui::SetKeyboardFocusHere();
-                focus_row_id_.clear();
-            }
             interaction.navigation_direction = 0;
-            if (ImGui::InputText(
-                    "##ticker", interaction.ticker.data(),
-                    interaction.ticker.size(),
-                    ImGuiInputTextFlags_CharsUppercase |
-                        ImGuiInputTextFlags_CallbackHistory,
-                    WatchListTickerInputCallback,
-                    &interaction.navigation_direction)) {
-                row.ticker_input = interaction.ticker.data();
-                row.instrument_id.clear();
-                row.symbol.clear();
-                interaction.highlighted_match = -1;
-                persistent_changed_ = true;
+            if (!row.symbol.empty()) {
+                if (ImGui::Selectable(
+                        row.symbol.c_str(), selected_row, 0,
+                        {ImGui::GetContentRegionAvail().x, 0.0f})) {
+                    state.selected_symbol = row.symbol;
+                    persistent_changed_ = true;
+                }
+            } else {
+                if (focus_row_id_ == row.id) {
+                    ImGui::SetKeyboardFocusHere();
+                    focus_row_id_.clear();
+                }
+                if (ImGui::InputText(
+                        "##ticker", interaction.ticker.data(),
+                        interaction.ticker.size(),
+                        ImGuiInputTextFlags_CharsUppercase |
+                            ImGuiInputTextFlags_CallbackHistory,
+                        WatchListTickerInputCallback,
+                        &interaction.navigation_direction)) {
+                    row.ticker_input = interaction.ticker.data();
+                    row.instrument_id.clear();
+                    interaction.highlighted_match = -1;
+                    persistent_changed_ = true;
+                }
             }
 
             const auto* matches =
@@ -503,6 +570,7 @@ void WatchListWindowRenderer::Draw(
                                 interaction.ticker.data());
                     interaction.ticker[count] = '\0';
                     interaction.highlighted_match = -1;
+                    state.selected_symbol = asset.symbol;
                     if (row_index + 1U == document->rows.size()) {
                         if (document->id == workstation::kWatchListDraftId) {
                             document->rows.push_back({
@@ -535,16 +603,28 @@ void WatchListWindowRenderer::Draw(
                 row_snapshot != nullptr && row_snapshot->current_price
                     ? row_snapshot->current_price->ToString().c_str()
                     : "--");
+            if (!row.symbol.empty() && ImGui::IsItemClicked()) {
+                state.selected_symbol = row.symbol;
+                persistent_changed_ = true;
+            }
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(
-                row_snapshot != nullptr && row_snapshot->previous_close
-                    ? row_snapshot->previous_close->ToString().c_str()
-                    : "--");
+            DrawPercentage(
+                row_snapshot == nullptr
+                    ? std::optional<core::Decimal>{}
+                    : row_snapshot->change_from_previous_close_percent);
+            if (!row.symbol.empty() && ImGui::IsItemClicked()) {
+                state.selected_symbol = row.symbol;
+                persistent_changed_ = true;
+            }
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(
-                row_snapshot != nullptr && row_snapshot->session_open
-                    ? row_snapshot->session_open->ToString().c_str()
-                    : "--");
+            DrawPercentage(
+                row_snapshot == nullptr
+                    ? std::optional<core::Decimal>{}
+                    : row_snapshot->change_from_session_open_percent);
+            if (!row.symbol.empty() && ImGui::IsItemClicked()) {
+                state.selected_symbol = row.symbol;
+                persistent_changed_ = true;
+            }
             ImGui::PopID();
         }
         ImGui::EndTable();
@@ -569,9 +649,11 @@ void WatchListWindowRenderer::Draw(
         }
     }
     workspace.EndWindow(window);
+    if (mono != nullptr) ImGui::PopFont();
     ImGui::PopStyleVar();
     return;
-#if 0
+#endif
+#if 1
     workstation::WatchListDocumentState* active_document =
         ActiveDocument(state);
     if (active_document == nullptr) return;
@@ -673,6 +755,8 @@ void WatchListWindowRenderer::Draw(
             ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable |
             ImGuiTableFlags_Sortable | ImGuiTableFlags_SizingFixedFit |
             ImGuiTableFlags_ScrollX | ImGuiTableFlags_NoSavedSettings;
+        std::optional<workstation::WatchListColumnKind>
+            pending_remove_column;
         if (ImGui::BeginTable(table_id.c_str(),
                               static_cast<int>(columns.size()) + 1,
                               table_flags)) {
@@ -719,6 +803,14 @@ void WatchListWindowRenderer::Draw(
                     ImGui::TableHeader(
                         definition == nullptr ? id.c_str()
                                                : definition->label.data());
+                    if (definition != nullptr &&
+                        definition->kind !=
+                            workstation::WatchListColumnKind::Symbol &&
+                        ImGui::BeginPopupContextItem()) {
+                        if (ImGui::MenuItem("Remove column"))
+                            pending_remove_column = definition->kind;
+                        ImGui::EndPopup();
+                    }
                 }
             }
 
@@ -734,12 +826,28 @@ void WatchListWindowRenderer::Draw(
                         spec.SortDirection == ImGuiSortDirection_Descending
                             ? "descending"
                             : "ascending";
+                    for (workstation::ColumnState& column :
+                         table->second.columns) {
+                        if (&column != &sorted_column &&
+                            !column.sort_direction.empty()) {
+                            column.sort_direction.clear();
+                            persistent_changed_ = true;
+                        }
+                    }
                     if (sorted_column.sort_direction != next_direction) {
                         sorted_column.sort_direction = next_direction;
                         persistent_changed_ = true;
                     }
+                    std::vector<std::string> prior_row_order;
+                    prior_row_order.reserve(document.rows.size());
+                    for (const auto& row : document.rows)
+                        prior_row_order.push_back(row.id);
                     SortRows(document.rows, sorted_column.id,
                              spec.SortDirection, watch_snapshot);
+                    const bool order_changed = !std::ranges::equal(
+                        document.rows, prior_row_order, {},
+                        &workstation::WatchListRowState::id);
+                    if (order_changed) persistent_changed_ = true;
                 }
             }
 
@@ -909,14 +1017,14 @@ void WatchListWindowRenderer::Draw(
                                     row_snapshot->current_price
                                 ? row_snapshot->current_price->ToString().c_str()
                                 : "--");
-                    } else if (column_id == "change_from_open") {
+                    } else if (column_id == "change_from_close") {
                         const auto* row_snapshot =
                             RowSnapshotFor(watch_snapshot, row.id);
                         const std::string value =
                             row_snapshot != nullptr &&
-                                    row_snapshot->change_from_open
+                                    row_snapshot->change_from_close
                                 ? SignedDecimal(
-                                      *row_snapshot->change_from_open)
+                                      *row_snapshot->change_from_close)
                                 : "--";
                         ImGui::TextUnformatted(value.c_str());
                     } else {
@@ -971,6 +1079,13 @@ void WatchListWindowRenderer::Draw(
                     reordered[index].order = static_cast<int>(index);
                 table->second.columns = std::move(reordered);
             }
+        }
+
+        if (pending_remove_column) {
+            const auto removed = workstation::RemoveWatchListColumn(
+                state, document.id, *pending_remove_column);
+            if (removed) persistent_changed_ = true;
+            else message_ = removed.error().message;
         }
 
         if (ImGui::BeginPopup("watch_list_add_column")) {

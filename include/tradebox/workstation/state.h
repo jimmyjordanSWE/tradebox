@@ -81,6 +81,7 @@ struct ApplicationSettings {
     int window_snap_pixels = 10;
     bool vsync_requested = true;
     int maximum_frame_rate = 120;
+    float account_risk_per_trade_percent = 1.0f;
 };
 
 struct AccountContext {
