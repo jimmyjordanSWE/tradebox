@@ -206,6 +206,64 @@ void OrderTicketWindowRenderer::Draw(
         persistent_changed_ = true;
     }
 
+    // --- Bracket order section ---
+    ImGui::Separator();
+    auto bracket_it = state.bracket_drafts.find(symbol);
+    if (bracket_it == state.bracket_drafts.end()) {
+        // Insert a default bracket draft for this symbol.
+        bracket_it = state.bracket_drafts
+                         .try_emplace(symbol, workstation::BracketDraftState{})
+                         .first;
+    }
+    workstation::BracketDraftState& bracket = bracket_it->second;
+
+    bool bracket_enabled = bracket.target_percent > 0.0f ||
+                           bracket.stop_percent > 0.0f;
+    if (ImGui::Checkbox("Bracket (TP/SL)", &bracket_enabled)) {
+        if (!bracket_enabled) {
+            bracket.target_percent = 0.0f;
+            bracket.stop_percent = 0.0f;
+        } else {
+            bracket.target_percent = 1.0f;
+            bracket.stop_percent = 0.5f;
+        }
+        persistent_changed_ = true;
+    }
+
+    if (bracket_enabled) {
+        ImGui::Indent(16.0f);
+
+        float target = bracket.target_percent;
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::InputFloat("Take Profit %", &target, 0.1f, 1.0f,
+                              "%.1f%%")) {
+            bracket.target_percent = std::max(0.0f, target);
+            persistent_changed_ = true;
+        }
+
+        float stop = bracket.stop_percent;
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::InputFloat("Stop Loss %", &stop, 0.1f, 1.0f,
+                              "%.1f%%")) {
+            bracket.stop_percent = std::max(0.0f, stop);
+            persistent_changed_ = true;
+        }
+
+        bool gtc = bracket.gtc;
+        if (ImGui::Checkbox("GTC Bracket Legs", &gtc)) {
+            bracket.gtc = gtc;
+            persistent_changed_ = true;
+        }
+
+        bool short_entry = bracket.short_entry;
+        if (ImGui::Checkbox("Short Entry", &short_entry)) {
+            bracket.short_entry = short_entry;
+            persistent_changed_ = true;
+        }
+
+        ImGui::Unindent(16.0f);
+    }
+
     ImGui::Separator();
 
     // Submit button
@@ -262,6 +320,28 @@ void OrderTicketWindowRenderer::Draw(
         if (!ticket->stop_price.empty())
             request.stop_price = core::Decimal::Parse(ticket->stop_price);
 
+        // Attach bracket (take-profit / stop-loss) if enabled.
+        if (bracket.target_percent > 0.0f || bracket.stop_percent > 0.0f) {
+            request.order_class = core::OrderClass::Bracket;
+            if (bracket.target_percent > 0.0f) {
+                // The take-profit limit price is derived from the entry
+                // direction. For a buy, TP is above; for a sell, TP is below.
+                // The actual price computation requires a reference price
+                // (e.g. last trade). We store the percentage and let the
+                // broker adapter compute the absolute price.
+                request.take_profit = core::TakeProfit{
+                    .limit_price = core::Decimal::FromFloat(
+                        bracket.target_percent),
+                };
+            }
+            if (bracket.stop_percent > 0.0f) {
+                request.stop_loss = core::StopLoss{
+                    .stop_price = core::Decimal::FromFloat(
+                        bracket.stop_percent),
+                };
+            }
+        }
+
         // Validate
         auto errors = core::ValidateOrder(request);
         if (!errors.empty()) {
@@ -314,6 +394,17 @@ void OrderTicketWindowRenderer::Draw(
         ImGui::Text("TIF: %s", ticket->time_in_force.c_str());
         if (ticket->extended_hours)
             ImGui::TextUnformatted("Extended hours: Yes");
+        if (bracket.target_percent > 0.0f || bracket.stop_percent > 0.0f) {
+            ImGui::TextUnformatted("Bracket: Yes");
+            if (bracket.target_percent > 0.0f)
+                ImGui::Text("Take Profit: %.1f%%", bracket.target_percent);
+            if (bracket.stop_percent > 0.0f)
+                ImGui::Text("Stop Loss: %.1f%%", bracket.stop_percent);
+            if (bracket.gtc)
+                ImGui::TextUnformatted("Bracket legs: GTC");
+            if (bracket.short_entry)
+                ImGui::TextUnformatted("Short entry bracket");
+        }
         ImGui::Separator();
         ImGui::Checkbox("I confirm this order", &confirmed);
         ImGui::BeginDisabled(!confirmed);

@@ -10,14 +10,14 @@ A desktop application that connects to Alpaca, displays real-time market data on
 
 **Goal**: Users can place, cancel, and replace orders from within the application.
 
-- [ ] **1.1 Order ticket window GUI**
+- [x] **1.1 Order ticket window GUI**
   - New: `src/adapters/gui/order_ticket_window.cpp` / `.h`
   - Render `OrderTicketState` fields: symbol, side, type, qty/notional, limit/stop price, TIF, extended hours
   - Wire submit button → `TradingApplication::SubmitOrder()`
   - Show order status/result feedback
   - Register in `main.cpp` alongside other window renderers
 
-- [ ] **1.2 Bracket order UI**
+- [x] **1.2 Bracket order UI**
   - Render `BracketDraftState` (target %, stop %, GTC, short entry)
   - Attach bracket params to the order before submission
 
