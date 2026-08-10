@@ -38,7 +38,7 @@ struct UiWatchListRowQuery {
 struct UiWatchListQuery {
     std::string document_id;
     std::vector<UiWatchListRowQuery> rows;
-    bool needs_change_from_close = false;
+    bool needs_change_from_open = false;
 };
 
 struct UiSnapshotQuery {
@@ -84,11 +84,12 @@ struct UiChartSnapshot {
 struct UiWatchListRowSnapshot {
     std::string row_id;
     std::optional<core::Decimal> current_price;
+    std::int64_t current_price_time_ns = 0;
     std::optional<core::Decimal> previous_close;
     std::optional<core::Decimal> session_open;
     std::optional<core::Decimal> change_from_previous_close_percent;
     std::optional<core::Decimal> change_from_session_open_percent;
-    std::optional<core::Decimal> change_from_close;
+    std::optional<core::Decimal> change_from_open;
     bool history_missing = false;
 };
 

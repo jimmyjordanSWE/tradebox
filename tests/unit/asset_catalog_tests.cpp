@@ -44,5 +44,19 @@ TEST(AssetCatalog, WithoutHistoryMatchesAreAlphabetical) {
     EXPECT_EQ(matches[1].symbol, "AAB");
 }
 
+TEST(AssetCatalog, ExactSymbolMatchExcludesPartialAndNameMatches) {
+    const std::vector<TradableAsset> assets{
+        Equity("asset:qqq", "QQQ"),
+        Equity("asset:qqqj", "QQQJ"),
+        {.symbol = "ONE", .name = "QQQ Holdings", .active = true,
+         .tradable = true, .instrument_id = "asset:one"},
+    };
+
+    const auto matches = SearchTradableAssets(assets, "QQQ");
+
+    ASSERT_EQ(matches.size(), 1U);
+    EXPECT_EQ(matches.front().symbol, "QQQ");
+}
+
 }  // namespace
 }  // namespace tradebox::core

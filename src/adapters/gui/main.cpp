@@ -556,6 +556,9 @@ std::vector<std::string> VisibleMarketSymbols(
     const tradebox::application::UiSnapshotQuery& query,
     const tradebox::core::CoreSnapshot& core) {
     std::vector<std::string> result = query.market_symbols;
+    for (const auto& watch_list : query.watch_lists)
+        for (const auto& row : watch_list.rows)
+            if (!row.symbol.empty()) result.push_back(row.symbol);
     for (const auto& chart : query.charts)
         if (!chart.symbol.empty()) result.push_back(chart.symbol);
     if (query.include_position_markets)
@@ -566,6 +569,20 @@ std::vector<std::string> VisibleMarketSymbols(
     result.erase(unique.begin(), unique.end());
     std::erase_if(result,
                   [](const std::string& symbol) { return symbol.empty(); });
+    return result;
+}
+
+std::vector<std::string> ActiveWatchListSymbols(
+    const tradebox::workstation::WorkspaceState& workspace) {
+    std::vector<std::string> result;
+    const auto* document = tradebox::workstation::FindWatchListDocument(
+        workspace, workspace.active_watch_list_id);
+    if (document == nullptr) return result;
+    for (const auto& row : document->rows)
+        if (!row.symbol.empty()) result.push_back(row.symbol);
+    std::ranges::sort(result);
+    const auto unique = std::ranges::unique(result);
+    result.erase(unique.begin(), unique.end());
     return result;
 }
 
@@ -808,8 +825,8 @@ int RunApplication(const LaunchOptions& options) {
                         tradebox::application::ConnectionRequest request;
                         request.environment = environment;
                         request.credential_slot = slot;
-                        request.market_data_feed =
-                            tradebox::core::MarketDataFeed::Iex;
+                        request.market_symbols = ActiveWatchListSymbols(
+                            workstation_state.workspace);
                         const auto receipt =
                             application->Connect(std::move(request));
                         account_popup.message = receipt
@@ -844,7 +861,7 @@ int RunApplication(const LaunchOptions& options) {
             const auto core_snapshot = application->Snapshot();
             static_cast<void>(application->UpdateMarketDataInterest({
                 .consumer_id = "ui.visible",
-                .feed = tradebox::core::MarketDataFeed::Iex,
+                .feed = application->ActiveMarketDataFeed(),
                 .symbols = VisibleMarketSymbols(snapshot_query, core_snapshot),
                 .priority = tradebox::application::
                     MarketDataInterestPriority::UserVisible,
@@ -902,7 +919,16 @@ int RunApplication(const LaunchOptions& options) {
             }
         }
         if (chrome_actions.new_watch_list) {
-            watch_list_renderer.StartNewDraft(workstation_state.workspace);
+            const auto ensured = tradebox::workstation::EnsureDefaultWatchList(
+                workstation_state.workspace);
+            if (ensured) {
+                static_cast<void>(tradebox::workstation::EnsureWatchListWindow(
+                    workstation_state.workspace));
+                workstation_state.workspace.windows.at(
+                    std::string(tradebox::workstation::kWatchListWindowId))
+                    .open = true;
+                profile_store.MarkDirty();
+            }
         }
         if (chrome_actions.new_positions) {
             const auto created = tradebox::workstation::CreatePositionsWindow(
@@ -1035,8 +1061,8 @@ int RunApplication(const LaunchOptions& options) {
                 request.environment =
                     target_environment;
                 request.credential_slot = target_credential_slot;
-                request.market_data_feed =
-                    tradebox::core::MarketDataFeed::Iex;
+                request.market_symbols = ActiveWatchListSymbols(
+                    workstation_state.workspace);
                 const auto receipt = application->Connect(std::move(request));
                 account_popup.message = receipt
                                              ? receipt->message
@@ -1097,8 +1123,8 @@ int RunApplication(const LaunchOptions& options) {
             true);
         chart_renderer.Draw(workspace, workstation_state.workspace, snapshot);
         watch_list_renderer.Draw(
-            workspace, workstation_state.workspace, snapshot, gui_fonts.mono,
-            gui_fonts.icons);
+            workspace, workstation_state.workspace, snapshot,
+            workstation_state.application, gui_fonts.mono, gui_fonts.icons);
         order_ticket_renderer.Draw(
             workspace, workstation_state.workspace, snapshot);
         trade_hotkey_renderer.Draw(workspace, workstation_state.workspace);

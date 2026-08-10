@@ -24,6 +24,7 @@ public:
         const application::ApplicationUiSnapshot& snapshot);
     void Draw(ui::Workspace& workspace, workstation::WorkspaceState& state,
               const application::ApplicationUiSnapshot& snapshot,
+              const workstation::ApplicationSettings& settings,
               ImFont* mono, ImFont* icons);
     [[nodiscard]] bool ConsumePersistentChanges();
 
@@ -54,6 +55,7 @@ private:
     bool focus_name_input_ = false;
     std::string message_;
     bool persistent_changed_ = false;
+    bool session_normalized_ = false;
 };
 
 }  // namespace tradebox::gui

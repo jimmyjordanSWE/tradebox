@@ -596,6 +596,30 @@ tradebox::core::BarSeriesKey AlpacaService::ResolveBarSeriesKey(
     };
 }
 
+std::expected<tradebox::core::MarketDataFeed, std::string>
+AlpacaService::ResolveMarketDataFeed(
+    const AlpacaCredentials& credentials,
+    tradebox::core::MarketDataFeed requested,
+    const std::vector<std::string>& symbols) {
+    if (requested != tradebox::core::MarketDataFeed::Unknown)
+        return requested;
+
+    // Probe the provider's broadest stock feed through the same authenticated
+    // market-data endpoint used for snapshot seeding. A successful SIP
+    // response proves that this connection can use SIP; otherwise IEX is the
+    // best available feed for the current Alpaca account.
+    const std::string probe_symbol =
+        symbols.empty() ? std::string("AAPL") : symbols.front();
+    rest_transport_.Resume();
+    const auto response = Get(
+        rest_transport_, L"data.alpaca.markets",
+        Wide("/v2/stocks/trades/latest?symbols=" +
+             UrlEncode(probe_symbol) + "&feed=sip"),
+        credentials, tradebox::broker::alpaca::RestPriority::Interactive);
+    if (response.status == 200) return tradebox::core::MarketDataFeed::Sip;
+    return tradebox::core::MarketDataFeed::Iex;
+}
+
 void AlpacaService::Connect(AlpacaCredentials credentials,
                             const std::vector<std::string>& symbols,
                             tradebox::core::MarketDataFeed feed) {
@@ -1160,6 +1184,53 @@ void AlpacaService::SeedLatestSnapshots(
     }
     try {
         const json snapshots = json::parse(response.body);
+        std::unordered_set<std::string> seeded_trade_symbols;
+        const auto ingest_trade = [&](const std::string& symbol,
+                                       const json& item) {
+            if (!item.is_object() || !item.contains("t") ||
+                !item.contains("p") || !item.contains("s") ||
+                item["t"].is_null() || item["p"].is_null() ||
+                item["s"].is_null())
+                return false;
+            const std::string instrument_id =
+                InstrumentIdForSymbol(symbol);
+            const std::string timestamp = String(item, "t");
+            const std::int64_t event_time_ns =
+                ParseTimestampNs(timestamp);
+            if (timestamp.empty() || event_time_ns <= 0) return false;
+            const std::int64_t received_at_ms = WallClockNowMs();
+            const std::string trade_id = Identifier(item, "i");
+            auto event = tradebox::core::ShareMarketDataEvent(
+                tradebox::core::TradeReceived{
+                    .trade = {
+                        .instrument_id = instrument_id,
+                        .symbol = symbol,
+                        .trade_id = trade_id,
+                        .price = RequiredDecimal(item, "p"),
+                        .size = RequiredDecimal(item, "s"),
+                        .exchange = String(item, "x"),
+                        .conditions = StringArray(item, "c"),
+                        .tape = String(item, "z"),
+                        .broker_timestamp = timestamp,
+                        .event_time_ns = event_time_ns,
+                        .received_at_ms = received_at_ms,
+                    },
+                });
+            if (!database_.QueueMarketDataEvent(
+                    feed,
+                    symbol + ":" + std::to_string(event_time_ns) + ":" +
+                        trade_id,
+                    event) &&
+                !persistence_queue_warning_emitted_.exchange(true))
+                events_.Push(OperationalEvent(
+                    OperationalComponent::Persistence,
+                    OperationalState::Degraded,
+                    OperationalSeverity::Critical,
+                    "Market-data persistence queue rejected an event",
+                    OperationalReason::QueueOverload));
+            market_data_.Ingest(std::move(event));
+            return true;
+        };
         for (const std::string& symbol : symbols) {
             if (!snapshots.contains(symbol) ||
                 !snapshots[symbol].is_object())
@@ -1225,48 +1296,44 @@ void AlpacaService::SeedLatestSnapshots(
             }
             if (snapshot.contains("latestTrade") &&
                 snapshot["latestTrade"].is_object()) {
-                const json& item = snapshot["latestTrade"];
-                const std::string timestamp =
-                    String(item, "t");
-                const std::int64_t event_time_ns =
-                    ParseTimestampNs(timestamp);
-                const std::int64_t received_at_ms =
-                    WallClockNowMs();
-                const std::string trade_id =
-                    Identifier(item, "i");
-                auto event =
-                    tradebox::core::ShareMarketDataEvent(
-                        tradebox::core::TradeReceived{
-                            .trade = {
-                                .instrument_id = instrument_id,
-                                .symbol = symbol,
-                                .trade_id = trade_id,
-                                .price =
-                                    RequiredDecimal(item, "p"),
-                                .size =
-                                    RequiredDecimal(item, "s"),
-                                .exchange = String(item, "x"),
-                                .conditions = StringArray(item, "c"),
-                                .tape = String(item, "z"),
-                                .broker_timestamp = timestamp,
-                                .event_time_ns = event_time_ns,
-                                .received_at_ms = received_at_ms,
-                            },
-                        });
-                if (!database_.QueueMarketDataEvent(
-                        feed,
-                        symbol + ":" +
-                            std::to_string(event_time_ns) + ":" +
-                            trade_id,
-                        event) &&
-                    !persistence_queue_warning_emitted_.exchange(true))
-                    events_.Push(OperationalEvent(
-                        OperationalComponent::Persistence,
-                        OperationalState::Degraded,
-                        OperationalSeverity::Critical,
-                        "Market-data persistence queue rejected an event",
-                        OperationalReason::QueueOverload));
-                market_data_.Ingest(std::move(event));
+                if (ingest_trade(symbol, snapshot["latestTrade"]))
+                    seeded_trade_symbols.insert(symbol);
+            }
+        }
+
+        std::vector<std::string> missing_trade_symbols;
+        for (const std::string& symbol : symbols)
+            if (!seeded_trade_symbols.contains(symbol))
+                missing_trade_symbols.push_back(symbol);
+        if (!missing_trade_symbols.empty()) {
+            std::string missing_joined;
+            for (const std::string& symbol : missing_trade_symbols) {
+                if (!missing_joined.empty()) missing_joined += ',';
+                missing_joined += symbol;
+            }
+            const HttpResult latest_trades = Get(
+                rest_transport_, L"data.alpaca.markets",
+                Wide("/v2/stocks/trades/latest?symbols=" +
+                     UrlEncode(missing_joined) + "&feed=" + feed),
+                credentials,
+                tradebox::broker::alpaca::RestPriority::Interactive);
+            if (latest_trades.status == 200) {
+                const json value = json::parse(latest_trades.body);
+                if (value.contains("trades") &&
+                    value["trades"].is_object()) {
+                    for (const std::string& symbol : missing_trade_symbols) {
+                        if (!value["trades"].contains(symbol)) continue;
+                        if (ingest_trade(symbol, value["trades"][symbol]))
+                            seeded_trade_symbols.insert(symbol);
+                    }
+                }
+            } else {
+                events_.Push({
+                    UiEventType::Status, {},
+                    "Latest trade seed failed: " +
+                        (!latest_trades.error.empty()
+                             ? latest_trades.error
+                             : latest_trades.body)});
             }
         }
     } catch (const std::exception& error) {

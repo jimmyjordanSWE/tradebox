@@ -29,7 +29,9 @@ struct ConnectionRequest {
     std::string api_key;
     std::string api_secret;
     std::vector<std::string> market_symbols;
-    core::MarketDataFeed market_data_feed = core::MarketDataFeed::Iex;
+    // Unknown asks the connected broker provider to select its best
+    // available feed. A concrete value pins the connection to that feed.
+    core::MarketDataFeed market_data_feed = core::MarketDataFeed::Unknown;
 };
 
 class TradingApplication final {
@@ -94,6 +96,7 @@ public:
         const core::AccountActivityQuery& query) const;
     void RefreshAccountActivities();
     [[nodiscard]] core::RestTransportHealth RestHealth() const;
+    [[nodiscard]] core::MarketDataFeed ActiveMarketDataFeed() const;
     [[nodiscard]] core::MarketDataPipelineHealth
     MarketDataHealth() const;
 

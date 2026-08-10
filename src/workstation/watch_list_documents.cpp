@@ -29,6 +29,35 @@ WatchListRowState* FindRow(WatchListDocumentState& document,
     return found == document.rows.end() ? nullptr : &*found;
 }
 
+std::vector<WatchListRowState> LegacyWatchListRows(
+    const std::vector<std::string>& symbols) {
+    std::vector<WatchListRowState> rows;
+    rows.reserve(symbols.size());
+    for (const std::string& symbol : symbols) {
+        if (symbol.empty()) continue;
+        rows.push_back({.id = NewStableId("watch-list-row"),
+                        .ticker_input = symbol});
+    }
+    return rows;
+}
+
+void MigrateWatchListColumns(PersistentTableState& table) {
+    for (ColumnState& column : table.columns) {
+        if (column.id == "change_from_close")
+            column.id = "change_from_open";
+        else if (column.id == "change_from_close_percent")
+            column.id = "change_from_open_percent";
+    }
+    std::vector<std::string> seen;
+    std::erase_if(table.columns, [&](const ColumnState& column) {
+        if (std::ranges::find(seen, column.id) != seen.end()) return true;
+        seen.push_back(column.id);
+        return false;
+    });
+    for (std::size_t index = 0; index < table.columns.size(); ++index)
+        table.columns[index].order = static_cast<int>(index);
+}
+
 std::expected<void, WatchListDocumentError> EnsureWindow(
     WorkspaceState& workspace) {
     for (auto iterator = workspace.windows.begin();
@@ -59,6 +88,7 @@ std::expected<void, WatchListDocumentError> EnsureWindow(
     PersistentTableState& table = workspace.windows.at(
         std::string(kWatchListWindowId))
                                       .tables[std::string(kWatchListTableId)];
+    MigrateWatchListColumns(table);
     if (!std::ranges::any_of(table.columns, [](const ColumnState& column) {
             return column.id == "symbol";
         })) {
@@ -69,7 +99,15 @@ std::expected<void, WatchListDocumentError> EnsureWindow(
     if (existing == workspace.windows.end()) {
         table.columns.push_back({.id = "current_price", .order = 1,
                                  .width = 140.0f, .visible = true});
-        table.columns.push_back({.id = "change_from_close", .order = 2,
+        table.columns.push_back({.id = "trade_time", .order = 2,
+                                 .width = 170.0f, .visible = true});
+        table.columns.push_back({.id = "session_open", .order = 3,
+                                 .width = 120.0f, .visible = true});
+        table.columns.push_back({.id = "previous_close", .order = 4,
+                                 .width = 140.0f, .visible = true});
+        table.columns.push_back({.id = "change_from_open", .order = 5,
+                                 .width = 150.0f, .visible = true});
+        table.columns.push_back({.id = "change_from_open_percent", .order = 6,
                                  .width = 160.0f, .visible = true});
     } else if (workspace.watch_lists.empty() &&
                workspace.active_watch_list_id.empty() &&
@@ -78,7 +116,15 @@ std::expected<void, WatchListDocumentError> EnsureWindow(
         // optional columns, the resulting choice is retained.
         table.columns.push_back({.id = "current_price", .order = 1,
                                  .width = 140.0f, .visible = true});
-        table.columns.push_back({.id = "change_from_close", .order = 2,
+        table.columns.push_back({.id = "trade_time", .order = 2,
+                                 .width = 170.0f, .visible = true});
+        table.columns.push_back({.id = "session_open", .order = 3,
+                                 .width = 120.0f, .visible = true});
+        table.columns.push_back({.id = "previous_close", .order = 4,
+                                 .width = 140.0f, .visible = true});
+        table.columns.push_back({.id = "change_from_open", .order = 5,
+                                 .width = 150.0f, .visible = true});
+        table.columns.push_back({.id = "change_from_open_percent", .order = 6,
                                  .width = 160.0f, .visible = true});
     }
     return {};
@@ -134,8 +180,13 @@ std::expected<std::string, WatchListDocumentError> EnsureDefaultWatchList(
         workspace.watch_lists.push_back({
             .id = std::string(kWatchListDefaultId),
             .name = "Default",
-            .rows = {{.id = NewStableId("watch-list-row")}},
+            .rows = LegacyWatchListRows(workspace.watchlist),
         });
+        workspace.watchlist.clear();
+    } else if (default_document->rows.empty() &&
+               !workspace.watchlist.empty()) {
+        default_document->rows = LegacyWatchListRows(workspace.watchlist);
+        workspace.watchlist.clear();
     }
     workspace.active_watch_list_id = std::string(kWatchListDefaultId);
     return std::string(kWatchListDefaultId);
@@ -221,6 +272,21 @@ std::expected<std::string, WatchListDocumentError> AddWatchListRow(
     const std::string row_id = NewStableId("watch-list-row");
     document.rows.push_back({.id = row_id});
     return row_id;
+}
+
+std::expected<bool, WatchListDocumentError> RemoveEmptyWatchListRows(
+    WorkspaceState& workspace, std::string_view document_id) {
+    WatchListDocumentState* document = FindDocument(workspace, document_id);
+    if (document == nullptr)
+        return std::unexpected(
+            WatchListDocumentError{"watch list document does not exist"});
+    const auto empty_row = [](const WatchListRowState& row) {
+        return row.instrument_id.empty() && row.symbol.empty() &&
+               row.ticker_input.empty();
+    };
+    const std::size_t original_size = document->rows.size();
+    std::erase_if(document->rows, empty_row);
+    return original_size != document->rows.size();
 }
 
 bool EnsureWatchListTrailingEmptyRow(WatchListDocumentState& document) {

@@ -16,6 +16,7 @@
 #include <future>
 #include <condition_variable>
 #include <deque>
+#include <expected>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -44,6 +45,11 @@ public:
                  const std::vector<std::string>& symbols,
                  tradebox::core::MarketDataFeed feed =
                      tradebox::core::MarketDataFeed::Iex);
+    [[nodiscard]] std::expected<tradebox::core::MarketDataFeed, std::string>
+    ResolveMarketDataFeed(
+        const AlpacaCredentials& credentials,
+        tradebox::core::MarketDataFeed requested,
+        const std::vector<std::string>& symbols);
     void RefreshSymbols(const std::vector<std::string>& symbols);
     void RequestHistory(const std::string& symbol,
                         const std::string& timeframe = "1Day");

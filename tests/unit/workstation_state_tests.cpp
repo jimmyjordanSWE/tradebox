@@ -113,6 +113,10 @@ TEST(WorkstationState, ProfileRoundTripPreservesSemanticState) {
     WorkstationState source = WorkstationState::Defaults();
     source.profile.name = "Research";
     source.application.account_risk_per_trade_percent = 1.25f;
+    source.application.watch_list_strong_green_rgba = 0x12345678U;
+    source.application.watch_list_light_green_rgba = 0x23456789U;
+    source.application.watch_list_light_red_rgba = 0x3456789aU;
+    source.application.watch_list_strong_red_rgba = 0x456789abU;
     source.workspace.selected_symbol = "NVDA";
     source.workspace.bracket_drafts.emplace(
         "NVDA", BracketDraftState{.target_percent = 0.75f,
@@ -193,6 +197,12 @@ TEST(WorkstationState, ProfileRoundTripPreservesSemanticState) {
     EXPECT_EQ(decoded->profile.name, "Research");
     EXPECT_FLOAT_EQ(decoded->application.account_risk_per_trade_percent,
                     1.25f);
+    EXPECT_EQ(decoded->application.watch_list_strong_green_rgba,
+              0x12345678U);
+    EXPECT_EQ(decoded->application.watch_list_light_green_rgba,
+              0x23456789U);
+    EXPECT_EQ(decoded->application.watch_list_light_red_rgba, 0x3456789aU);
+    EXPECT_EQ(decoded->application.watch_list_strong_red_rgba, 0x456789abU);
     EXPECT_EQ(decoded->workspace.selected_symbol, "NVDA");
     ASSERT_TRUE(decoded->workspace.bracket_drafts.contains("NVDA"));
     ASSERT_EQ(decoded->workspace.asset_selection_history.size(), 2U);
@@ -327,6 +337,28 @@ TEST(WatchListDocuments, KeepsOneEmptyDraftRowAtTheEnd) {
     EXPECT_FALSE(EnsureWatchListTrailingEmptyRow(document));
 }
 
+TEST(WatchListDocuments, RemovesBlankRowsForExplicitAddRowUi) {
+    WorkstationState state = WorkstationState::Defaults();
+    state.workspace.watchlist.clear();
+    ASSERT_TRUE(EnsureDefaultWatchList(state.workspace));
+    const auto document = FindWatchListDocument(
+        state.workspace, kWatchListDefaultId);
+    ASSERT_NE(document, nullptr);
+    ASSERT_TRUE(AddWatchListRow(state.workspace, kWatchListDefaultId));
+    ASSERT_TRUE(AddWatchListRow(state.workspace, kWatchListDefaultId));
+    document->rows.front().symbol = "AAPL";
+    document->rows.front().instrument_id = "asset-aapl";
+
+    const auto removed = RemoveEmptyWatchListRows(
+        state.workspace, kWatchListDefaultId);
+    ASSERT_TRUE(removed);
+    EXPECT_TRUE(*removed);
+    ASSERT_EQ(document->rows.size(), 1U);
+    EXPECT_EQ(document->rows.front().symbol, "AAPL");
+    EXPECT_FALSE(*RemoveEmptyWatchListRows(
+        state.workspace, kWatchListDefaultId));
+}
+
 TEST(WatchListDocuments, InitializesAndAddsTableColumns) {
     WorkstationState state = WorkstationState::Defaults();
     const auto created = CreateWatchListDocument(state.workspace);
@@ -337,26 +369,26 @@ TEST(WatchListDocuments, InitializesAndAddsTableColumns) {
     const auto table = window->second.tables.find(
         std::string(kWatchListTableId));
     ASSERT_NE(table, window->second.tables.end());
-    ASSERT_EQ(table->second.columns.size(), 3U);
+    ASSERT_EQ(table->second.columns.size(), 7U);
     EXPECT_EQ(table->second.columns.front().id, "symbol");
 
     EXPECT_FALSE(AddWatchListColumn(
         state.workspace, *created, WatchListColumnKind::CurrentPrice));
     EXPECT_FALSE(AddWatchListColumn(
-        state.workspace, *created, WatchListColumnKind::ChangeFromClose));
+        state.workspace, *created, WatchListColumnKind::ChangeFromOpen));
     EXPECT_FALSE(AddWatchListColumn(
         state.workspace, *created, WatchListColumnKind::CurrentPrice));
-    ASSERT_EQ(table->second.columns.size(), 3U);
+    ASSERT_EQ(table->second.columns.size(), 7U);
     EXPECT_EQ(table->second.columns[1].id, "current_price");
-    EXPECT_EQ(table->second.columns[2].id, "change_from_close");
+    EXPECT_EQ(table->second.columns[5].id, "change_from_open");
 
     EXPECT_FALSE(RemoveWatchListColumn(
         state.workspace, *created, WatchListColumnKind::Symbol));
     ASSERT_TRUE(RemoveWatchListColumn(
         state.workspace, *created, WatchListColumnKind::CurrentPrice));
-    ASSERT_EQ(table->second.columns.size(), 2U);
+    ASSERT_EQ(table->second.columns.size(), 6U);
     EXPECT_EQ(table->second.columns[0].id, "symbol");
-    EXPECT_EQ(table->second.columns[1].id, "change_from_close");
+    EXPECT_EQ(table->second.columns[1].id, "trade_time");
 
     std::string error;
     EXPECT_TRUE(ValidateAndNormalize(state, error)) << error;
@@ -367,7 +399,24 @@ TEST(WatchListDocuments, InitializesAndAddsTableColumns) {
     ASSERT_NE(decoded_window, decoded->workspace.windows.end());
     EXPECT_EQ(decoded_window->second.tables.at(std::string(kWatchListTableId))
                   .columns.size(),
-              2U);
+              6U);
+}
+
+TEST(WatchListDocuments, MigratesCloseColumnsToOpenColumns) {
+    WorkstationState state = WorkstationState::Defaults();
+    ASSERT_TRUE(EnsureWatchListWindow(state.workspace));
+    auto& table = state.workspace.windows.at(std::string(kWatchListWindowId))
+                      .tables[std::string(kWatchListTableId)];
+    table.columns = {
+        {.id = "symbol", .order = 0, .width = 100.0f, .visible = true},
+        {.id = "change_from_close", .order = 1, .width = 120.0f,
+         .visible = true},
+    };
+
+    ASSERT_TRUE(EnsureWatchListWindow(state.workspace));
+    ASSERT_EQ(table.columns.size(), 2U);
+    EXPECT_EQ(table.columns[1].id, "change_from_open");
+    EXPECT_TRUE(FindWatchListColumn("change_from_open"));
 }
 
 TEST(WatchListDocuments, SavesAndManagesOneNamedDocumentLibrary) {
@@ -417,6 +466,12 @@ TEST(WatchListDocuments, ReusesOnePersistentDefaultWatchList) {
     EXPECT_EQ(*second, kWatchListDefaultId);
     ASSERT_EQ(state.workspace.watch_lists.size(), 1U);
     EXPECT_EQ(state.workspace.watch_lists.front().name, "Default");
+    ASSERT_EQ(state.workspace.watch_lists.front().rows.size(), 4U);
+    EXPECT_EQ(state.workspace.watch_lists.front().rows[0].ticker_input, "AMD");
+    EXPECT_EQ(state.workspace.watch_lists.front().rows[1].ticker_input, "AAPL");
+    EXPECT_EQ(state.workspace.watch_lists.front().rows[2].ticker_input, "NVDA");
+    EXPECT_EQ(state.workspace.watch_lists.front().rows[3].ticker_input, "SPY");
+    EXPECT_TRUE(state.workspace.watchlist.empty());
     EXPECT_EQ(state.workspace.active_watch_list_id, kWatchListDefaultId);
     EXPECT_TRUE(state.workspace.windows.empty());
     ASSERT_TRUE(OpenWatchListDocument(
@@ -424,6 +479,23 @@ TEST(WatchListDocuments, ReusesOnePersistentDefaultWatchList) {
     EXPECT_TRUE(state.workspace.windows.at(std::string(kWatchListWindowId)).open);
     EXPECT_FALSE(DeleteWatchListDocument(
         state.workspace, kWatchListDefaultId));
+}
+
+TEST(WatchListDocuments, MigratesLegacySymbolsOnlyOnce) {
+    WorkstationState state = WorkstationState::Defaults();
+    state.workspace.watchlist = {"AAPL", "MSFT"};
+    state.workspace.watch_lists.push_back({
+        .id = std::string(kWatchListDefaultId),
+        .name = "Default",
+    });
+
+    ASSERT_TRUE(EnsureDefaultWatchList(state.workspace));
+    const auto first = state.workspace.watch_lists.front().rows;
+    ASSERT_TRUE(EnsureDefaultWatchList(state.workspace));
+
+    ASSERT_EQ(state.workspace.watch_lists.size(), 1U);
+    EXPECT_EQ(state.workspace.watch_lists.front().rows.size(), first.size());
+    EXPECT_TRUE(state.workspace.watchlist.empty());
 }
 
 TEST(WatchListDocuments, DraftRowsUseStableIdentityAndCanBeEditedBeforeSaving) {

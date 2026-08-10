@@ -43,8 +43,10 @@ DeleteWatchListDocument(WorkspaceState& workspace,
 AddWatchListRow(WorkspaceState& workspace, std::string_view document_id);
 [[nodiscard]] std::expected<std::string, WatchListDocumentError>
 AddWatchListRow(WatchListDocumentState& document);
-// Maintains exactly one fully empty row at the end of a document. This is the
-// durable draft row used to add the next symbol.
+// Removes blank rows. The UI uses explicit Add Row instead of an implicit
+// trailing draft row.
+[[nodiscard]] std::expected<bool, WatchListDocumentError>
+RemoveEmptyWatchListRows(WorkspaceState& workspace, std::string_view document_id);
 [[nodiscard]] bool EnsureWatchListTrailingEmptyRow(
     WatchListDocumentState& document);
 [[nodiscard]] std::expected<void, WatchListDocumentError>

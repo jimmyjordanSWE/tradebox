@@ -295,7 +295,16 @@ std::string EncodeProfile(const WorkstationState& state) {
     output << "vsync_requested = " << (state.application.vsync_requested ? "true" : "false") << '\n';
     output << "maximum_frame_rate = " << state.application.maximum_frame_rate << '\n';
     output << "account_risk_per_trade_percent = "
-           << state.application.account_risk_per_trade_percent << "\n\n";
+           << state.application.account_risk_per_trade_percent << '\n';
+    output << "watch_list_strong_green_rgba = "
+           << static_cast<std::int64_t>(state.application.watch_list_strong_green_rgba) << '\n';
+    output << "watch_list_light_green_rgba = "
+           << static_cast<std::int64_t>(state.application.watch_list_light_green_rgba) << '\n';
+    output << "watch_list_light_red_rgba = "
+           << static_cast<std::int64_t>(state.application.watch_list_light_red_rgba) << '\n';
+    output << "watch_list_strong_red_rgba = "
+           << static_cast<std::int64_t>(state.application.watch_list_strong_red_rgba)
+           << "\n\n";
 
     output << "[native_window]\n";
     WriteRect(output, state.native_window.bounds);
@@ -501,6 +510,18 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
             state.application.account_risk_per_trade_percent = ValueOr(
                 *application, "account_risk_per_trade_percent",
                 state.application.account_risk_per_trade_percent);
+            state.application.watch_list_strong_green_rgba = static_cast<std::uint32_t>(
+                ValueOr(*application, "watch_list_strong_green_rgba",
+                        static_cast<std::int64_t>(state.application.watch_list_strong_green_rgba)));
+            state.application.watch_list_light_green_rgba = static_cast<std::uint32_t>(
+                ValueOr(*application, "watch_list_light_green_rgba",
+                        static_cast<std::int64_t>(state.application.watch_list_light_green_rgba)));
+            state.application.watch_list_light_red_rgba = static_cast<std::uint32_t>(
+                ValueOr(*application, "watch_list_light_red_rgba",
+                        static_cast<std::int64_t>(state.application.watch_list_light_red_rgba)));
+            state.application.watch_list_strong_red_rgba = static_cast<std::uint32_t>(
+                ValueOr(*application, "watch_list_strong_red_rgba",
+                        static_cast<std::int64_t>(state.application.watch_list_strong_red_rgba)));
         }
         if (const toml::table* native = root["native_window"].as_table()) {
             state.native_window.bounds = ReadRect(*native, state.native_window.bounds);

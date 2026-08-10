@@ -66,14 +66,16 @@ void PopulateWatchListDailyReferences(
                                                : &daily.bars.back();
     if (current == nullptr) return;
     row.session_open = current->open;
+    if (daily.previous_session_close) {
+        row.previous_close = *daily.previous_session_close;
+        return;
+    }
     for (auto bar = daily.bars.rbegin(); bar != daily.bars.rend(); ++bar) {
         if (bar->start_ns < current->start_ns) {
             row.previous_close = bar->close;
             return;
         }
     }
-    if (daily.previous_session_close)
-        row.previous_close = *daily.previous_session_close;
 }
 
 class CoreValuationMarketDataSink final
@@ -351,7 +353,7 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
         UiWatchListSnapshot projected{
             .document_id = watch_list.document_id,
         };
-        if (watch_list.needs_change_from_close && query.as_of_ns > 0)
+        if (watch_list.needs_change_from_open && query.as_of_ns > 0)
             projected.daily_range = WatchListDailyRange(query.as_of_ns);
         projected.rows.reserve(watch_list.rows.size());
         for (const UiWatchListRowQuery& row : watch_list.rows) {
@@ -364,9 +366,13 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
             if (live == nullptr && !row.symbol.empty())
                 live = result.markets.Find(row.symbol);
             if (live != nullptr && live->latest_price)
+            {
                 row_snapshot.current_price = live->latest_price->price;
+                row_snapshot.current_price_time_ns =
+                    live->latest_price->event_time_ns;
+            }
 
-            if (watch_list.needs_change_from_close &&
+            if (watch_list.needs_change_from_open &&
                 query.as_of_ns > 0 && !row.instrument_id.empty()) {
                 auto [daily_position, inserted] = daily_series.try_emplace(
                     row.instrument_id);
@@ -382,19 +388,18 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
                 row_snapshot.history_missing =
                     !daily.missing_ranges.empty();
                 PopulateWatchListDailyReferences(daily, row_snapshot);
-                if (!row_snapshot.current_price && daily.current_bar)
-                    row_snapshot.current_price = daily.current_bar->close;
                 if (row_snapshot.current_price && row_snapshot.previous_close) {
-                    row_snapshot.change_from_close =
-                        *row_snapshot.current_price - *row_snapshot.previous_close;
                     row_snapshot.change_from_previous_close_percent =
                         PercentageChange(*row_snapshot.current_price,
                                          *row_snapshot.previous_close);
                 }
-                if (row_snapshot.current_price && row_snapshot.session_open)
+                if (row_snapshot.current_price && row_snapshot.session_open) {
+                    row_snapshot.change_from_open =
+                        *row_snapshot.current_price - *row_snapshot.session_open;
                     row_snapshot.change_from_session_open_percent =
                         PercentageChange(*row_snapshot.current_price,
                                          *row_snapshot.session_open);
+                }
             }
             projected.rows.push_back(std::move(row_snapshot));
         }
@@ -592,13 +597,21 @@ TradingApplication::Connect(ConnectionRequest request) {
         request.api_key = std::move(saved.key);
         request.api_secret = std::move(saved.secret);
     }
+    AlpacaCredentials credentials(
+        request.api_key, request.api_secret,
+        request.environment == core::AccountEnvironment::Paper);
+    const auto selected_feed = impl_->broker.ResolveMarketDataFeed(
+        credentials, request.market_data_feed, request.market_symbols);
+    if (!selected_feed)
+        return std::unexpected(core::CoreError{
+            .code = core::CoreErrorCode::InvalidCommand,
+            .message = selected_feed.error(),
+        });
+    request.market_data_feed = *selected_feed;
     auto receipt = impl_->core.Submit(
         core::ConnectAccount{request.environment});
     if (!receipt || !receipt->accepted) return receipt;
 
-    AlpacaCredentials credentials(
-        request.api_key, request.api_secret,
-        request.environment == core::AccountEnvironment::Paper);
     ClearSensitiveString(request.api_key);
     ClearSensitiveString(request.api_secret);
     impl_->active_market_feed = request.market_data_feed;
@@ -713,6 +726,10 @@ void TradingApplication::RefreshAccountActivities() {
 
 core::RestTransportHealth TradingApplication::RestHealth() const {
     return impl_->broker.RestHealth();
+}
+
+core::MarketDataFeed TradingApplication::ActiveMarketDataFeed() const {
+    return impl_->active_market_feed;
 }
 
 core::MarketDataPipelineHealth

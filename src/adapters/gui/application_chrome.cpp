@@ -5,6 +5,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <utility>
@@ -23,22 +24,13 @@ struct CreationActions {
 };
 
 CreationActions DrawCreationMenu(
-    ImFont* regular_font, const workstation::WorkspaceState& state) {
+    ImFont* regular_font, const workstation::WorkspaceState& /*state*/) {
     CreationActions actions;
     if (!ImGui::BeginMenu("Add Window")) return actions;
 
     ImGui::PushFont(regular_font, 18.0f);
     if (ImGui::MenuItem("Chart", "")) actions.new_chart = true;
-    if (ImGui::BeginMenu("Watchlist")) {
-        for (const workstation::WatchListDocumentState& watch_list :
-             state.watch_lists) {
-            if (ImGui::MenuItem(watch_list.name.c_str()))
-                actions.open_watch_list_id = watch_list.id;
-        }
-        if (!state.watch_lists.empty()) ImGui::Separator();
-        if (ImGui::MenuItem("Add new...")) actions.new_watch_list = true;
-        ImGui::EndMenu();
-    }
+    if (ImGui::MenuItem("Watchlist", "")) actions.new_watch_list = true;
     if (ImGui::MenuItem("Positions", "")) actions.new_positions = true;
     if (ImGui::MenuItem("Orders", "")) actions.new_orders = true;
     if (ImGui::MenuItem("Debug", "")) actions.new_debug = true;
@@ -80,6 +72,26 @@ void DrawSettingsMenu(ImFont* regular_font,
             settings.account_risk_per_trade_percent, 0.01f, 100.0f);
         changed = true;
     }
+    ImGui::SeparatorText("Watch List Percentage Colours");
+    const auto edit_color = [&](const char* label, std::uint32_t& packed) {
+        ImVec4 color{
+            static_cast<float>((packed >> 24U) & 0xffU) / 255.0f,
+            static_cast<float>((packed >> 16U) & 0xffU) / 255.0f,
+            static_cast<float>((packed >> 8U) & 0xffU) / 255.0f,
+            static_cast<float>(packed & 0xffU) / 255.0f};
+        if (ImGui::ColorEdit4(label, &color.x,
+                              ImGuiColorEditFlags_AlphaBar)) {
+            packed = (static_cast<std::uint32_t>(color.x * 255.0f + 0.5f) << 24U) |
+                     (static_cast<std::uint32_t>(color.y * 255.0f + 0.5f) << 16U) |
+                     (static_cast<std::uint32_t>(color.z * 255.0f + 0.5f) << 8U) |
+                     static_cast<std::uint32_t>(color.w * 255.0f + 0.5f);
+            changed = true;
+        }
+    };
+    edit_color("Above +3%", settings.watch_list_strong_green_rgba);
+    edit_color("0% to +3%", settings.watch_list_light_green_rgba);
+    edit_color("0% to -3%", settings.watch_list_light_red_rgba);
+    edit_color("Below -3%", settings.watch_list_strong_red_rgba);
     ImGui::PopFont();
     ImGui::EndMenu();
 }
@@ -125,10 +137,7 @@ ChromeActions DrawApplicationChrome(
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0.0f, 0.0f));
     ChromeActions actions;
     if (ImGui::Begin("##tradebox_chrome", nullptr, flags)) {
-        const ImVec2 window_min = ImGui::GetWindowPos();
         const ImVec2 window_size = ImGui::GetWindowSize();
-        const ImVec2 window_max{window_min.x + window_size.x,
-                                window_min.y + window_size.y};
 
         ImGui::BeginMenuBar();
 
@@ -209,11 +218,6 @@ ChromeActions DrawApplicationChrome(
 
         ImGui::EndMenuBar();
 
-        ImDrawList* draw_list = ImGui::GetWindowDrawList();
-        draw_list->AddLine(
-            {window_min.x, window_max.y - 1.0f},
-            {window_max.x, window_max.y - 1.0f},
-            ImGui::GetColorU32(ImGuiCol_Border));
     }
     ImGui::End();
     ImGui::PopStyleVar(3);

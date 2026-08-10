@@ -82,6 +82,10 @@ struct ApplicationSettings {
     bool vsync_requested = true;
     int maximum_frame_rate = 120;
     float account_risk_per_trade_percent = 1.0f;
+    std::uint32_t watch_list_strong_green_rgba = 0x22d66fffU;
+    std::uint32_t watch_list_light_green_rgba = 0x7be6a0ffU;
+    std::uint32_t watch_list_light_red_rgba = 0xf08a8affU;
+    std::uint32_t watch_list_strong_red_rgba = 0xff3b30ffU;
 };
 
 struct AccountContext {

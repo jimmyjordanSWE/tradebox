@@ -48,6 +48,8 @@ std::vector<TradableAsset> SearchTradableAssets(
             return left.preference_rank < right.preference_rank;
         return left.asset->symbol < right.asset->symbol;
     });
+    if (!matches.empty() && matches.front().group == 0)
+        return {*matches.front().asset};
     std::vector<TradableAsset> result;
     for (const Match& match : matches) {
         if (result.size() == limit) break;
