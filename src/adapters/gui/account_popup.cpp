@@ -3,40 +3,16 @@
 #include "gui_controls.h"
 
 #include <algorithm>
-#include <iomanip>
-#include <sstream>
+#include <chrono>
+#include <cstdint>
+#include <format>
 
 namespace tradebox::gui {
 namespace {
 
-const char* EnvironmentLabel(core::AccountEnvironment environment) {
-    return environment == core::AccountEnvironment::Live ? "LIVE" : "PAPER";
-}
-
-std::string MaskApiKey(std::string_view key) {
-    if (key.empty()) return "Key unavailable";
-    if (key.size() <= 4) return std::string(key.size(), '*');
-    return std::string(key.substr(0, 2)) + "..." +
-           std::string(key.substr(key.size() - 2));
-}
-
 std::string AbbreviateAccountId(std::string_view id) {
     if (id.size() <= 8) return std::string(id);
     return std::format("{}...{}", id.substr(0, 4), id.substr(id.size() - 4));
-}
-
-std::string FormatMoney(const core::Decimal& value) {
-    std::ostringstream output;
-    output << std::fixed << std::setprecision(2) << value.ToDisplayDouble();
-    std::string text = output.str();
-    const std::size_t decimal = text.find('.');
-    std::size_t first = decimal == std::string::npos ? text.size() : decimal;
-    for (std::size_t position = first; position > 3;) {
-        position -= 3;
-        if (position > 0 && text[position - 1] == '-') continue;
-        text.insert(position, 1, ',');
-    }
-    return "$" + text;
 }
 
 void CopyText(std::array<char, 128>& destination, std::string_view value) {
@@ -76,10 +52,28 @@ AccountPopupAction DrawSavedAccountList(
     AccountPopupAction action = AccountPopupAction::None;
     static_cast<void>(saved_accounts_error);
     static_cast<void>(current_account_id);
-    ImGui::SeparatorText(environment == core::AccountEnvironment::Live
-                             ? "Live Accounts"
-                             : "Paper Accounts");
+    static_cast<void>(show_add_account);
 
+    // The first item of every environment section is the add-account entry,
+    // so an empty section (e.g. no live accounts saved) still offers it.
+    if (show_add_account) {
+        const char* label = environment == core::AccountEnvironment::Live
+                                ? "Add live account..."
+                                : "Add paper account...";
+        if (ImGui::MenuItem(label)) {
+            BeginAddAccount(state, environment);
+            ImGui::OpenPopup("##add_account_modal");
+            ImGui::CloseCurrentPopup();
+        }
+    }
+
+    const bool connecting =
+        snapshot.safety_status == core::SafetyStatus::Connecting;
+    const ImVec4 kConnectedGreen{0.25f, 0.85f, 0.35f, 1.0f};
+    const ImVec4 kConnectingAmber{0.95f, 0.75f, 0.25f, 1.0f};
+    const auto money = [](const core::Decimal& value) {
+        return std::format("${:.2f}", value.ToDisplayDouble());
+    };
     for (std::size_t index = 0; index < saved_accounts.size(); ++index) {
         const application::SavedAccountDescriptor& account =
             saved_accounts[index];
@@ -87,135 +81,175 @@ AccountPopupAction DrawSavedAccountList(
         const bool current =
             account.credential_slot == current_credential_slot &&
             account.environment == environment;
-        ImGui::PushID(static_cast<int>(index));
-        const bool expanded = current && connected;
-        const float card_height = expanded ? 235.0f : 72.0f;
-        ImGui::Indent(8.0f);
-        ImGui::PushStyleColor(ImGuiCol_ChildBg,
-                              expanded ? ImVec4(0.12f, 0.15f, 0.20f, 1.0f)
-                                       : ImVec4(0.09f, 0.10f, 0.13f, 1.0f));
-        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 7.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {10.0f, 8.0f});
-        const float card_width =
-            std::max(0.0f, ImGui::GetContentRegionAvail().x - 8.0f);
-        ImGui::BeginChild("##account_card", {card_width, card_height},
-                          ImGuiChildFlags_Borders,
-                          ImGuiWindowFlags_NoScrollbar |
-                              ImGuiWindowFlags_NoScrollWithMouse);
-        ImGui::SetWindowFontScale(1.15f);
-        ImGui::TextColored({0.92f, 0.92f, 0.96f, 1.0f}, "%s",
-                           account.credential_slot.c_str());
-        ImGui::SetWindowFontScale(1.0f);
-        if (expanded) {
-            ImGui::TextColored({0.25f, 0.85f, 0.35f, 1.0f}, "Connected");
-        }
-#if 0
-        if (expanded) {
-            ImGui::TextColored({0.25f, 0.85f, 0.35f, 1.0f},
-                               "Connected · %s",
-                               EnvironmentLabel(account.environment));
-        } else {
-            ImGui::TextDisabled("%s account",
-                                EnvironmentLabel(account.environment));
-        }
-#endif
-#if 0
-        ImGui::TextDisabled(
-            "%s · %s", EnvironmentLabel(account.environment),
-            MaskApiKey(account.api_key_id).c_str());
-#endif
-        ImGui::BeginDisabled(!application_available || (connected && !current));
-        if (current && connected) {
-            if (ImGui::Button("Disconnect")) {
-                state.selected_credential_slot = account.credential_slot;
-                state.selected_environment = account.environment;
-                state.request_disconnect_confirmation = true;
-                ImGui::CloseCurrentPopup();
-            }
-        } else {
-            if (ImGui::Button("Connect")) {
-                state.selected_credential_slot = account.credential_slot;
-                state.selected_environment = account.environment;
-                CopyText(state.account_name, account.credential_slot);
-                state.adding_account = false;
-                state.editing_name = false;
-                action = AccountPopupAction::Connect;
-                ImGui::CloseCurrentPopup();
-            }
-        }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!application_available);
-        if (ImGui::Button("Rename")) {
-            state.selected_credential_slot = account.credential_slot;
-            state.selected_environment = account.environment;
-            state.environment = account.environment;
-            CopyText(state.account_name, account.credential_slot);
-            state.adding_account = false;
-            state.editing_name = true;
-            state.message.clear();
-            action = AccountPopupAction::EditName;
-        }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!application_available);
-        if (ImGui::Button("Forget")) {
-            state.selected_credential_slot = account.credential_slot;
-            state.selected_environment = account.environment;
-            state.request_forget_confirmation = true;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndDisabled();
-        if (current && connected) {
-            if (snapshot.account) {
-                const auto& info = *snapshot.account;
-                ImGui::SetWindowFontScale(0.82f);
-                ImGui::TextDisabled("Account ID: %s",
-                                    AbbreviateAccountId(info.id).c_str());
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("%s\nClick to copy", info.id.c_str());
-                    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-                        ImGui::SetClipboardText(info.id.c_str());
-                }
-                ImGui::TextDisabled("Type: %s",
-                                    EnvironmentLabel(account.environment));
-                ImGui::TextDisabled("Currency: %s", info.currency.c_str());
-                ImGui::TextDisabled("Equity: %s", FormatMoney(info.equity).c_str());
-                ImGui::TextDisabled("Cash: %s", FormatMoney(info.cash).c_str());
-                ImGui::TextDisabled("Buying power: %s",
-                            FormatMoney(info.buying_power).c_str());
-                ImGui::TextDisabled("Portfolio value: %s",
-                            FormatMoney(info.portfolio_value).c_str());
-                ImGui::TextDisabled("Shorting: %s", info.shorting_enabled ? "Yes" : "No");
-                ImGui::SetWindowFontScale(1.0f);
-            }
-        }
-        ImGui::EndChild();
-        ImGui::PopStyleVar(2);
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
-        ImGui::Unindent(8.0f);
-        ImGui::PopID();
-    }
+        const bool is_connected = current && connected;
+        // Account data is REST truth fetched from /v2/account and is
+        // independent of the trade_updates stream, so a routine stream flap
+        // (idle timeout, transient network) must not hide it. Whenever account
+        // data is present for the current account, show it. "Connected" is
+        // only truthful when the stream is also authenticated; while the
+        // stream is reconnecting the data stays visible under an amber
+        // "Reconnecting" label.
+        const bool has_account = snapshot.account.has_value();
+        const bool show_account = current && has_account;
+        const bool show_connected = is_connected && has_account;
+        // The account-stream loop labels the flap state; only a Stale safety
+        // status means the stream dropped after a live session. Otherwise a
+        // data-bearing row without an authenticated stream is still in the
+        // initial connection window.
+        const bool stream_stale =
+            snapshot.safety_status == core::SafetyStatus::Stale;
 
-    if (show_add_account) {
-        const char* label = environment == core::AccountEnvironment::Live
-                                ? "Add live account"
-                                : "Add paper account";
-        if (ImGui::Button(label)) {
-            BeginAddAccount(state, environment);
-            ImGui::OpenPopup("##add_account_modal");
-            ImGui::CloseCurrentPopup();
+        ImGui::PushID(static_cast<int>(index));
+        // Every saved account is an expandable submenu. The connected one
+        // reads "name · Connected" in the list so it is identifiable at a
+        // glance even before expanding; while the stream is reconnecting it
+        // reads "name · Reconnecting" in amber with the data still visible.
+        std::string account_label = account.credential_slot;
+        if (show_account) {
+            const char* suffix = show_connected
+                                     ? " · Connected"
+                                     : (stream_stale ? " · Reconnecting"
+                                                     : " · Connecting");
+            account_label += suffix;
         }
+        if (show_account)
+            ImGui::PushStyleColor(
+                ImGuiCol_Text,
+                show_connected ? kConnectedGreen : kConnectingAmber);
+        const bool open = ImGui::BeginMenu(account_label.c_str());
+        if (show_account) ImGui::PopStyleColor();
+        if (open) {
+            if (show_account) {
+                if (show_connected)
+                    ImGui::TextColored(kConnectedGreen, "Connected");
+                else
+                    ImGui::TextColored(
+                        kConnectingAmber,
+                        stream_stale ? "Reconnecting..." : "Connecting...");
+                if (snapshot.account) {
+                    const auto& info = *snapshot.account;
+                    ImGui::Indent(22.0f);
+                    ImGui::TextDisabled("Account ID: %s",
+                                        AbbreviateAccountId(info.id).c_str());
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("%s\nClick to copy",
+                                          info.id.c_str());
+                        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                            ImGui::SetClipboardText(info.id.c_str());
+                    }
+                    ImGui::TextDisabled("Account #: %s",
+                                        info.account_number.c_str());
+                    ImGui::TextDisabled(
+                        "Type: %s",
+                        account.environment == core::AccountEnvironment::Live
+                            ? "Live"
+                            : "Paper");
+                    ImGui::TextDisabled("Currency: %s",
+                                        info.currency.c_str());
+                    ImGui::TextDisabled("Equity: %s",
+                                        money(info.equity).c_str());
+                    ImGui::TextDisabled("Cash: %s",
+                                        money(info.cash).c_str());
+                    ImGui::TextDisabled(
+                        "Buying power: %s", money(info.buying_power).c_str());
+                    ImGui::TextDisabled(
+                        "Portfolio value: %s",
+                        money(info.portfolio_value).c_str());
+                    ImGui::TextDisabled(
+                        "Long market value: %s",
+                        money(info.long_market_value).c_str());
+                    ImGui::TextDisabled(
+                        "Short market value: %s",
+                        money(info.short_market_value).c_str());
+                    ImGui::TextDisabled(
+                        "Shorting: %s", info.shorting_enabled ? "Yes" : "No");
+                    const std::int64_t now_ms =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now()
+                                .time_since_epoch())
+                            .count();
+                    const std::int64_t age_s = std::max<std::int64_t>(
+                        0, (now_ms - info.received_at_ms) / 1000);
+                    ImGui::TextDisabled(
+                        "Updated: %s",
+                        age_s < 60
+                            ? std::format("{} s ago", age_s).c_str()
+                            : std::format("{} min ago", age_s / 60).c_str());
+                    ImGui::Unindent(22.0f);
+                } else {
+                    ImGui::TextDisabled("Account data not loaded yet");
+                }
+                ImGui::Separator();
+                ImGui::BeginDisabled(!application_available);
+                if (ImGui::Button("Disconnect", {-1.0f, 0.0f})) {
+                    state.selected_credential_slot = account.credential_slot;
+                    state.selected_environment = account.environment;
+                    state.request_disconnect_confirmation = true;
+                    ImGui::CloseCurrentPopup();
+                }
+                if (ImGui::MenuItem("Rename")) {
+                    state.selected_credential_slot = account.credential_slot;
+                    state.selected_environment = account.environment;
+                    state.environment = account.environment;
+                    CopyText(state.account_name, account.credential_slot);
+                    state.adding_account = false;
+                    state.editing_name = true;
+                    state.message.clear();
+                    action = AccountPopupAction::EditName;
+                }
+                if (ImGui::MenuItem("Forget")) {
+                    state.selected_credential_slot = account.credential_slot;
+                    state.selected_environment = account.environment;
+                    state.request_forget_confirmation = true;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndDisabled();
+            } else {
+                if (current && connecting)
+                    ImGui::TextColored(kConnectingAmber, "Connecting...");
+                ImGui::BeginDisabled(!application_available);
+                if (ImGui::MenuItem("Connect")) {
+                    state.selected_credential_slot = account.credential_slot;
+                    state.selected_environment = account.environment;
+                    CopyText(state.account_name, account.credential_slot);
+                    state.adding_account = false;
+                    state.editing_name = false;
+                    action = AccountPopupAction::Connect;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SetItemTooltip(
+                    "Connecting switches to this account (one connection at a "
+                    "time)");
+                if (ImGui::MenuItem("Rename")) {
+                    state.selected_credential_slot = account.credential_slot;
+                    state.selected_environment = account.environment;
+                    state.environment = account.environment;
+                    CopyText(state.account_name, account.credential_slot);
+                    state.adding_account = false;
+                    state.editing_name = true;
+                    state.message.clear();
+                    action = AccountPopupAction::EditName;
+                }
+                if (ImGui::MenuItem("Forget")) {
+                    state.selected_credential_slot = account.credential_slot;
+                    state.selected_environment = account.environment;
+                    state.request_forget_confirmation = true;
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndDisabled();
+            }
+            ImGui::EndMenu();
+        }
+        ImGui::PopID();
     }
     return action;
 }
 
 }  // namespace
 
-AccountPopupAction DrawAccountPopup(
-    ImFont* regular_font, const char* id, ImVec2 anchor,
-    const core::CoreSnapshot& snapshot, bool application_available,
+AccountPopupAction DrawAccountMenu(
+    ImFont* regular_font, const core::CoreSnapshot& snapshot,
+    bool application_available,
     const std::vector<application::SavedAccountDescriptor>& saved_accounts,
     std::string_view saved_accounts_error,
     std::string_view current_credential_slot,
@@ -233,9 +267,7 @@ AccountPopupAction DrawAccountPopup(
     if (state.adding_account) ImGui::OpenPopup("##add_account_modal");
 
     AccountPopupAction action = AccountPopupAction::None;
-    ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, {0.0f, 0.0f});
-    ImGui::SetNextWindowSizeConstraints({380.0f, 0.0f}, {560.0f, 560.0f});
-    if (ImGui::BeginPopup(id)) {
+    if (ImGui::BeginMenu("Accounts")) {
         ImGui::PushFont(regular_font, 18.0f);
         if (!state.initialized) {
             state.selected_credential_slot = std::string(current_credential_slot);
@@ -269,21 +301,23 @@ AccountPopupAction DrawAccountPopup(
                 std::string(current_credential_slot);
             state.selected_environment = snapshot.environment;
             }
-            const auto live_action = DrawSavedAccountList(
-                saved_accounts, saved_accounts_error, application_available,
-                core::AccountEnvironment::Live, snapshot.authenticated,
-                current_credential_slot, current_account_id, snapshot, true,
-                state);
+            ImGui::SeparatorText("Paper");
             const auto paper_action = DrawSavedAccountList(
                 saved_accounts, saved_accounts_error, application_available,
                 core::AccountEnvironment::Paper, snapshot.authenticated,
+                current_credential_slot, current_account_id, snapshot, true,
+                state);
+            ImGui::SeparatorText("Live");
+            const auto live_action = DrawSavedAccountList(
+                saved_accounts, saved_accounts_error, application_available,
+                core::AccountEnvironment::Live, snapshot.authenticated,
                 current_credential_slot, current_account_id, snapshot, true,
                 state);
             action = live_action != AccountPopupAction::None ? live_action
                                                                : paper_action;
             }
         ImGui::PopFont();
-        ImGui::EndPopup();
+        ImGui::EndMenu();
     }
 
     ImGui::SetNextWindowSizeConstraints({360.0f, 0.0f}, {480.0f, 360.0f});

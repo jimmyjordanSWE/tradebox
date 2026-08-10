@@ -8,6 +8,7 @@
 #include <charconv>
 #include <limits>
 #include <optional>
+#include <unordered_set>
 
 namespace tradebox::broker::alpaca {
 namespace {
@@ -85,23 +86,62 @@ public:
     }
 
     ~WinHttpRestExecutor() override {
-        for (const auto& [host, connection] : connections_) {
+        Abort();
+    }
+
+    void Abort() override {
+        std::unordered_set<HINTERNET> requests_to_close;
+        std::unordered_map<std::string, HINTERNET> connections_to_close;
+        HINTERNET session_to_close = nullptr;
+        {
+            std::scoped_lock lock(connections_mutex_);
+            session_to_close = session_;
+            session_ = nullptr;
+            connections_to_close = std::move(connections_);
+            connections_.clear();
+            requests_to_close = std::move(in_flight_requests_);
+            in_flight_requests_.clear();
+        }
+        // Closing a request handle aborts its pending WinHttpSendRequest /
+        // WinHttpReceiveResponse / WinHttpReadData with
+        // ERROR_WINHTTP_OPERATION_CANCELLED, so worker threads blocked inside
+        // Execute() return promptly. Closing only the session does NOT abort
+        // them: WinHTTP reference-counts handles, so pending I/O keeps waiting
+        // forever (the disconnect hang this guards against). The request
+        // handle ownership transfers to this set while in flight, so Execute()
+        // never double-closes a handle Abort already took.
+        for (HINTERNET request : requests_to_close)
+            if (request) WinHttpCloseHandle(request);
+        for (const auto& [host, connection] : connections_to_close) {
             static_cast<void>(host);
             if (connection) WinHttpCloseHandle(connection);
         }
-        if (session_) WinHttpCloseHandle(session_);
+        if (session_to_close) WinHttpCloseHandle(session_to_close);
     }
 
     RestResponse Execute(const RestRequest& input) override {
         RestResponse result;
-        if (!session_) {
-            result.error = "WinHTTP session is unavailable";
-            return result;
-        }
         const std::wstring host = Wide(input.host);
         HINTERNET connection = nullptr;
         {
+            // Abort() closes the shared session on fast disconnect/shutdown.
+            // Recreate it lazily under the connection lock so the transport
+            // survives connect cycles instead of staying bricked until the
+            // process exits.
             std::scoped_lock lock(connections_mutex_);
+            if (!session_) {
+                session_ = WinHttpOpen(
+                    L"TradeBoxNative/1.0",
+                    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+                if (session_)
+                    WinHttpSetTimeouts(
+                        session_, 5000, 5000, 10000, 10000);
+            }
+            if (!session_) {
+                result.error = "WinHTTP session is unavailable";
+                return result;
+            }
             auto& cached = connections_[input.host];
             if (!cached)
                 cached = WinHttpConnect(
@@ -110,13 +150,20 @@ public:
         }
         const std::wstring method = Wide(input.method);
         const std::wstring path = Wide(input.path);
-        HINTERNET request =
-            connection
-                ? WinHttpOpenRequest(
-                      connection, method.c_str(), path.c_str(), nullptr,
-                      WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                      WINHTTP_FLAG_SECURE)
-                : nullptr;
+        HINTERNET request = nullptr;
+        {
+            // Register the request before releasing the connection lock.
+            // Otherwise Abort() can run between WinHttpOpenRequest() and the
+            // registration, miss the handle, and leave a worker blocked in
+            // WinHTTP while Disconnect() waits to join it.
+            std::scoped_lock lock(connections_mutex_);
+            if (connection)
+                request = WinHttpOpenRequest(
+                    connection, method.c_str(), path.c_str(), nullptr,
+                    WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                    WINHTTP_FLAG_SECURE);
+            if (request) in_flight_requests_.insert(request);
+        }
         std::wstring key = Wide(input.api_key.Value());
         std::wstring secret = Wide(input.api_secret.Value());
         std::wstring headers = L"APCA-API-KEY-ID: ";
@@ -222,7 +269,14 @@ public:
             }
         }
         ClearWide(headers);
-        if (request) WinHttpCloseHandle(request);
+        bool owns_request = false;
+        if (request) {
+            // If Abort() took the handle, it owns the close now; otherwise
+            // erase it from the in-flight set and close it here.
+            std::scoped_lock lock(connections_mutex_);
+            owns_request = in_flight_requests_.erase(request) != 0;
+        }
+        if (owns_request) WinHttpCloseHandle(request);
         return result;
     }
 
@@ -230,6 +284,10 @@ private:
     HINTERNET session_ = nullptr;
     std::mutex connections_mutex_;
     std::unordered_map<std::string, HINTERNET> connections_;
+    // Request handles currently executing. Abort() moves them out and closes
+    // them so a blocked WinHttpSendRequest/WinHttpReceiveResponse/
+    // WinHttpReadData fails immediately instead of waiting forever.
+    std::unordered_set<HINTERNET> in_flight_requests_;
 };
 
 std::string CoalesceKey(const RestRequest& request) {
@@ -296,6 +354,11 @@ AlpacaRestTransport::~AlpacaRestTransport() {
         }
         health_.queued = 0;
     }
+    // Interrupt an in-flight executor operation before joining transport
+    // workers. The executor owns the actual WinHTTP handles; waiting for the
+    // worker first would make transport destruction depend on network
+    // timeouts.
+    executor_->Abort();
     ready_.notify_all();
     for (auto& worker : workers_)
         if (worker.joinable()) worker.join();
@@ -313,6 +376,11 @@ std::shared_future<RestResponse> AlpacaRestTransport::Submit(
         pending->promise.set_value(
             {.error = "REST transport is shutting down"});
         ++health_.rejected;
+        return pending->future;
+    }
+    if (aborted_) {
+        pending->promise.set_value({.error = "REST request canceled"});
+        ++health_.canceled;
         return pending->future;
     }
     if (!pending->coalesce_key.empty()) {
@@ -359,6 +427,46 @@ void AlpacaRestTransport::CancelPending() {
             --health_.queued;
         }
     }
+    ready_.notify_all();
+}
+
+void AlpacaRestTransport::Abort() {
+    // Close the WinHTTP session so all in-flight operations abort immediately
+    // (worker threads blocked inside executor_->Execute() return promptly with
+    // an error) and cancel every queued request. The transport itself is NOT
+    // stopped: AlpacaService::Connect() runs Disconnect() before establishing
+    // a new connection, and the executor recreates its session lazily, so the
+    // shared transport must stay usable across connect cycles. Only the
+    // destructor sets stopping_.
+    {
+        std::scoped_lock lock(mutex_);
+        // Mark the transport aborted before touching the executor. A
+        // background task can submit from another thread while the executor
+        // is being interrupted; those submissions must be rejected instead
+        // of starting a new request that Disconnect() would then have to
+        // wait for.
+        aborted_ = true;
+        ++cancel_generation_;
+        for (auto& queue : queues_) {
+            while (!queue.empty()) {
+                auto pending = std::move(queue.front());
+                queue.pop_front();
+                FinishLocked(pending,
+                             {.error = "REST request canceled"});
+                ++health_.canceled;
+            }
+        }
+        health_.queued = 0;
+    }
+    executor_->Abort();
+    ready_.notify_all();
+}
+
+void AlpacaRestTransport::Resume() {
+    std::scoped_lock lock(mutex_);
+    if (stopping_) return;
+    aborted_ = false;
+    ++cancel_generation_;
     ready_.notify_all();
 }
 

@@ -137,6 +137,18 @@ set "TEST_FLAG=-DBUILD_TESTING=OFF"
 if /i "!RUN_TESTS!"=="test" set "TEST_FLAG=-DBUILD_TESTING=ON"
 
 rem ---- configure and build ------------------------------------------------------
+set "RUNNING_APP="
+for /f "tokens=1" %%P in ('tasklist /FI "IMAGENAME eq TradeBoxNative.exe" /FO CSV /NH 2^>nul ^| find /I "TradeBoxNative.exe"') do if not defined RUNNING_APP set "RUNNING_APP=%%~P"
+if defined RUNNING_APP (
+  echo [build] Stopping running TradeBoxNative.exe, PID !RUNNING_APP! ...
+  taskkill /PID !RUNNING_APP! /T /F >nul 2>&1
+  if errorlevel 1 (
+    echo [build] ERROR: could not stop TradeBoxNative.exe.
+    exit /b 7
+  )
+  rem Give Windows a moment to release the executable and dependent files.
+  ping 127.0.0.1 -n 2 >nul
+)
 echo [build] Configuring (Ninja, !BUILD_CONFIG!) ...
 "%CMAKE_EXE%" -S . -B build -G Ninja !FRESH! !TEST_FLAG! -DCMAKE_BUILD_TYPE=!BUILD_CONFIG! -DCMAKE_C_COMPILER="!CL_EXE!" -DCMAKE_CXX_COMPILER="!CL_EXE!" -DCMAKE_MAKE_PROGRAM="!NINJA!"
 if errorlevel 1 exit /b 7

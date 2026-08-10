@@ -42,9 +42,9 @@ struct AccountPopupState {
     std::string message;
 };
 
-[[nodiscard]] AccountPopupAction DrawAccountPopup(
-    ImFont* regular_font, const char* id, ImVec2 anchor,
-    const core::CoreSnapshot& snapshot, bool application_available,
+[[nodiscard]] AccountPopupAction DrawAccountMenu(
+    ImFont* regular_font, const core::CoreSnapshot& snapshot,
+    bool application_available,
     const std::vector<application::SavedAccountDescriptor>& saved_accounts,
     std::string_view saved_accounts_error,
     std::string_view current_credential_slot,

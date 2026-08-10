@@ -601,6 +601,7 @@ void AlpacaService::Connect(AlpacaCredentials credentials,
                             tradebox::core::MarketDataFeed feed) {
     std::scoped_lock lifecycle_lock(lifecycle_mutex_);
     Disconnect();
+    rest_transport_.Resume();
     const std::uint64_t generation = generation_counter_.fetch_add(1) + 1;
     active_generation_ = generation;
     PublishCoreEvent(tradebox::core::BrokerEvent{
@@ -1346,6 +1347,12 @@ void AlpacaService::Disconnect() {
     connected_ = false;
     account_connected_ = false;
     rest_transport_.CancelPending();
+    // Abort the REST transport's WinHTTP session so that all in-flight HTTP
+    // operations fail immediately. This prevents AccountRefreshLoop,
+    // MarketClockLoop, and transport worker threads from blocking on slow
+    // network calls during shutdown (which could otherwise take 10-20 seconds
+    // due to WinHTTP timeouts).
+    rest_transport_.Abort();
     HINTERNET socket = websocket_.exchange(nullptr);
     if (socket) WinHttpCloseHandle(socket);
     HINTERNET account_socket = account_websocket_.exchange(nullptr);

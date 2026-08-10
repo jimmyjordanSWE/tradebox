@@ -129,3 +129,6 @@ A desktop application that connects to Alpaca, displays real-time market data on
 | 2026-08-07 | — | PLAN.md created | ✅ |
 | 2026-08-07 | 1.1 | Order ticket window GUI (header, impl, CMake, main.cpp registration) | ✅ |
 | 2026-08-07 | — | Committed: phase-1.1 order ticket window | ✅ |
+| 2026-08-07 | — | Fixed shutdown hang: added `Abort()` to REST transport to cancel in-flight HTTP operations immediately, preventing 10-20s block on thread join | ✅ |
+| 2026-08-10 | — | Fixed account menu: routine stream flap (`Disconnected`) no longer wipes the REST account snapshot; UI shows account data whenever present and labels reconnecting properly | ✅ |
+| 2026-08-10 | — | Fixed REST transport bricking: `Connect()`→`Disconnect()`→`Abort()` permanently set `stopping_` and destroyed the WinHTTP session, so all REST fetches (account/positions/orders/clock) failed after the first connect; Abort is now a fast cancel only, and the session is recreated lazily | ✅ |

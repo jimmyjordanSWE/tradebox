@@ -103,6 +103,7 @@ class IRestExecutor {
 public:
     virtual ~IRestExecutor() = default;
     virtual RestResponse Execute(const RestRequest& request) = 0;
+    virtual void Abort() {}
 };
 
 std::unique_ptr<IRestExecutor> CreateWinHttpRestExecutor();
@@ -122,6 +123,8 @@ public:
     std::shared_future<RestResponse> Submit(RestRequest request);
     RestResponse Execute(RestRequest request);
     void CancelPending();
+    void Abort();
+    void Resume();
     tradebox::core::RestTransportHealth Health() const;
 
 private:
@@ -147,6 +150,7 @@ private:
     std::uint64_t next_sequence_ = 1;
     std::uint64_t cancel_generation_ = 0;
     std::size_t non_command_in_flight_ = 0;
+    bool aborted_ = false;
     bool stopping_ = false;
 };
 

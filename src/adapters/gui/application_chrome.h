@@ -18,7 +18,6 @@ namespace tradebox::gui {
 struct ChromeMetrics {
     int title_bar_height = 35;
     int control_width = 46;
-    int tool_width = 40;
     int interactive_left_width = 0;
 };
 
@@ -31,6 +30,7 @@ struct GuiFonts {
         0xe8b8, 0xe8b8, 0xf20b, 0xf20b, 0xe145, 0xe145,
         0xe8f4, 0xe8f5, 0};
 };
+
 
 struct ChromeActions {
     AccountPopupAction account = AccountPopupAction::None;

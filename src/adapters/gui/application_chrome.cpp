@@ -5,28 +5,53 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <utility>
 
 namespace tradebox::gui {
 namespace {
 
-ImVec4 AccountIconColor(const core::CoreSnapshot& snapshot) {
-    if (snapshot.authenticated)
-        return {0.25f, 0.78f, 0.42f, 1.0f};
-    if (snapshot.safety_status == core::SafetyStatus::Error ||
-        snapshot.safety_status == core::SafetyStatus::Stale)
-        return {0.95f, 0.62f, 0.16f, 1.0f};
-    return {0.60f, 0.62f, 0.66f, 1.0f};
+struct CreationActions {
+    bool new_chart = false;
+    bool new_watch_list = false;
+    bool new_positions = false;
+    bool new_orders = false;
+    std::optional<std::string> open_watch_list_id;
+    bool new_debug = false;
+    bool imgui_demo = false;
+};
+
+CreationActions DrawCreationMenu(
+    ImFont* regular_font, const workstation::WorkspaceState& state) {
+    CreationActions actions;
+    if (!ImGui::BeginMenu("Add Window")) return actions;
+
+    ImGui::PushFont(regular_font, 18.0f);
+    if (ImGui::MenuItem("Chart", "")) actions.new_chart = true;
+    if (ImGui::BeginMenu("Watchlist")) {
+        for (const workstation::WatchListDocumentState& watch_list :
+             state.watch_lists) {
+            if (ImGui::MenuItem(watch_list.name.c_str()))
+                actions.open_watch_list_id = watch_list.id;
+        }
+        if (!state.watch_lists.empty()) ImGui::Separator();
+        if (ImGui::MenuItem("Add new...")) actions.new_watch_list = true;
+        ImGui::EndMenu();
+    }
+    if (ImGui::MenuItem("Positions", "")) actions.new_positions = true;
+    if (ImGui::MenuItem("Orders", "")) actions.new_orders = true;
+    if (ImGui::MenuItem("Debug", "")) actions.new_debug = true;
+    if (ImGui::MenuItem("ImGui Demo", "")) actions.imgui_demo = true;
+    ImGui::PopFont();
+    ImGui::EndMenu();
+    return actions;
 }
 
-void DrawSettingsPopup(
-    ImFont* regular_font, const char* id, ImVec2 anchor,
-    workstation::ApplicationSettings& settings, bool& auto_connect,
-    bool& changed) {
-    ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, {0.0f, 0.0f});
-    ImGui::SetNextWindowSizeConstraints({250.0f, 0.0f}, {360.0f, 640.0f});
-    if (!ImGui::BeginPopup(id)) return;
+void DrawSettingsMenu(ImFont* regular_font,
+                      workstation::ApplicationSettings& settings,
+                      bool& auto_connect, bool& changed) {
+    if (!ImGui::BeginMenu("Settings")) return;
 
     ImGui::PushFont(regular_font, 18.0f);
     if (ImGui::Checkbox("Auto connect last used account", &auto_connect))
@@ -56,53 +81,7 @@ void DrawSettingsPopup(
         changed = true;
     }
     ImGui::PopFont();
-    ImGui::EndPopup();
-}
-
-struct CreationActions {
-    bool new_chart = false;
-    bool new_watch_list = false;
-    bool new_positions = false;
-    bool new_orders = false;
-    std::optional<std::string> open_watch_list_id;
-    bool new_debug = false;
-    bool imgui_demo = false;
-};
-
-CreationActions DrawCreationPopup(ImFont* regular_font, const char* id,
-                                  ImVec2 anchor,
-                                  const workstation::WorkspaceState& state) {
-    ImGui::SetNextWindowPos(anchor, ImGuiCond_Appearing, {0.0f, 0.0f});
-    ImGui::SetNextWindowSizeConstraints({220.0f, 0.0f}, {320.0f, 320.0f});
-    if (!ImGui::BeginPopup(id)) return {};
-
-    ImGui::PushFont(regular_font, 18.0f);
-    const bool new_chart = ImGui::MenuItem("Chart", "");
-    bool new_watch_list = false;
-    bool new_positions = false;
-    bool new_orders = false;
-    std::optional<std::string> open_watch_list_id;
-    if (ImGui::BeginMenu("Watchlist")) {
-        for (const workstation::WatchListDocumentState& watch_list :
-             state.watch_lists) {
-            if (ImGui::MenuItem(watch_list.name.c_str()))
-                open_watch_list_id = watch_list.id;
-        }
-        if (!state.watch_lists.empty()) ImGui::Separator();
-        new_watch_list = ImGui::MenuItem("Add new...");
-        ImGui::EndMenu();
-    }
-    new_positions = ImGui::MenuItem("Positions", "");
-    new_orders = ImGui::MenuItem("Orders", "");
-    const bool new_debug = ImGui::MenuItem("Debug", "");
-    const bool imgui_demo = ImGui::MenuItem("ImGui Demo", "");
-    if (new_chart || new_watch_list || open_watch_list_id.has_value() ||
-        new_positions || new_orders || new_debug || imgui_demo)
-        ImGui::CloseCurrentPopup();
-    ImGui::PopFont();
-    ImGui::EndPopup();
-    return {new_chart, new_watch_list, new_positions, new_orders,
-            std::move(open_watch_list_id), new_debug, imgui_demo};
+    ImGui::EndMenu();
 }
 
 }  // namespace
@@ -121,24 +100,24 @@ ChromeActions DrawApplicationChrome(
     const workstation::WorkspaceState& workspace_state,
     workstation::ApplicationSettings& application_settings, bool& done) {
     ImGuiViewport* viewport = ImGui::GetMainViewport();
-    metrics.title_bar_height = 35;
+    // The chrome window is sized to exactly the menu bar height; sizing it to
+    // GetFrameHeightWithSpacing() would leave a visible gap between the menu
+    // bar and the border line below it.
+    metrics.title_bar_height = static_cast<int>(ImGui::GetFrameHeight());
     metrics.control_width = 46;
-    metrics.tool_width = 40;
     const float row_height = static_cast<float>(metrics.title_bar_height);
     viewport->WorkPos = {viewport->Pos.x, viewport->Pos.y + row_height};
     viewport->WorkSize = {
         viewport->Size.x, std::max(0.0f, viewport->Size.y - row_height)};
     const float caption_controls_width =
         static_cast<float>(metrics.control_width * 3);
-    const float tool_controls_width =
-        static_cast<float>(metrics.tool_width * 3);
-    metrics.interactive_left_width = static_cast<int>(tool_controls_width);
 
     const ImGuiWindowFlags flags =
         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus |
-        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_MenuBar;
     ImGui::SetNextWindowPos(viewport->Pos, ImGuiCond_Always);
     ImGui::SetNextWindowSize({viewport->Size.x, row_height}, ImGuiCond_Always);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
@@ -150,50 +129,20 @@ ChromeActions DrawApplicationChrome(
         const ImVec2 window_size = ImGui::GetWindowSize();
         const ImVec2 window_max{window_min.x + window_size.x,
                                 window_min.y + window_size.y};
-        ImDrawList* draw_list = ImGui::GetWindowDrawList();
-        draw_list->AddRectFilled(
-            window_min, window_max, ImGui::GetColorU32(ImGuiCol_MenuBarBg));
-        draw_list->AddLine(
-            {window_min.x, window_max.y - 1.0f},
-            {window_max.x, window_max.y - 1.0f},
-            ImGui::GetColorU32(ImGuiCol_Border));
 
-        ImGui::SetCursorPos({0.0f, 0.0f});
-        const ImVec2 tool_size{
-            static_cast<float>(metrics.tool_width), row_height};
-        const bool account_clicked = DrawTitleBarToolButton(
-            "##account", 0xf20b, fonts.icons, tool_size,
-            ImGui::GetColorU32(AccountIconColor(snapshot)));
-        const ImVec2 account_anchor = ImGui::GetItemRectMax();
-        ImGui::SameLine(0.0f, 0.0f);
-        const bool settings_clicked = DrawTitleBarToolButton(
-            "##settings", 0xe8b8, fonts.icons, tool_size,
-            ImGui::GetColorU32(ImGuiCol_Text));
-        ImGui::SameLine(0.0f, 0.0f);
-        const bool create_clicked = DrawTitleBarToolButton(
-            "##create", 0xe145, fonts.icons, tool_size,
-            ImGui::GetColorU32(ImGuiCol_Text));
+        ImGui::BeginMenuBar();
 
-        if (account_clicked) ImGui::OpenPopup("##account_menu");
-        if (settings_clicked) ImGui::OpenPopup("##settings_menu");
-        if (create_clicked) ImGui::OpenPopup("##create_menu");
-        const ImVec2 left_menu_anchor{window_min.x, account_anchor.y};
-        actions.account = DrawAccountPopup(
-            fonts.regular, "##account_menu", left_menu_anchor, snapshot,
-            application_available, saved_accounts, saved_accounts_error,
-            current_credential_slot, current_environment, current_account_id,
-            fonts.icons,
+        actions.account = DrawAccountMenu(
+            fonts.regular, snapshot, application_available, saved_accounts,
+            saved_accounts_error, current_credential_slot,
+            current_environment, current_account_id, fonts.icons,
             account_popup);
-        DrawSettingsPopup(fonts.regular, "##settings_menu", left_menu_anchor,
-                          application_settings,
-                          auto_connect,
-                          actions.settings_changed);
-        const CreationActions creation_actions = DrawCreationPopup(
-            fonts.regular, "##create_menu",
-            {window_min.x + tool_controls_width -
-                 static_cast<float>(metrics.tool_width),
-             account_anchor.y},
-            workspace_state);
+        bool settings_changed = false;
+        DrawSettingsMenu(fonts.regular, application_settings, auto_connect,
+                         settings_changed);
+        actions.settings_changed = settings_changed;
+        const CreationActions creation_actions =
+            DrawCreationMenu(fonts.regular, workspace_state);
         actions.new_chart = creation_actions.new_chart;
         actions.new_watch_list = creation_actions.new_watch_list;
         actions.new_positions = creation_actions.new_positions;
@@ -202,7 +151,10 @@ ChromeActions DrawApplicationChrome(
         actions.new_debug = creation_actions.new_debug;
         actions.imgui_demo = creation_actions.imgui_demo;
 
-        ImGui::SetCursorPos({window_size.x - caption_controls_width, 0.0f});
+        metrics.interactive_left_width =
+            static_cast<int>(ImGui::GetCursorPosX());
+
+        ImGui::SetCursorPosX(window_size.x - caption_controls_width);
         const ImVec2 button_size{
             static_cast<float>(metrics.control_width), row_height};
         if (DrawChromeButton(
@@ -243,22 +195,25 @@ ChromeActions DrawApplicationChrome(
         const float title_gap = environment_title.empty() ? 0.0f : 12.0f;
         const float title_width =
             time_size.x + title_gap + environment_size.x;
-        const float title_x =
-            window_min.x + (window_size.x - title_width) * 0.5f;
-        draw_list->AddText(
-            ImGui::GetFont(), ImGui::GetFontSize(),
-            {title_x, window_min.y + (row_height - time_size.y) * 0.5f},
-            ImGui::GetColorU32(ImGuiCol_Text), time_title.c_str());
+        ImGui::SetCursorPosX((window_size.x - title_width) * 0.5f);
+        ImGui::TextUnformatted(time_title.c_str());
         if (!environment_title.empty()) {
-            draw_list->AddText(
-                ImGui::GetFont(), ImGui::GetFontSize(),
-                {title_x + time_size.x + title_gap,
-                 window_min.y + (row_height - environment_size.y) * 0.5f},
-                live_account ? ImGui::GetColorU32(ImGuiCol_PlotLinesHovered)
-                             : ImGui::GetColorU32(ImGuiCol_TextDisabled),
-                environment_title.c_str());
+            ImGui::SameLine(0.0f, title_gap);
+            ImGui::TextColored(
+                live_account
+                    ? ImVec4{0.30f, 0.85f, 0.40f, 1.0f}
+                    : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled),
+                "%s", environment_title.c_str());
         }
         ImGui::PopFont();
+
+        ImGui::EndMenuBar();
+
+        ImDrawList* draw_list = ImGui::GetWindowDrawList();
+        draw_list->AddLine(
+            {window_min.x, window_max.y - 1.0f},
+            {window_max.x, window_max.y - 1.0f},
+            ImGui::GetColorU32(ImGuiCol_Border));
     }
     ImGui::End();
     ImGui::PopStyleVar(3);

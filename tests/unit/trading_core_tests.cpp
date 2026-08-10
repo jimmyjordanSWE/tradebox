@@ -228,6 +228,76 @@ TEST(TradingCore, DisconnectClearsLiveBarriersAndMarksStateStale) {
     EXPECT_FALSE(snapshot.reconciled);
 }
 
+// A routine account-stream disconnect is expected during normal operation
+// (idle timeout, transient network blip). The REST /v2/account snapshot is
+// not invalidated by a stream flap, so it remains visible while the stream
+// reconnects rather than clearing the account data from the UI.
+TEST(TradingCore, StreamFlapClearsAuthButKeepsAccountData) {
+    MemoryJournal journal;
+    FixedClock clock;
+    TradingCore core(journal, clock);
+
+    ASSERT_TRUE(core.Ingest(
+        Event(BrokerEventKind::ConnectionAttemptStarted, 1)));
+    ASSERT_TRUE(core.Ingest(Event(BrokerEventKind::Authorized, 1)));
+    ASSERT_TRUE(core.Ingest(AccountEvent(1)));
+    ASSERT_TRUE(core.Snapshot().account.has_value());
+    ASSERT_TRUE(core.Snapshot().authenticated);
+
+    // The account stream drops (routine flap) and publishes Disconnected.
+    ASSERT_TRUE(core.Ingest(Event(BrokerEventKind::Disconnected, 1)));
+    const CoreSnapshot flap = core.Snapshot();
+    EXPECT_EQ(flap.safety_status, SafetyStatus::Stale);
+    EXPECT_FALSE(flap.authenticated);
+    // REST-fetched account data must survive a stream flap so the account
+    // menu can still show buying power etc. while reconnecting.
+    EXPECT_TRUE(flap.account.has_value());
+    EXPECT_TRUE(flap.account_snapshot_loaded);
+}
+
+// An explicit disconnect (user action) ends the session; the account snapshot
+// is connection-scoped truth and must not linger after the session is gone.
+TEST(TradingCore, ExplicitDisconnectClearsAccountSnapshot) {
+    MemoryJournal journal;
+    FixedClock clock;
+    TradingCore core(journal, clock);
+
+    ASSERT_TRUE(core.Ingest(
+        Event(BrokerEventKind::ConnectionAttemptStarted, 1)));
+    ASSERT_TRUE(core.Ingest(Event(BrokerEventKind::Authorized, 1)));
+    ASSERT_TRUE(core.Ingest(AccountEvent(1)));
+    ASSERT_TRUE(core.Snapshot().account.has_value());
+
+    ASSERT_TRUE(core.Submit(DisconnectAccount{}));
+    const CoreSnapshot snapshot = core.Snapshot();
+    EXPECT_EQ(snapshot.safety_status, SafetyStatus::Disconnected);
+    EXPECT_FALSE(snapshot.authenticated);
+    // Stale account data must not present as an active connection.
+    EXPECT_FALSE(snapshot.account.has_value());
+}
+
+TEST(TradingCore, FailureResetsConnectionAndClearsAccount) {
+    MemoryJournal journal;
+    FixedClock clock;
+    TradingCore core(journal, clock);
+
+    ASSERT_TRUE(core.Ingest(
+        Event(BrokerEventKind::ConnectionAttemptStarted, 1)));
+    ASSERT_TRUE(core.Ingest(Event(BrokerEventKind::Authorized, 1)));
+    ASSERT_TRUE(core.Ingest(AccountEvent(1)));
+    ASSERT_TRUE(core.Snapshot().account.has_value());
+
+    ASSERT_TRUE(core.Ingest(BrokerEvent{
+        .kind = BrokerEventKind::Failure,
+        .generation = ConnectionGeneration{1},
+        .message = "Account stream connection failed",
+    }));
+    const CoreSnapshot snapshot = core.Snapshot();
+    EXPECT_EQ(snapshot.safety_status, SafetyStatus::Error);
+    EXPECT_FALSE(snapshot.authenticated);
+    EXPECT_FALSE(snapshot.account.has_value());
+}
+
 TEST(TradingCore,
      DisconnectDuringFillRetainsVisibleStateUntilReconnectReconciliation) {
     MemoryJournal journal;

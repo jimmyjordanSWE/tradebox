@@ -494,6 +494,64 @@ bool CaptureNativeWindowState(
     return changed;
 }
 
+bool RectIntersects(const SDL_Rect& a, const SDL_Rect& b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h &&
+           a.y + a.h > b.y;
+}
+
+// The saved native window geometry is only valid while the display it was
+// recorded against still exists. If the window's restore rectangle no
+// longer intersects any attached display (for example, a second monitor was
+// disconnected or the arrangement changed), the window falls back to a
+// default position and size on the primary display and skips the maximized
+// restore; otherwise the maximized window lands on a phantom region and the
+// swap chain never presents a usable first frame.
+void NormalizeRestoreGeometry(
+    const tradebox::workstation::NativeWindowState& saved,
+    tradebox::workstation::NativeWindowState& effective) {
+    effective = saved;
+
+    int display_count = 0;
+    SDL_DisplayID* displays = SDL_GetDisplays(&display_count);
+    if (displays == nullptr || display_count <= 0) {
+        SDL_free(displays);
+        effective.bounds = {120.0f, 80.0f, 1400.0f, 900.0f};
+        effective.maximized = false;
+        return;
+    }
+
+    const SDL_Rect saved_rect{
+        static_cast<int>(saved.bounds.x),
+        static_cast<int>(saved.bounds.y),
+        std::max(1, static_cast<int>(saved.bounds.width)),
+        std::max(1, static_cast<int>(saved.bounds.height))};
+    bool intersects = false;
+    for (int index = 0; index < display_count; ++index) {
+        SDL_Rect display_bounds{};
+        if (SDL_GetDisplayBounds(displays[index], &display_bounds) &&
+            RectIntersects(saved_rect, display_bounds)) {
+            intersects = true;
+            break;
+        }
+    }
+    SDL_free(displays);
+    if (intersects) return;
+
+    SDL_Rect primary_bounds{};
+    const SDL_DisplayID primary_display = SDL_GetPrimaryDisplay();
+    if (!SDL_GetDisplayBounds(primary_display, &primary_bounds) ||
+        primary_bounds.w <= 0 || primary_bounds.h <= 0)
+        primary_bounds = {0, 0, 1920, 1080};
+    effective.bounds = {
+        static_cast<float>(primary_bounds.x),
+        static_cast<float>(primary_bounds.y),
+        static_cast<float>(std::min(primary_bounds.w, 1600)),
+        static_cast<float>(std::min(primary_bounds.h, 1000))};
+    // A maximized restore from a stale position is exactly the failure mode
+    // above; never restore maximized from a fallen-back geometry.
+    effective.maximized = false;
+}
+
 std::vector<std::string> VisibleMarketSymbols(
     const tradebox::application::UiSnapshotQuery& query,
     const tradebox::core::CoreSnapshot& core) {
@@ -577,7 +635,9 @@ int RunApplication(const LaunchOptions& options) {
         *loaded_profile;
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) return 1;
-    const auto& native_window = workstation_state.native_window;
+    tradebox::workstation::NativeWindowState native_window(
+        workstation_state.native_window);
+    NormalizeRestoreGeometry(workstation_state.native_window, native_window);
     const int initial_width = std::max(
         640, static_cast<int>(native_window.bounds.width));
     const int initial_height = std::max(

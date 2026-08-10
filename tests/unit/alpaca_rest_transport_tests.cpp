@@ -246,6 +246,50 @@ TEST(AlpacaRestTransport,
     EXPECT_EQ(deferred.get().error, "REST request canceled");
 }
 
+// AlpacaService::Connect() runs Disconnect() before establishing a new
+// connection, and Disconnect() calls Abort() for a fast in-flight cancel. The
+// shared REST transport must survive an Abort so the next connection can fetch
+// the account/positions/orders snapshots again. Regression: Abort permanently
+// set stopping_ and destroyed the WinHTTP session, bricking all REST traffic
+// for the rest of the process (title bar showed an authenticated stream while
+// the account menu had no data).
+TEST(AlpacaRestTransport, StaysUsableAfterAbortForTheNextConnection) {
+    auto executor = std::make_unique<FakeExecutor>();
+    FakeExecutor* fake = executor.get();
+    fake->responses = {{.status = 200}, {.status = 200}};
+    AlpacaRestTransport transport(std::move(executor), 1, 10);
+
+    EXPECT_EQ(transport.Execute(Read("/v2/account")).status, 200U);
+    transport.Abort();
+    transport.Resume();
+    // An Abort is a fast cancel, not a shutdown: the transport must accept
+    // and complete the next connection's snapshot fetches after Resume().
+    EXPECT_FALSE(transport.Health().stopping);
+    EXPECT_EQ(transport.Execute(Read("/v2/positions")).status, 200U);
+
+    std::scoped_lock lock(fake->mutex);
+    EXPECT_EQ(fake->calls.size(), 2U);
+}
+
+TEST(AlpacaRestTransport, RejectsRequestsUntilTheNextConnectionResumes) {
+    auto executor = std::make_unique<FakeExecutor>();
+    FakeExecutor* fake = executor.get();
+    fake->responses = {{.status = 200}};
+    AlpacaRestTransport transport(std::move(executor), 1, 10);
+
+    transport.Abort();
+    const auto canceled = transport.Submit(Read("/v2/account"));
+    EXPECT_EQ(canceled.wait_for(0ms), std::future_status::ready);
+    EXPECT_EQ(canceled.get().error, "REST request canceled");
+    {
+        std::scoped_lock lock(fake->mutex);
+        EXPECT_TRUE(fake->calls.empty());
+    }
+
+    transport.Resume();
+    EXPECT_EQ(transport.Execute(Read("/v2/positions")).status, 200U);
+}
+
 TEST(AlpacaRestTransport, BoundsQueueAndCancelsPendingOnShutdown) {
     auto executor = std::make_unique<FakeExecutor>();
     FakeExecutor* fake = executor.get();

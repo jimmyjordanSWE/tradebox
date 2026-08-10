@@ -246,14 +246,24 @@ std::expected<void, CoreError> TradingCore::Ingest(BrokerEvent event) {
             RefreshSafetyStatus();
             break;
         case BrokerEventKind::Disconnected:
+            // A routine account-stream flap (idle timeout, transient network
+            // blip) is recoverable: the REST session and the /v2/account
+            // snapshot remain valid truth. Keep the account so the UI can
+            // continue showing buying power etc. while the stream reconnects;
+            // only an explicit disconnect, a new connection, or a fatal
+            // failure clears it.
             ResetConnectionState(SafetyStatus::Stale,
-                                 "Trading stream disconnected");
+                                 "Trading stream disconnected",
+                                 /*clear_account=*/false);
             break;
         case BrokerEventKind::Failure:
-            state_.safety_status = SafetyStatus::Error;
-            state_.status_message =
-                event.message.empty() ? "Broker failure" : event.message;
-            ++state_.revision;
+            // A broker failure (account stream connection, upgrade,
+            // authentication, or payload-limit) ends the connection. Reset the
+            // connection state so the UI never presents a dead connection as
+            // authenticated with live account data.
+            ResetConnectionState(
+                SafetyStatus::Error,
+                event.message.empty() ? "Broker failure" : event.message);
             break;
     }
 
@@ -419,11 +429,20 @@ void TradingCore::RefreshSafetyStatus() {
 }
 
 void TradingCore::ResetConnectionState(SafetyStatus status,
-                                       std::string message) {
+                                       std::string message,
+                                       bool clear_account) {
     reconciliation_required_ = false;
     state_.authenticated = false;
     state_.trade_updates_acknowledged = false;
-    state_.account_snapshot_loaded = false;
+    if (clear_account) {
+        // The account snapshot is only as valid as the connection that
+        // fetched it. An explicit disconnect, a new connection, and a fatal
+        // failure clear it so a dead connection never presents as an active
+        // account. A routine stream flap (Disconnected) deliberately keeps it:
+        // the REST /v2/account data is still truthful while reconnecting.
+        state_.account.reset();
+        state_.account_snapshot_loaded = false;
+    }
     state_.positions_snapshot_loaded = false;
     state_.orders_snapshot_loaded = false;
     state_.initial_snapshot_loaded = false;

@@ -30,7 +30,8 @@ private:
     void PublishOrders();
     void PublishPositions();
     void RefreshSafetyStatus();
-    void ResetConnectionState(SafetyStatus status, std::string message);
+    void ResetConnectionState(SafetyStatus status, std::string message,
+                              bool clear_account = true);
     void ClearFinancialState();
 
     IEventJournal& journal_;
