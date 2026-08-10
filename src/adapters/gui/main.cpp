@@ -5,9 +5,11 @@
 #include "tradebox/workstation/chart_documents.h"
 #include "tradebox/workstation/profile_store.h"
 #include "tradebox/workstation/watch_list_documents.h"
+#include "tradebox/workstation/order_tickets.h"
 
 #include "chart_window.h"
 #include "debug_window.h"
+#include "event_window.h"
 #include "order_ticket_window.h"
 #include "positions_window.h"
 #include "watch_list_window.h"
@@ -52,9 +54,9 @@ using tradebox::gui::AccountPopupState;
 using tradebox::gui::ChromeActions;
 using tradebox::gui::ChromeMetrics;
 using tradebox::gui::DrawApplicationChrome;
-using tradebox::gui::DrawImGuiDemo;
 using tradebox::gui::DebugSnapshot;
-using tradebox::gui::DebugWindowRenderer;
+  using tradebox::gui::DebugWindowRenderer;
+  using tradebox::gui::EventWindowRenderer;
 using tradebox::gui::GuiFonts;
 using tradebox::gui::ConfigureImGuiStyle;
 
@@ -720,7 +722,8 @@ int RunApplication(const LaunchOptions& options) {
     tradebox::ui::Workspace workspace;
     workspace.SetPersistentState(&workstation_state.workspace);
     tradebox::gui::ChartWindowRenderer chart_renderer;
-    DebugWindowRenderer debug_renderer;
+      DebugWindowRenderer debug_renderer;
+      EventWindowRenderer event_renderer;
     tradebox::gui::WatchListWindowRenderer watch_list_renderer;
     tradebox::gui::TradeHotkeyWindowRenderer trade_hotkey_renderer;
     tradebox::gui::OrderTicketWindowRenderer order_ticket_renderer;
@@ -742,7 +745,6 @@ int RunApplication(const LaunchOptions& options) {
         workstation_state.account_context.paper
             ? tradebox::core::AccountEnvironment::Paper
             : tradebox::core::AccountEnvironment::Live;
-    bool show_imgui_demo = false;
     const MarketTimeZone market_time_zone = LoadMarketTimeZone();
     const Uint64 started_at = SDL_GetTicks();
     auto previous_frame_start = std::chrono::steady_clock::now();
@@ -848,8 +850,8 @@ int RunApplication(const LaunchOptions& options) {
         const auto now = std::chrono::time_point_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now());
         const std::int64_t now_ns = now.time_since_epoch().count();
-        if (application != nullptr)
-            static_cast<void>(application->DrainUiEvents());
+          if (application != nullptr)
+             event_renderer.Append(application->DrainUiEvents());
         auto snapshot_query = chart_renderer.BuildSnapshotQuery(
             workstation_state.workspace, now_ns);
         snapshot_query.as_of_ns = now_ns;
@@ -940,12 +942,16 @@ int RunApplication(const LaunchOptions& options) {
                 workstation_state.workspace);
             if (created) profile_store.MarkDirty();
         }
+        if (chrome_actions.new_trade_hotkey) {
+            const auto opened = tradebox::workstation::OpenTradeHotkeyWindow(
+                workstation_state.workspace);
+            if (opened) profile_store.MarkDirty();
+        }
         if (chrome_actions.open_watch_list_id) {
             watch_list_renderer.OpenSavedDocument(
                 workstation_state.workspace, *chrome_actions.open_watch_list_id);
         }
-        if (chrome_actions.new_debug) debug_renderer.Open();
-        if (chrome_actions.imgui_demo) show_imgui_demo = true;
+        if (chrome_actions.new_events) event_renderer.Open();
         if (chrome_actions.settings_changed) profile_store.MarkDirty();
 
         if (chrome_actions.account == AccountPopupAction::SaveAccount) {
@@ -1127,16 +1133,43 @@ int RunApplication(const LaunchOptions& options) {
             workstation_state.application, gui_fonts.mono, gui_fonts.icons);
         order_ticket_renderer.Draw(
             workspace, workstation_state.workspace, snapshot);
-        trade_hotkey_renderer.Draw(workspace, workstation_state.workspace);
+        trade_hotkey_renderer.Draw(workspace, workstation_state.workspace, workstation_state.application);
+        if (application != nullptr) {
+            if (auto request = trade_hotkey_renderer.ConsumePreviewRequest())
+                trade_hotkey_renderer.SetPreviews(
+                    application->PreviewHotkeyBracket(request->long_intent),
+                    application->PreviewHotkeyBracket(request->short_intent));
+            if (auto intent = trade_hotkey_renderer.ConsumeSubmissionRequest()) {
+                auto submitted = application->SubmitHotkeyBracket(
+                    *intent, true);
+                if (submitted)
+                    trade_hotkey_renderer.SetSubmissionResult(std::move(*submitted));
+                else
+                    trade_hotkey_renderer.SetSubmissionError(submitted.error());
+            }
+        } else {
+            static_cast<void>(trade_hotkey_renderer.ConsumePreviewRequest());
+            static_cast<void>(trade_hotkey_renderer.ConsumeSubmissionRequest());
+        }
         positions_renderer.Draw(
             workspace, workstation_state.workspace, snapshot);
+        if (application != nullptr) {
+            if (auto symbol = positions_renderer.ConsumeExitRequest()) {
+                auto submitted = application->ClosePosition(
+                    std::move(*symbol), true);
+                if (!submitted) positions_renderer.SetExitError(submitted.error());
+            }
+        } else {
+            static_cast<void>(positions_renderer.ConsumeExitRequest());
+        }
         orders_renderer.Draw(
             workspace, workstation_state.workspace, snapshot);
         const DebugSnapshot debug_snapshot = BuildDebugSnapshot(
             renderer, window, workstation_state.application,
             measured_frames_per_second, measured_frame_time_ms);
         debug_renderer.Draw(
-            workspace, workstation_state.workspace, debug_snapshot);
+              workspace, workstation_state.workspace, debug_snapshot);
+        event_renderer.Draw(workspace, workstation_state.workspace);
         if (application != nullptr) {
             for (const auto& retry : chart_renderer.ConsumeHistoryRetries())
                 application->RequestMarketHistory(retry);
@@ -1146,9 +1179,6 @@ int RunApplication(const LaunchOptions& options) {
         workspace.EndFrame();
 
         DrawStartupOverlay(startup_status);
-
-        DrawImGuiDemo(show_imgui_demo,
-                      static_cast<float>(chrome_metrics.title_bar_height));
 
         if (chart_renderer.ConsumePersistentChanges() ||
             watch_list_renderer.ConsumePersistentChanges() ||

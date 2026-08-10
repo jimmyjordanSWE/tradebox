@@ -6,7 +6,7 @@
 namespace tradebox::workstation {
 namespace {
 
-constexpr std::array<TableColumnDefinition, 25> kPositionColumns{{
+constexpr auto kPositionColumns = std::to_array<TableColumnDefinition>({
     {"symbol", "Symbol", 110.0f, true},
     {"qty", "Qty", 90.0f}, {"qty_available", "Available", 100.0f},
     {"side", "Side", 80.0f}, {"avg_entry", "Avg Entry", 105.0f},
@@ -23,14 +23,14 @@ constexpr std::array<TableColumnDefinition, 25> kPositionColumns{{
     {"valuation_feed", "Valuation Feed", 115.0f},
     {"valuation_event_ns", "Valuation Event (ns)", 165.0f},
     {"valuation_received_ms", "Valuation Received (ms)", 180.0f},
-}};
+});
 
-constexpr std::array<TableColumnDefinition, 30> kOrderColumns{{
+constexpr auto kOrderColumns = std::to_array<TableColumnDefinition>({
     {"symbol", "Symbol", 110.0f, true},
     {"side", "Side", 75.0f}, {"status", "Status", 105.0f},
-    {"type", "Type", 95.0f}, {"qty", "Qty", 85.0f},
-    {"notional", "Notional", 100.0f}, {"filled", "Filled", 85.0f},
-    {"filled_avg", "Filled Avg", 105.0f}, {"limit", "Limit", 90.0f},
+    {"type", "Type", 95.0f}, {"qty", "Shares", 85.0f},
+    {"notional", "Order Notional", 110.0f}, {"filled", "Filled Shares", 100.0f},
+    {"filled_avg", "Average Fill", 105.0f}, {"filled_value", "Filled Value", 110.0f}, {"limit", "Limit", 90.0f},
     {"stop", "Stop", 90.0f}, {"tif", "TIF", 70.0f},
     {"class", "Class", 90.0f}, {"extended_hours", "Extended", 90.0f},
     {"submitted", "Submitted", 170.0f}, {"updated", "Updated", 170.0f},
@@ -41,7 +41,16 @@ constexpr std::array<TableColumnDefinition, 30> kOrderColumns{{
     {"expired_at", "Expired", 170.0f}, {"failed_at", "Failed", 170.0f},
     {"replaced_at", "Replaced", 170.0f}, {"replaced_by", "Replaced By", 180.0f},
     {"replaces", "Replaces", 180.0f}, {"last_event", "Last Event", 125.0f},
-}};
+});
+
+static_assert(std::ranges::none_of(
+    kPositionColumns, [](const TableColumnDefinition& definition) {
+        return definition.id.empty() || definition.label.empty();
+    }));
+static_assert(std::ranges::none_of(
+    kOrderColumns, [](const TableColumnDefinition& definition) {
+        return definition.id.empty() || definition.label.empty();
+    }));
 
 const TableColumnDefinition* FindColumn(
     std::span<const TableColumnDefinition> definitions, std::string_view id) {
@@ -138,10 +147,21 @@ std::expected<void, std::string> CreatePositionsWindow(WorkspaceState& state) {
                         {820.0f, 330.0f, 760.0f, 300.0f});
 }
 std::expected<void, std::string> CreateOrdersWindow(WorkspaceState& state) {
-    return CreateWindow(state, kOrdersWindowId, "orders", "Orders", kOrdersTableId,
-                        {"symbol", "side", "status", "type", "qty", "filled",
-                         "limit", "stop", "submitted"},
+    const auto created = CreateWindow(state, kOrdersWindowId, "orders", "Orders", kOrdersTableId,
+                        {"symbol", "side", "status", "class", "qty", "filled",
+                         "filled_avg", "filled_value", "limit", "stop", "submitted"},
                         {820.0f, 650.0f, 760.0f, 300.0f});
+    if (!created) return created;
+    PersistentTableState& table = state.windows.at(std::string(kOrdersWindowId))
+                                      .tables.at(std::string(kOrdersTableId));
+    if (std::ranges::none_of(table.columns, [](const ColumnState& column) {
+            return !column.sort_direction.empty();
+        })) {
+        const auto symbol = std::ranges::find(table.columns, "symbol",
+                                               &ColumnState::id);
+        if (symbol != table.columns.end()) symbol->sort_direction = "ascending";
+    }
+    return {};
 }
 
 std::expected<void, std::string> AddPositionColumn(

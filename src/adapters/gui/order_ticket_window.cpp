@@ -2,6 +2,7 @@
 
 #include "tradebox/application/trading_application.h"
 #include "tradebox/core/order_request.h"
+#include "tradebox/workstation/order_tickets.h"
 
 #include "imgui.h"
 
@@ -17,21 +18,6 @@
 
 namespace tradebox::gui {
 namespace {
-
-constexpr std::string_view kOrderTicketWindowId = "order-ticket.window";
-
-std::pair<workstation::WindowInstanceState&, bool> EnsureWindow(
-    workstation::WorkspaceState& state) {
-    auto [found, inserted] = state.windows.try_emplace(
-        std::string(kOrderTicketWindowId), workstation::WindowInstanceState{
-            .id = std::string(kOrderTicketWindowId),
-            .kind = "order-ticket",
-            .title = "Order Ticket",
-            .open = true,
-            .bounds = {24.0f, 72.0f, 360.0f, 420.0f},
-        });
-    return {found->second, inserted};
-}
 
 constexpr std::array<std::string_view, 2> kSideOptions = {"buy", "sell"};
 constexpr std::array<std::string_view, 5> kTypeOptions = {
@@ -106,13 +92,26 @@ void DrawOrderResult(const std::optional<core::OrderCommandResult>& result) {
 void OrderTicketWindowRenderer::Draw(
     ui::Workspace& workspace, workstation::WorkspaceState& state,
     [[maybe_unused]] const application::ApplicationUiSnapshot& snapshot) {
-    auto [persisted, inserted] = EnsureWindow(state);
-    if (inserted) persistent_changed_ = true;
-    if (!persisted.open) return;
+    const auto window_state = state.windows.find(
+        std::string(workstation::kOrderTicketWindowId));
+    if (window_state == state.windows.end()) {
+        const auto opened = workstation::OpenOrderTicketForSymbol(
+            state, state.selected_symbol);
+        if (!opened) return;
+        persistent_changed_ = true;
+    } else if (!window_state->second.open) {
+        return;
+    } else if (workstation::FindOrderTicketForSymbol(
+                   state, state.selected_symbol) == nullptr) {
+        const auto opened = workstation::OpenOrderTicketForSymbol(
+            state, state.selected_symbol);
+        if (!opened) return;
+        persistent_changed_ = true;
+    }
 
     ui::WorkspaceWindow window{
         .title = "Order Ticket",
-        .id = std::string(kOrderTicketWindowId),
+        .id = std::string(workstation::kOrderTicketWindowId),
         .default_offset = {24.0f, 72.0f},
         .default_size = {360.0f, 420.0f},
         .open = true,
@@ -124,25 +123,10 @@ void OrderTicketWindowRenderer::Draw(
         return;
     }
 
-    // Find or create an order ticket for the selected symbol.
     const std::string& symbol = state.selected_symbol;
-    auto ticket_it = std::ranges::find_if(
-        state.order_tickets,
-        [&](const workstation::OrderTicketState& t) {
-            return t.symbol == symbol;
-        });
-    workstation::OrderTicketState* ticket = nullptr;
-    if (ticket_it != state.order_tickets.end()) {
-        ticket = &*ticket_it;
-    } else {
-        // Create a transient ticket for the selected symbol.
-        // It will be persisted when the user modifies a field.
-        state.order_tickets.push_back({
-            .id = std::string(kOrderTicketWindowId) + "." + symbol,
-            .symbol = symbol,
-        });
-        ticket = &state.order_tickets.back();
-    }
+    workstation::OrderTicketState* ticket =
+        workstation::FindOrderTicketForSymbol(state, symbol);
+    if (ticket == nullptr) return;
 
     InteractionState& interaction = Interaction(*ticket);
     if (!interaction.initialized) {

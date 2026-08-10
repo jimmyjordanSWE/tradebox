@@ -85,6 +85,26 @@ TEST(AlpacaOrderCodec, SerializesOcoExitAsNestedProfitAndStopLegs) {
     EXPECT_FALSE(json.contains("limit_price"));
 }
 
+TEST(AlpacaOrderCodec, RejectsEquityPricesThatDoNotMatchAlpacaIncrements) {
+    core::NativeOrderRequest request{
+        .asset_class = core::AssetClass::Equity,
+        .symbol = "AAPL",
+        .qty = D("10"),
+        .side = core::OrderSide::Buy,
+        .type = core::OrderType::Market,
+        .time_in_force = core::TimeInForce::Gtc,
+        .order_class = core::OrderClass::Bracket,
+        .take_profit = core::TakeProfit{D("309.42576")},
+        .stop_loss = core::StopLoss{D("308.81"), std::nullopt},
+    };
+
+    const auto encoded = broker::alpaca::SerializeOrder(request);
+
+    ASSERT_FALSE(encoded);
+    EXPECT_EQ(encoded.error(),
+              "take_profit.limit_price: must use $0.01 increments at or above $1.00 and $0.0001 below $1.00");
+}
+
 TEST(AlpacaOrderCodec, SerializesReplacementFieldsOnly) {
     const core::ReplaceOrderRequest request{
         .qty = D("10"),

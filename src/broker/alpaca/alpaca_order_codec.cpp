@@ -1,4 +1,5 @@
 #include "tradebox/broker/alpaca_order_codec.h"
+#include "tradebox/broker/alpaca_price_rules.h"
 
 #include <nlohmann/json.hpp>
 
@@ -90,6 +91,9 @@ std::expected<std::string, std::string> SerializeOrder(
     if (!errors.empty())
         return std::unexpected(errors.front().field + ": " +
                                errors.front().message);
+    if (const auto price_errors = ValidateOrderPriceIncrements(request);
+        !price_errors)
+        return std::unexpected(price_errors.error());
 
     json value;
     if (!request.symbol.empty()) value["symbol"] = request.symbol;

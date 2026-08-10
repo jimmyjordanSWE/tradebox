@@ -75,6 +75,10 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
         std::clamp(state.application.maximum_frame_rate, 0, 10000);
     state.application.account_risk_per_trade_percent = std::clamp(
         state.application.account_risk_per_trade_percent, 0.01f, 100.0f);
+    state.application.max_long_buying_power_percent = std::clamp(
+        state.application.max_long_buying_power_percent, 0.01f, 100.0f);
+    state.application.max_short_buying_power_percent = std::clamp(
+        state.application.max_short_buying_power_percent, 0.01f, 100.0f);
     NormalizeBounds(state.native_window.bounds, 640.0f, 480.0f);
 
     std::set<std::string, std::less<>> link_group_ids;

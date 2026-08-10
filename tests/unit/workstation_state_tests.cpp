@@ -1,5 +1,6 @@
 #include "tradebox/workstation/chart_documents.h"
 #include "tradebox/workstation/instrument_links.h"
+#include "tradebox/workstation/order_tickets.h"
 #include "tradebox/workstation/profile_codec.h"
 #include "tradebox/workstation/profile_store.h"
 #include "tradebox/workstation/positions_orders_windows.h"
@@ -88,7 +89,7 @@ TEST(PositionsAndOrdersWindows, CreateSeparatePersistentWindows) {
     EXPECT_EQ(orders->second.title, "Orders");
     ASSERT_TRUE(orders->second.tables.contains(std::string(kOrdersTableId)));
     EXPECT_EQ(orders->second.tables.at(std::string(kOrdersTableId))
-                  .columns.size(), 9U);
+                  .columns.size(), 11U);
 
     ASSERT_TRUE(AddPositionColumn(state.workspace, "day_pnl"));
     EXPECT_TRUE(RemovePositionColumn(state.workspace, "day_pnl"));
@@ -109,10 +110,76 @@ TEST(PositionsAndOrdersWindows, CreateSeparatePersistentWindows) {
         std::string(kOrdersWindowId)));
 }
 
+TEST(PositionsAndOrdersWindows, ColumnRegistriesContainOnlyUsableDefinitions) {
+    const auto assert_usable = [](const auto definitions) {
+        ASSERT_FALSE(definitions.empty());
+        for (const TableColumnDefinition& definition : definitions) {
+            EXPECT_FALSE(definition.id.empty());
+            EXPECT_FALSE(definition.label.empty());
+            EXPECT_GT(definition.default_width, 0.0f);
+        }
+    };
+
+    assert_usable(PositionColumnDefinitions());
+    assert_usable(OrderColumnDefinitions());
+}
+
+TEST(OrderTickets, OpensOnePersistentConfigurationPerTicker) {
+    WorkstationState state = WorkstationState::Defaults();
+
+    ASSERT_TRUE(OpenOrderTicketForSymbol(state.workspace, "NVDA"));
+    OrderTicketState* nvda = FindOrderTicketForSymbol(state.workspace, "NVDA");
+    ASSERT_NE(nvda, nullptr);
+    const std::string nvda_id = nvda->id;
+    nvda->side = "sell";
+    nvda->amount = "250";
+    nvda->type = "limit";
+    nvda->limit_price = "175.50";
+
+    ASSERT_TRUE(OpenOrderTicketForSymbol(state.workspace, "AAPL"));
+    OrderTicketState* aapl = FindOrderTicketForSymbol(state.workspace, "AAPL");
+    ASSERT_NE(aapl, nullptr);
+    EXPECT_NE(aapl->id, nvda_id);
+    aapl->amount = "10";
+
+    ASSERT_TRUE(OpenOrderTicketForSymbol(state.workspace, "NVDA"));
+    nvda = FindOrderTicketForSymbol(state.workspace, "NVDA");
+    ASSERT_NE(nvda, nullptr);
+    EXPECT_EQ(state.workspace.selected_symbol, "NVDA");
+    EXPECT_EQ(nvda->id, nvda_id);
+    EXPECT_EQ(nvda->side, "sell");
+    EXPECT_EQ(nvda->amount, "250");
+    EXPECT_EQ(nvda->type, "limit");
+    EXPECT_EQ(nvda->limit_price, "175.50");
+    EXPECT_TRUE(state.workspace.windows.at(
+        std::string(kOrderTicketWindowId)).open);
+
+    const auto decoded = DecodeProfile(EncodeProfile(state));
+    ASSERT_TRUE(decoded) << decoded.error();
+    const OrderTicketState* restored_nvda = FindOrderTicketForSymbol(
+        decoded->workspace, "NVDA");
+    ASSERT_NE(restored_nvda, nullptr);
+    EXPECT_EQ(restored_nvda->id, nvda_id);
+    EXPECT_EQ(restored_nvda->side, "sell");
+    EXPECT_EQ(restored_nvda->limit_price, "175.50");
+}
+
+TEST(TradeHotkeyWindow, OpensThroughThePersistentWindowSystem) {
+    WorkstationState state = WorkstationState::Defaults();
+    ASSERT_TRUE(OpenTradeHotkeyWindow(state.workspace));
+    const auto window = state.workspace.windows.find(
+        std::string(kTradeHotkeyWindowId));
+    ASSERT_NE(window, state.workspace.windows.end());
+    EXPECT_EQ(window->second.kind, "trade-hotkey");
+    EXPECT_TRUE(window->second.open);
+}
+
 TEST(WorkstationState, ProfileRoundTripPreservesSemanticState) {
     WorkstationState source = WorkstationState::Defaults();
     source.profile.name = "Research";
     source.application.account_risk_per_trade_percent = 1.25f;
+    source.application.max_long_buying_power_percent = 95.0f;
+    source.application.max_short_buying_power_percent = 75.0f;
     source.application.watch_list_strong_green_rgba = 0x12345678U;
     source.application.watch_list_light_green_rgba = 0x23456789U;
     source.application.watch_list_light_red_rgba = 0x3456789aU;
@@ -197,6 +264,10 @@ TEST(WorkstationState, ProfileRoundTripPreservesSemanticState) {
     EXPECT_EQ(decoded->profile.name, "Research");
     EXPECT_FLOAT_EQ(decoded->application.account_risk_per_trade_percent,
                     1.25f);
+    EXPECT_FLOAT_EQ(decoded->application.max_long_buying_power_percent,
+                    95.0f);
+    EXPECT_FLOAT_EQ(decoded->application.max_short_buying_power_percent,
+                    75.0f);
     EXPECT_EQ(decoded->application.watch_list_strong_green_rgba,
               0x12345678U);
     EXPECT_EQ(decoded->application.watch_list_light_green_rgba,
@@ -381,6 +452,18 @@ TEST(WatchListDocuments, InitializesAndAddsTableColumns) {
     ASSERT_EQ(table->second.columns.size(), 7U);
     EXPECT_EQ(table->second.columns[1].id, "current_price");
     EXPECT_EQ(table->second.columns[5].id, "change_from_open");
+
+    ASSERT_TRUE(RemoveWatchListColumn(
+        state.workspace, *created, WatchListColumnKind::CurrentPrice));
+    table->second.columns.front().order = 6;
+    table->second.columns.back().order = 0;
+    ASSERT_TRUE(AddWatchListColumn(
+        state.workspace, *created, WatchListColumnKind::CurrentPrice));
+    const auto newest = std::ranges::find(
+        table->second.columns, "current_price",
+        &ColumnState::id);
+    ASSERT_NE(newest, table->second.columns.end());
+    EXPECT_EQ(newest->order, 7);
 
     EXPECT_FALSE(RemoveWatchListColumn(
         state.workspace, *created, WatchListColumnKind::Symbol));
@@ -725,6 +808,21 @@ TEST(WorkstationState, MigratesSchemaOneWithDefaultLinkGroups) {
     EXPECT_EQ(decoded->workspace.instrument_link_groups.size(), 32U);
     EXPECT_EQ(decoded->workspace.instrument_link_groups[11].id,
               "instrument-link.blue");
+}
+
+TEST(WorkstationState, MigratesLegacyHotkeyPositionCapAway) {
+    const auto decoded = DecodeProfile(
+        "[profile]\n"
+        "schema_version = 5\n"
+        "id = \"legacy-hotkey-profile\"\n"
+        "name = \"Legacy\"\n\n"
+        "[bracket_drafts.AMD]\n"
+        "maximum_position_percent_of_account = 35.000\n");
+    ASSERT_TRUE(decoded) << decoded.error();
+    ASSERT_TRUE(decoded->workspace.bracket_drafts.contains("AMD"));
+    EXPECT_FLOAT_EQ(decoded->workspace.bracket_drafts.at("AMD")
+                        .target_percent,
+                    1.0f);
 }
 
 TEST(InstrumentLinks, CommandsPreserveLocalWindowStateAndPublishOneContext) {

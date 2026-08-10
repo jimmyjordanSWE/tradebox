@@ -18,10 +18,38 @@ struct CreationActions {
     bool new_watch_list = false;
     bool new_positions = false;
     bool new_orders = false;
+    bool new_trade_hotkey = false;
+    bool new_events = false;
     std::optional<std::string> open_watch_list_id;
-    bool new_debug = false;
-    bool imgui_demo = false;
 };
+
+void DrawBuyingPowerMeter(const core::AccountState& account) {
+    const auto multiplier = core::Decimal::Parse(account.multiplier);
+    const core::Decimal buying_power_capacity =
+        multiplier && *multiplier > core::Decimal::Zero()
+            ? account.equity * *multiplier
+            : account.equity;
+    std::optional<core::Decimal> available_ratio;
+    if (buying_power_capacity > core::Decimal::Zero()) {
+        const auto divided = account.buying_power.Divide(buying_power_capacity, 6);
+        if (divided) available_ratio = *divided;
+    }
+    const float available_percent = available_ratio
+                                        ? std::max(
+                                              static_cast<float>(
+                                                  available_ratio->ToDisplayDouble()),
+                                              0.0f)
+                                        : 0.0f;
+    const std::string summary = std::format(
+        "BP ${:.0f} left  |  {:.0f}% available",
+        account.buying_power.ToDisplayDouble(), available_percent * 100.0f);
+    ImGui::TextDisabled("%s", summary.c_str());
+    const std::string tooltip = std::format(
+        "Buying power left: ${:.2f}\nBuying-power capacity: ${:.2f}\nAvailable: {:.1f}%",
+        account.buying_power.ToDisplayDouble(),
+        buying_power_capacity.ToDisplayDouble(), available_percent * 100.0f);
+    ImGui::SetItemTooltip("%s", tooltip.c_str());
+}
 
 CreationActions DrawCreationMenu(
     ImFont* regular_font, const workstation::WorkspaceState& /*state*/) {
@@ -33,8 +61,8 @@ CreationActions DrawCreationMenu(
     if (ImGui::MenuItem("Watchlist", "")) actions.new_watch_list = true;
     if (ImGui::MenuItem("Positions", "")) actions.new_positions = true;
     if (ImGui::MenuItem("Orders", "")) actions.new_orders = true;
-    if (ImGui::MenuItem("Debug", "")) actions.new_debug = true;
-    if (ImGui::MenuItem("ImGui Demo", "")) actions.imgui_demo = true;
+    if (ImGui::MenuItem("Trade Hotkey", "")) actions.new_trade_hotkey = true;
+    if (ImGui::MenuItem("Events", "")) actions.new_events = true;
     ImGui::PopFont();
     ImGui::EndMenu();
     return actions;
@@ -70,6 +98,20 @@ void DrawSettingsMenu(ImFont* regular_font,
                           "%.2f%%")) {
         settings.account_risk_per_trade_percent = std::clamp(
             settings.account_risk_per_trade_percent, 0.01f, 100.0f);
+        changed = true;
+    }
+    if (ImGui::InputFloat("Max Long buying power",
+                          &settings.max_long_buying_power_percent,
+                          1.0f, 5.0f, "%.1f%%")) {
+        settings.max_long_buying_power_percent = std::clamp(
+            settings.max_long_buying_power_percent, 0.01f, 100.0f);
+        changed = true;
+    }
+    if (ImGui::InputFloat("Max Short buying power",
+                          &settings.max_short_buying_power_percent,
+                          1.0f, 5.0f, "%.1f%%")) {
+        settings.max_short_buying_power_percent = std::clamp(
+            settings.max_short_buying_power_percent, 0.01f, 100.0f);
         changed = true;
     }
     ImGui::SeparatorText("Watch List Percentage Colours");
@@ -156,12 +198,24 @@ ChromeActions DrawApplicationChrome(
         actions.new_watch_list = creation_actions.new_watch_list;
         actions.new_positions = creation_actions.new_positions;
         actions.new_orders = creation_actions.new_orders;
+        actions.new_trade_hotkey = creation_actions.new_trade_hotkey;
+        actions.new_events = creation_actions.new_events;
         actions.open_watch_list_id = creation_actions.open_watch_list_id;
-        actions.new_debug = creation_actions.new_debug;
-        actions.imgui_demo = creation_actions.imgui_demo;
 
         metrics.interactive_left_width =
             static_cast<int>(ImGui::GetCursorPosX());
+
+        if (snapshot.account) {
+            const std::string summary = std::format(
+                "BP ${:.0f} left  |  100% available",
+                snapshot.account->buying_power.ToDisplayDouble());
+            const float summary_width = ImGui::CalcTextSize(summary.c_str()).x;
+            const float meter_x = std::max(
+                static_cast<float>(metrics.interactive_left_width + 12),
+                window_size.x - caption_controls_width - summary_width - 12.0f);
+            ImGui::SetCursorPosX(meter_x);
+            DrawBuyingPowerMeter(*snapshot.account);
+        }
 
         ImGui::SetCursorPosX(window_size.x - caption_controls_width);
         const ImVec2 button_size{

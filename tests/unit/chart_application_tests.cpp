@@ -288,6 +288,18 @@ TEST(ChartApplicationSnapshotTest, FindsStoredBarInstrumentWithoutCatalog) {
     EXPECT_EQ(snapshot.assets.front().instrument_id, "asset-aapl");
 }
 
+TEST(TradingApplication, RejectsPositionExitWithoutAnAccountSnapshot) {
+    TemporaryDatabase temporary;
+    Database database;
+    std::string error;
+    ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+    tradebox::application::TradingApplication application(database);
+
+    const auto result = application.ClosePosition("AAPL", true);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), "Account data is unavailable");
+}
+
 TEST(ChartApplicationSnapshotTest, PublishesOnlyUniqueRequestedMarkets) {
     TemporaryDatabase temporary;
     Database database;

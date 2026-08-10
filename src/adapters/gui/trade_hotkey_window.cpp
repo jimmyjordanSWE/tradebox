@@ -1,112 +1,193 @@
 #include "trade_hotkey_window.h"
 
+#include "tradebox/workstation/order_tickets.h"
+
 #include "imgui.h"
 
 #include <algorithm>
-#include <cfloat>
-#include <string>
+#include <chrono>
+#include <format>
+#include <utility>
 
 namespace tradebox::gui {
 namespace {
 
-constexpr std::string_view kTradeHotkeyWindowId = "trade-hotkey.window";
+std::optional<core::Decimal> DecimalFromPercent(float value) {
+    auto parsed = core::Decimal::Parse(std::format("{:.2f}", value));
+    if (!parsed) return std::nullopt;
+    return *parsed;
+}
 
-std::pair<workstation::WindowInstanceState&, bool> EnsureWindow(
-    workstation::WorkspaceState& state) {
-    auto [found, inserted] = state.windows.try_emplace(
-        std::string(kTradeHotkeyWindowId), workstation::WindowInstanceState{
-            .id = std::string(kTradeHotkeyWindowId),
-            .kind = "trade-hotkey",
-            .title = "Trade Hotkey",
-            .open = true,
-            .bounds = {820.0f, 72.0f, 300.0f, 230.0f},
-        });
-    return {found->second, inserted};
+void DrawCommitment(
+    const char* label,
+    const std::optional<application::HotkeyBracketPreview>& preview,
+    const std::string& error) {
+    if (!preview) {
+        ImGui::Text("%s: unavailable", label);
+        if (!error.empty()) ImGui::SetItemTooltip("%s", error.c_str());
+        return;
+    }
+    ImGui::Text("%s: %s", label,
+                preview->estimated_entry_notional.ToString().c_str());
 }
 
 }  // namespace
 
 void TradeHotkeyWindowRenderer::Draw(
-    ui::Workspace& workspace, workstation::WorkspaceState& state) {
-    auto [persisted, inserted] = EnsureWindow(state);
-    if (inserted) persistent_changed_ = true;
-    if (!persisted.open) return;
+    ui::Workspace& workspace, workstation::WorkspaceState& state,
+    workstation::ApplicationSettings& settings) {
+    if (pending_result_ &&
+        pending_result_->wait_for(std::chrono::seconds(0)) ==
+            std::future_status::ready) {
+        result_ = pending_result_->get();
+        pending_result_.reset();
+    }
+    const auto persisted = state.windows.find(
+        std::string(workstation::kTradeHotkeyWindowId));
+    if (persisted == state.windows.end()) {
+        if (!workstation::OpenTradeHotkeyWindow(state)) return;
+        persistent_changed_ = true;
+    } else if (!persisted->second.open) {
+        return;
+    }
 
     ui::WorkspaceWindow window{
         .title = "Trade Hotkey",
-        .id = std::string(kTradeHotkeyWindowId),
-        .default_offset = {820.0f, 72.0f},
-        .default_size = {300.0f, 230.0f},
+        .id = std::string(workstation::kTradeHotkeyWindowId),
+        .default_offset = {820, 72},
+        .default_size = {300, 250},
         .open = true,
-        .flags = ImGuiWindowFlags_NoCollapse,
-    };
-    workspace.ConstrainNextWindowSize({260.0f, 190.0f});
+        .flags = ImGuiWindowFlags_NoCollapse};
+    workspace.ConstrainNextWindowSize({260, 220});
     if (!workspace.BeginWindow(window)) {
         workspace.EndWindow(window);
         return;
     }
-
     if (state.selected_symbol.empty()) {
         ImGui::TextUnformatted("No symbol selected");
-        ImGui::Separator();
-        ImGui::TextDisabled("Select a ticker in a watch list first.");
-        ImGui::BeginDisabled();
-        static_cast<void>(ImGui::Button("LONG", {118.0f, 34.0f}));
-        ImGui::SameLine();
-        static_cast<void>(ImGui::Button("SHORT", {118.0f, 34.0f}));
-        ImGui::EndDisabled();
         workspace.EndWindow(window);
         return;
     }
 
-    workstation::BracketDraftState& draft =
-        state.bracket_drafts[state.selected_symbol];
+    auto& draft = state.bracket_drafts[state.selected_symbol];
     ImGui::TextUnformatted(state.selected_symbol.c_str());
     ImGui::Separator();
-    auto percentage_control = [&](const char* label, float& value,
-                                  float minimum, float maximum) {
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::AlignTextToFramePadding();
-        ImGui::TextUnformatted(label);
-        ImGui::TableNextColumn();
-        ImGui::PushID(label);
-        ImGui::SetNextItemWidth(150.0f);
-        if (ImGui::InputFloat("##percent", &value, 0.0f, 0.0f, "%.2f%%",
+    const auto input = [&](const char* name, float& value, float minimum,
+                           float maximum) {
+        if (ImGui::InputFloat(name, &value, 0, 0, "%.2f%%",
                               ImGuiInputTextFlags_AutoSelectAll)) {
             value = std::clamp(value, minimum, maximum);
             persistent_changed_ = true;
+            long_preview_.reset();
+            short_preview_.reset();
+            error_.clear();
         }
-        const bool adjustible = ImGui::IsItemHovered() || ImGui::IsItemFocused();
-        if (adjustible) {
-            const float step = ImGui::GetIO().KeyShift ? 0.25f : 0.05f;
-            float delta = ImGui::GetIO().MouseWheel * step;
-            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true)) delta += step;
-            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true)) delta -= step;
-            if (delta != 0.0f) {
-                value = std::clamp(value + delta, minimum, maximum);
-                persistent_changed_ = true;
-            }
-        }
-        ImGui::PopID();
     };
-    if (ImGui::BeginTable("trade_percentages", 2,
-                          ImGuiTableFlags_SizingFixedFit)) {
-        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed,
-                                92.0f);
-        ImGui::TableSetupColumn("Control", ImGuiTableColumnFlags_WidthFixed,
-                                150.0f);
-        percentage_control("Stop Loss", draft.stop_percent, 0.25f, 5.0f);
-        percentage_control("Target", draft.target_percent, 0.25f, 5.0f);
-        ImGui::EndTable();
+    input("Stop Loss", draft.stop_percent, .01f, 100.f);
+    input("Target", draft.target_percent, .01f, 100.f);
+    if (ImGui::Checkbox("GTC", &draft.gtc)) {
+        persistent_changed_ = true;
+        long_preview_.reset();
+        short_preview_.reset();
     }
-    ImGui::Spacing();
-    static_cast<void>(ImGui::Button("LONG", {118.0f, 34.0f}));
+
+    const auto build_intent = [&](application::HotkeyOrderSide side)
+        -> std::optional<application::HotkeyBracketIntent> {
+        const auto risk =
+            DecimalFromPercent(settings.account_risk_per_trade_percent);
+        const auto stop = DecimalFromPercent(draft.stop_percent);
+        const auto target = DecimalFromPercent(draft.target_percent);
+        if (!risk || !stop || !target) {
+            error_ = "Invalid risk, target, or stop percentage";
+            return std::nullopt;
+        }
+        const float maximum = side == application::HotkeyOrderSide::Long
+                                  ? settings.max_long_buying_power_percent
+                                  : settings.max_short_buying_power_percent;
+        const auto buying_power = DecimalFromPercent(maximum);
+        if (!buying_power) {
+            error_ = "Invalid buying-power limit";
+            return std::nullopt;
+        }
+        return application::HotkeyBracketIntent{
+            state.selected_symbol, side, *risk, *target, *stop, *buying_power,
+            draft.gtc};
+    };
+
+    const auto long_intent = build_intent(application::HotkeyOrderSide::Long);
+    const auto short_intent = build_intent(application::HotkeyOrderSide::Short);
+    if (long_intent && short_intent)
+        preview_request_ = HotkeyPreviewRequest{*long_intent, *short_intent};
+
+    if (ImGui::Button("LONG", {118, 34}) && long_intent) {
+        active_intent_ = *long_intent;
+        submission_request_ = *long_intent;
+        error_.clear();
+        result_.reset();
+    }
     ImGui::SameLine();
-    static_cast<void>(ImGui::Button("SHORT", {118.0f, 34.0f}));
-    ImGui::TextDisabled("Order submission is not wired yet.");
+    if (ImGui::Button("SHORT", {118, 34}) && short_intent) {
+        active_intent_ = *short_intent;
+        submission_request_ = *short_intent;
+        error_.clear();
+        result_.reset();
+    }
+
+    if (long_preview_ || short_preview_) {
+        ImGui::Separator();
+        ImGui::TextUnformatted("Live calculation");
+        DrawCommitment("Long commitment", long_preview_, long_preview_error_);
+        DrawCommitment("Short commitment", short_preview_, short_preview_error_);
+    }
+    if (!error_.empty())
+        ImGui::TextColored({.95f, .32f, .32f, 1}, "%s", error_.c_str());
+    if (result_) {
+        const bool accepted = result_->AcceptedByBroker();
+        ImGui::TextColored(
+            accepted ? ImVec4{.30f, .85f, .40f, 1} : ImVec4{.95f, .32f, .32f, 1},
+            accepted ? "Order accepted" : "Order rejected: %s",
+            accepted ? "" : result_->message.c_str());
+    }
 
     workspace.EndWindow(window);
+}
+
+std::optional<HotkeyPreviewRequest>
+TradeHotkeyWindowRenderer::ConsumePreviewRequest() {
+    return std::exchange(preview_request_, std::nullopt);
+}
+
+std::optional<application::HotkeyBracketIntent>
+TradeHotkeyWindowRenderer::ConsumeSubmissionRequest() {
+    return std::exchange(submission_request_, std::nullopt);
+}
+
+void TradeHotkeyWindowRenderer::SetPreviews(
+    std::expected<application::HotkeyBracketPreview, std::string> long_preview,
+    std::expected<application::HotkeyBracketPreview, std::string> short_preview) {
+    if (long_preview) {
+        long_preview_ = std::move(*long_preview);
+        long_preview_error_.clear();
+    } else {
+        long_preview_.reset();
+        long_preview_error_ = long_preview.error();
+    }
+    if (short_preview) {
+        short_preview_ = std::move(*short_preview);
+        short_preview_error_.clear();
+    } else {
+        short_preview_.reset();
+        short_preview_error_ = short_preview.error();
+    }
+}
+
+void TradeHotkeyWindowRenderer::SetSubmissionResult(
+    std::future<core::OrderCommandResult> result) {
+    pending_result_ = std::move(result);
+}
+
+void TradeHotkeyWindowRenderer::SetSubmissionError(std::string error) {
+    error_ = std::move(error);
 }
 
 bool TradeHotkeyWindowRenderer::ConsumePersistentChanges() {

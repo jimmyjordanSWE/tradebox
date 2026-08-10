@@ -294,8 +294,10 @@ std::string EncodeProfile(const WorkstationState& state) {
     output << "window_snap_pixels = " << state.application.window_snap_pixels << '\n';
     output << "vsync_requested = " << (state.application.vsync_requested ? "true" : "false") << '\n';
     output << "maximum_frame_rate = " << state.application.maximum_frame_rate << '\n';
-    output << "account_risk_per_trade_percent = "
-           << state.application.account_risk_per_trade_percent << '\n';
+      output << "account_risk_per_trade_percent = "
+             << state.application.account_risk_per_trade_percent << '\n';
+      output << "max_long_buying_power_percent = " << state.application.max_long_buying_power_percent << '\n';
+      output << "max_short_buying_power_percent = " << state.application.max_short_buying_power_percent << '\n';
     output << "watch_list_strong_green_rgba = "
            << static_cast<std::int64_t>(state.application.watch_list_strong_green_rgba) << '\n';
     output << "watch_list_light_green_rgba = "
@@ -332,8 +334,7 @@ std::string EncodeProfile(const WorkstationState& state) {
     output << "show_filled_orders = " << (state.workspace.show_filled_orders ? "true" : "false") << '\n';
     output << "order_management_symbol = " << Quote(state.workspace.order_management_symbol) << '\n';
     output << "time_sales_symbol = " << Quote(state.workspace.time_sales_symbol) << '\n';
-    output << "quick_long_buying_power_percent = " << state.workspace.quick_long_buying_power_percent << '\n';
-    output << "quick_short_buying_power_percent = " << state.workspace.quick_short_buying_power_percent << "\n\n";
+    output << "\n";
 
     const ChartDefaultsState& defaults = state.workspace.chart_defaults;
     output << "[chart_defaults]\n";
@@ -498,6 +499,8 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
         }
         const int source_schema_version = state.profile.schema_version;
         if (source_schema_version != 1 && source_schema_version != 2 &&
+            source_schema_version != 3 && source_schema_version != 4 &&
+            source_schema_version != 5 &&
             source_schema_version != kCurrentSchemaVersion)
             return std::unexpected(
                 "Unsupported workstation profile schema version");
@@ -507,9 +510,11 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
             state.application.window_snap_pixels = ValueOr(*application, "window_snap_pixels", state.application.window_snap_pixels);
             state.application.vsync_requested = ValueOr(*application, "vsync_requested", state.application.vsync_requested);
             state.application.maximum_frame_rate = ValueOr(*application, "maximum_frame_rate", state.application.maximum_frame_rate);
-            state.application.account_risk_per_trade_percent = ValueOr(
-                *application, "account_risk_per_trade_percent",
-                state.application.account_risk_per_trade_percent);
+              state.application.account_risk_per_trade_percent = ValueOr(
+                  *application, "account_risk_per_trade_percent",
+                  state.application.account_risk_per_trade_percent);
+              state.application.max_long_buying_power_percent = ValueOr(*application, "max_long_buying_power_percent", state.application.max_long_buying_power_percent);
+              state.application.max_short_buying_power_percent = ValueOr(*application, "max_short_buying_power_percent", state.application.max_short_buying_power_percent);
             state.application.watch_list_strong_green_rgba = static_cast<std::uint32_t>(
                 ValueOr(*application, "watch_list_strong_green_rgba",
                         static_cast<std::int64_t>(state.application.watch_list_strong_green_rgba)));
@@ -546,8 +551,6 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
             state.workspace.show_filled_orders = ValueOr(*workspace, "show_filled_orders", true);
             state.workspace.order_management_symbol = ValueOr(*workspace, "order_management_symbol", std::string{});
             state.workspace.time_sales_symbol = ValueOr(*workspace, "time_sales_symbol", state.workspace.time_sales_symbol);
-            state.workspace.quick_long_buying_power_percent = ValueOr(*workspace, "quick_long_buying_power_percent", 100.0f);
-            state.workspace.quick_short_buying_power_percent = ValueOr(*workspace, "quick_short_buying_power_percent", 80.0f);
         }
         if (const toml::table* defaults = root["chart_defaults"].as_table()) {
             state.workspace.chart_defaults.timeframe = ValueOr(

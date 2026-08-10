@@ -30,6 +30,7 @@ struct OrderProjection {
 };
 
 [[nodiscard]] OrderProjection ProjectOrder(const OrderState& order);
+[[nodiscard]] std::optional<Decimal> FilledOrderValue(const OrderState& order);
 
 struct QuickOrderProjection {
     Decimal reference_price;

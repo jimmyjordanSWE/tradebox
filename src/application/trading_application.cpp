@@ -3,6 +3,7 @@
 #include "tradebox/application/order_execution_service.h"
 #include "tradebox/application/history_request_tracker.h"
 #include "tradebox/broker/alpaca_service.h"
+#include "tradebox/broker/alpaca_price_rules.h"
 #include "tradebox/core/system_clock.h"
 #include "tradebox/core/bar_store.h"
 #include "tradebox/core/market_data_store.h"
@@ -18,6 +19,8 @@
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <atomic>
+#include <format>
 
 namespace tradebox::application {
 namespace {
@@ -706,7 +709,60 @@ TradingApplication::Disconnect() {
 
 std::future<core::OrderCommandResult> TradingApplication::SubmitOrder(
     core::NativeOrderCommand command) {
-    return impl_->order_execution.Submit(std::move(command));
+    auto completion = impl_->order_execution.Submit(std::move(command));
+    UiEventQueue* const events = impl_->event_queue;
+    return std::async(std::launch::async,
+        [events, completion = std::move(completion)]() mutable {
+            core::OrderCommandResult result = completion.get();
+            if (events != nullptr) events->Push(UiEvent{.type=UiEventType::OrderCommandCompleted, .received_at_ms=WallClockNowMs(), .request_id=result.request_id, .command_result=result});
+            return result;
+        });
+}
+
+std::expected<HotkeyBracketPreview, std::string>
+TradingApplication::PreviewHotkeyBracket(const HotkeyBracketIntent& intent) const {
+    return BuildHotkeyBracketPreview(impl_->core.Snapshot(),
+                                     impl_->market_data.Snapshot(intent.symbol), intent,
+                                     broker::alpaca::UsEquityPriceIncrementSchedule());
+}
+
+std::expected<std::future<core::OrderCommandResult>, std::string>
+TradingApplication::SubmitHotkeyBracket(const HotkeyBracketIntent& intent,
+                                        bool live_trading_confirmed) {
+    auto preview = PreviewHotkeyBracket(intent);
+    if (!preview) return std::unexpected(preview.error());
+    static std::atomic_uint64_t next_request{1};
+    const core::CoreSnapshot snapshot = impl_->core.Snapshot();
+    if (!snapshot.account) return std::unexpected("Account data is unavailable");
+    preview->order.client_order_id = std::format("hotkey-{}-{}", WallClockNowMs(), next_request.fetch_add(1));
+    return SubmitOrder(core::PlaceOrderCommand{
+        .context = {.request_id = std::format("hotkey-{}-{}", WallClockNowMs(), next_request.fetch_add(1)),
+                    .source = "trade_hotkey", .account_id = snapshot.account->id,
+                    .environment = snapshot.environment, .generation = snapshot.generation,
+                    .live_trading_confirmed = live_trading_confirmed},
+        .order = std::move(preview->order)});
+}
+
+std::expected<std::future<core::OrderCommandResult>, std::string>
+TradingApplication::ClosePosition(std::string symbol_or_asset_id,
+                                  bool live_trading_confirmed) {
+    if (symbol_or_asset_id.empty())
+        return std::unexpected("Select a position to exit");
+    const core::CoreSnapshot snapshot = impl_->core.Snapshot();
+    if (!snapshot.account) return std::unexpected("Account data is unavailable");
+    static std::atomic_uint64_t next_request{1};
+    return SubmitOrder(core::ClosePositionCommand{
+        .context = {
+            .request_id = std::format("position-exit-{}-{}", WallClockNowMs(),
+                                      next_request.fetch_add(1)),
+            .source = "positions_window",
+            .account_id = snapshot.account->id,
+            .environment = snapshot.environment,
+            .generation = snapshot.generation,
+            .live_trading_confirmed = live_trading_confirmed,
+        },
+        .symbol_or_asset_id = std::move(symbol_or_asset_id),
+    });
 }
 
 std::expected<core::OrderCommandLookup, std::string>

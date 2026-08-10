@@ -11,7 +11,7 @@
 
 namespace tradebox::workstation {
 
-inline constexpr int kCurrentSchemaVersion = 3;
+inline constexpr int kCurrentSchemaVersion = 6;
 inline constexpr std::size_t kInstrumentLinkGroupCount = 32;
 
 enum class InstrumentLinkColor : std::uint8_t {
@@ -82,6 +82,8 @@ struct ApplicationSettings {
     bool vsync_requested = true;
     int maximum_frame_rate = 120;
     float account_risk_per_trade_percent = 1.0f;
+    float max_long_buying_power_percent = 100.0f;
+    float max_short_buying_power_percent = 80.0f;
     std::uint32_t watch_list_strong_green_rgba = 0x22d66fffU;
     std::uint32_t watch_list_light_green_rgba = 0x7be6a0ffU;
     std::uint32_t watch_list_light_red_rgba = 0xf08a8affU;
@@ -245,8 +247,6 @@ struct WorkspaceState {
     bool show_filled_orders = true;
     std::string order_management_symbol;
     std::string time_sales_symbol = "AMD";
-    float quick_long_buying_power_percent = 100.0f;
-    float quick_short_buying_power_percent = 80.0f;
     std::map<std::string, BracketDraftState, std::less<>> bracket_drafts;
     std::array<InstrumentLinkGroupState, kInstrumentLinkGroupCount>
         instrument_link_groups;

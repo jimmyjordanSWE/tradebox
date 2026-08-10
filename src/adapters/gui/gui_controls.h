@@ -1,9 +1,16 @@
 #pragma once
 
+#include "tradebox/workstation/state.h"
+
 #include "imgui.h"
 
 #include <array>
 #include <cstddef>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace tradebox::gui {
 
@@ -13,6 +20,33 @@ enum class ChromeButtonSymbol {
     Restore,
     Close,
 };
+
+struct TableColumnChoice {
+    std::string_view id;
+    std::string_view label;
+    bool required = false;
+};
+
+struct TableColumnActions {
+    std::optional<std::string> add;
+    std::optional<std::string> remove;
+};
+
+[[nodiscard]] std::vector<workstation::ColumnState*>
+OrderedVisibleTableColumns(workstation::PersistentTableState& table);
+[[nodiscard]] std::string TableColumnIdFromLabel(const char* label);
+[[nodiscard]] bool PersistTableColumnOrder(
+    workstation::PersistentTableState& table,
+    std::span<const std::string> display_ids);
+[[nodiscard]] bool PersistTableSortSpecs(
+    workstation::PersistentTableState& table,
+    const ImGuiTableSortSpecs* sort_specs);
+void SetupPersistentTableColumns(
+    std::span<workstation::ColumnState* const> columns,
+    std::span<const TableColumnChoice> choices, float fallback_width);
+[[nodiscard]] TableColumnActions DrawTableColumnControls(
+    const workstation::PersistentTableState& table,
+    std::span<const TableColumnChoice> choices, std::string_view id_scope);
 
 [[nodiscard]] std::array<char, 4> Utf8BmpGlyph(unsigned int codepoint);
 

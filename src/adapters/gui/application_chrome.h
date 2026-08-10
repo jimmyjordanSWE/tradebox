@@ -38,9 +38,9 @@ struct ChromeActions {
     bool new_watch_list = false;
     bool new_positions = false;
     bool new_orders = false;
+    bool new_trade_hotkey = false;
+    bool new_events = false;
     std::optional<std::string> open_watch_list_id;
-    bool new_debug = false;
-    bool imgui_demo = false;
     bool settings_changed = false;
 };
 

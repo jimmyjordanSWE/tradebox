@@ -9,6 +9,7 @@
 #include "tradebox/ui/model.h"
 #include "tradebox/application/ui_snapshot.h"
 #include "tradebox/application/market_data_interest.h"
+#include "tradebox/application/hotkey_order.h"
 
 #include <expected>
 #include <future>
@@ -90,6 +91,14 @@ public:
     Disconnect();
     [[nodiscard]] std::future<core::OrderCommandResult> SubmitOrder(
         core::NativeOrderCommand command);
+    [[nodiscard]] std::expected<HotkeyBracketPreview, std::string>
+    PreviewHotkeyBracket(const HotkeyBracketIntent& intent) const;
+    [[nodiscard]] std::expected<std::future<core::OrderCommandResult>, std::string>
+    SubmitHotkeyBracket(const HotkeyBracketIntent& intent,
+                        bool live_trading_confirmed);
+    [[nodiscard]] std::expected<std::future<core::OrderCommandResult>, std::string>
+    ClosePosition(std::string symbol_or_asset_id,
+                  bool live_trading_confirmed);
     [[nodiscard]] std::expected<core::OrderCommandLookup, std::string>
     OrderCommandStatus(const std::string& request_id);
     [[nodiscard]] core::AccountActivityPage AccountActivities(

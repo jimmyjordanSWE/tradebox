@@ -71,6 +71,12 @@ OrderProjection ProjectOrder(const OrderState& order) {
     };
 }
 
+std::optional<Decimal> FilledOrderValue(const OrderState& order) {
+    if (order.filled_qty <= Decimal::Zero() || !order.filled_avg_price)
+        return std::nullopt;
+    return order.filled_qty * *order.filled_avg_price;
+}
+
 QuickOrderProjection ProjectQuickOrder(
     const AccountState& account,
     const std::vector<PositionState>& positions,

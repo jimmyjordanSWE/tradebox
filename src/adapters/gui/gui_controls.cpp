@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <ranges>
 
 namespace tradebox::gui {
 namespace {
@@ -55,6 +56,152 @@ void DrawChromeButtonSymbol(
 }
 
 }  // namespace
+
+std::vector<workstation::ColumnState*> OrderedVisibleTableColumns(
+    workstation::PersistentTableState& table) {
+    std::vector<workstation::ColumnState*> columns;
+    columns.reserve(table.columns.size());
+    for (workstation::ColumnState& column : table.columns)
+        if (column.visible) columns.push_back(&column);
+    std::ranges::stable_sort(columns, [](const auto* left, const auto* right) {
+        if (left->order != right->order) return left->order < right->order;
+        return left->id < right->id;
+    });
+    return columns;
+}
+
+std::string TableColumnIdFromLabel(const char* label) {
+    if (label == nullptr) return {};
+    const std::string_view value(label);
+    const std::size_t separator = value.find("###");
+    return std::string(value.substr(
+        separator == std::string_view::npos ? 0 : separator + 3));
+}
+
+bool PersistTableColumnOrder(
+    workstation::PersistentTableState& table,
+    std::span<const std::string> display_ids) {
+    const std::size_t visible_count = static_cast<std::size_t>(
+        std::ranges::count(table.columns, true,
+                           &workstation::ColumnState::visible));
+    if (display_ids.size() != visible_count) return false;
+
+    std::vector<workstation::ColumnState> reordered;
+    reordered.reserve(table.columns.size());
+    for (const std::string& id : display_ids) {
+        const auto found = std::ranges::find(
+            table.columns, id, &workstation::ColumnState::id);
+        if (id.empty() || found == table.columns.end() || !found->visible ||
+            std::ranges::find(reordered, id,
+                              &workstation::ColumnState::id) != reordered.end())
+            return false;
+        reordered.push_back(*found);
+    }
+    for (const workstation::ColumnState& column : table.columns) {
+        if (!column.visible) reordered.push_back(column);
+    }
+
+    bool changed = false;
+    for (std::size_t index = 0; index < reordered.size(); ++index) {
+        changed = changed || reordered[index].order !=
+                                 static_cast<int>(index) ||
+                  reordered[index].id != table.columns[index].id;
+        reordered[index].order = static_cast<int>(index);
+    }
+    if (changed) table.columns = std::move(reordered);
+    return changed;
+}
+
+bool PersistTableSortSpecs(
+    workstation::PersistentTableState& table,
+    const ImGuiTableSortSpecs* sort_specs) {
+    if (sort_specs == nullptr || sort_specs->SpecsCount == 0) return false;
+    const ImGuiTableColumnSortSpecs& spec = sort_specs->Specs[0];
+    const std::string id = TableColumnIdFromLabel(
+        ImGui::TableGetColumnName(spec.ColumnIndex));
+    if (id.empty()) return false;
+    const std::string direction =
+        spec.SortDirection == ImGuiSortDirection_Descending ? "descending"
+                                                            : "ascending";
+    bool changed = false;
+    for (workstation::ColumnState& column : table.columns) {
+        const std::string next = column.id == id ? direction : "";
+        if (column.sort_direction != next) {
+            column.sort_direction = next;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+void SetupPersistentTableColumns(
+    std::span<workstation::ColumnState* const> columns,
+    std::span<const TableColumnChoice> choices, float fallback_width) {
+    for (const workstation::ColumnState* column : columns) {
+        const auto choice = std::ranges::find(
+            choices, column->id, &TableColumnChoice::id);
+        const std::string_view text =
+            choice == choices.end() ? std::string_view(column->id)
+                                    : choice->label;
+        const std::string label =
+            std::string(text) + "###" + column->id;
+        ImGuiTableColumnFlags flags = ImGuiTableColumnFlags_WidthFixed;
+        if (column->sort_direction == "descending")
+            flags |= ImGuiTableColumnFlags_DefaultSort |
+                     ImGuiTableColumnFlags_PreferSortDescending;
+        else if (column->sort_direction == "ascending")
+            flags |= ImGuiTableColumnFlags_DefaultSort;
+        ImGui::TableSetupColumn(
+            label.c_str(), flags,
+            column->width > 0.0f ? column->width : fallback_width);
+    }
+}
+
+TableColumnActions DrawTableColumnControls(
+    const workstation::PersistentTableState& table,
+    std::span<const TableColumnChoice> choices, std::string_view id_scope) {
+    TableColumnActions actions;
+    const std::string scope(id_scope);
+    ImGui::PushID(scope.c_str());
+    if (ImGui::Button("Add Column##add_column_button"))
+        ImGui::OpenPopup("add_column");
+    ImGui::SameLine();
+    if (ImGui::Button("Remove Column##remove_column_button"))
+        ImGui::OpenPopup("remove_column");
+
+    if (ImGui::BeginPopup("add_column")) {
+        for (const TableColumnChoice& choice : choices) {
+            if (choice.id.empty() || choice.label.empty() || choice.required ||
+                std::ranges::find(table.columns, choice.id,
+                                  &workstation::ColumnState::id) !=
+                    table.columns.end())
+                continue;
+            const std::string label(choice.label);
+            if (ImGui::MenuItem(label.c_str())) {
+                actions.add = std::string(choice.id);
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndPopup();
+    }
+    if (ImGui::BeginPopup("remove_column")) {
+        for (const workstation::ColumnState& column : table.columns) {
+            const auto choice = std::ranges::find(
+                choices, column.id, &TableColumnChoice::id);
+            if (choice == choices.end() || choice->required ||
+                choice->label.empty())
+                continue;
+            const std::string label(choice->label);
+            if (ImGui::MenuItem(label.c_str())) {
+                actions.remove = column.id;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
+    return actions;
+}
 
 std::array<char, 4> Utf8BmpGlyph(unsigned int codepoint) {
     return {

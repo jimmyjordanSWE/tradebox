@@ -110,6 +110,7 @@ add_library(tradebox_core STATIC
   src/core/bar_store.cpp
   src/core/market_data_store.cpp
   src/core/order_projection.cpp
+  src/core/price_increment.cpp
   src/core/order_request.cpp
   src/core/system_clock.cpp
   src/core/trade_pressure.cpp
@@ -145,7 +146,9 @@ add_library(tradebox_workstation STATIC
   src/workstation/chart_documents.cpp
   src/workstation/asset_preferences.cpp
   src/workstation/defaults.cpp
+  src/workstation/event_window.cpp
   src/workstation/instrument_links.cpp
+  src/workstation/order_tickets.cpp
   src/workstation/profile_codec.cpp
   src/workstation/profile_lock.cpp
   src/workstation/profile_store.cpp
@@ -171,6 +174,7 @@ add_library(tradebox_broker_alpaca STATIC
   src/broker/alpaca/alpaca_bar_request.cpp
   src/broker/alpaca/alpaca_market_stream_decoder.cpp
   src/broker/alpaca/alpaca_order_codec.cpp
+  src/broker/alpaca/alpaca_price_rules.cpp
   src/broker/alpaca/alpaca_page_validation.cpp
   src/broker/alpaca/alpaca_rest_transport.cpp
   src/broker/alpaca/alpaca_stream_supervision.cpp
@@ -192,6 +196,7 @@ tradebox_enable_strict_warnings(tradebox_broker_alpaca)
 
 add_library(tradebox_application STATIC
   src/application/chart_query.cpp
+  src/application/hotkey_order.cpp
   src/application/history_request_tracker.cpp
   src/application/indicator_projection_cache.cpp
   src/application/market_data_interest.cpp
@@ -215,6 +220,7 @@ add_executable(tradebox_gui WIN32
   src/adapters/gui/chart_geometry.cpp
   src/adapters/gui/chart_window.cpp
   src/adapters/gui/debug_window.cpp
+  src/adapters/gui/event_window.cpp
   src/adapters/gui/order_ticket_window.cpp
   src/adapters/gui/positions_window.cpp
   src/adapters/gui/trade_hotkey_window.cpp
@@ -296,6 +302,7 @@ if(BUILD_TESTING)
     tests/unit/credential_store_tests.cpp
     tests/unit/database_order_command_journal_tests.cpp
     tests/unit/market_data_interest_tests.cpp
+    tests/unit/hotkey_order_tests.cpp
     tests/unit/order_execution_service_tests.cpp
   )
   target_compile_features(tradebox_order_pipeline_tests PRIVATE cxx_std_23)
@@ -314,10 +321,12 @@ if(BUILD_TESTING)
   add_executable(tradebox_workstation_tests
     tests/unit/chart_geometry_tests.cpp
     tests/unit/native_chrome_layout_tests.cpp
+    tests/unit/table_controls_tests.cpp
     tests/unit/workstation_state_tests.cpp
     tests/unit/watch_list_autocomplete_tests.cpp
     tests/unit/workspace_dirty_tests.cpp
     src/adapters/gui/workspace.cpp
+    src/adapters/gui/gui_controls.cpp
   )
   target_compile_features(tradebox_workstation_tests PRIVATE cxx_std_23)
   target_include_directories(tradebox_workstation_tests PRIVATE

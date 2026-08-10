@@ -4,6 +4,7 @@
 
 using tradebox::core::OrderLifecycleState;
 using tradebox::core::OrderState;
+using tradebox::core::FilledOrderValue;
 using tradebox::core::ProjectOrder;
 
 TEST(OrderProjection, MapsBrokerLifecycleToTypedState) {
@@ -31,6 +32,17 @@ TEST(OrderProjection, ExposesCapabilitiesFromLifecycle) {
     order.status = "canceled";
     EXPECT_FALSE(ProjectOrder(order).capabilities.cancelable);
     EXPECT_FALSE(ProjectOrder(order).capabilities.replaceable);
+}
+
+TEST(OrderProjection, ComputesFilledOrderValueFromAuthoritativeFillData) {
+    OrderState order;
+    order.filled_qty = *tradebox::core::Decimal::Parse("25");
+    order.filled_avg_price = *tradebox::core::Decimal::Parse("175.64");
+
+    const auto value = FilledOrderValue(order);
+
+    ASSERT_TRUE(value);
+    EXPECT_EQ(value->ToString(), "4391");
 }
 
 TEST(OrderProjection, ComputesQuickOrderReadModelWithoutUiMath) {
