@@ -445,8 +445,15 @@ tradebox::broker::BrokerCommandResult CommandResult(
     }
     result.disposition =
         tradebox::broker::BrokerCommandDisposition::Rejected;
-    result.message = response.body.empty() ? "Broker rejected HTTP command"
-                                           : response.body;
+    result.message = "Broker rejected HTTP command";
+    if (!response.body.empty()) {
+        try {
+            const json value = json::parse(response.body);
+            if (value.is_object())
+                result.message = value.value("message", result.message);
+        } catch (const std::exception&) {
+        }
+    }
     return result;
 }
 

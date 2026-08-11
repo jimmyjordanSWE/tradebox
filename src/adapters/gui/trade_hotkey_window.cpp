@@ -134,12 +134,6 @@ void TradeHotkeyWindowRenderer::Draw(
         DrawCommitment("Long commitment", long_preview_, long_preview_error_);
         DrawCommitment("Short commitment", short_preview_, short_preview_error_);
     }
-    if (result_) {
-        const bool accepted = result_->AcceptedByBroker();
-        if (accepted)
-            ImGui::TextColored({.30f, .85f, .40f, 1}, "Order accepted");
-    }
-
     workspace.EndWindow(window);
 }
 

@@ -28,7 +28,8 @@ constexpr auto kPositionColumns = std::to_array<TableColumnDefinition>({
 constexpr auto kOrderColumns = std::to_array<TableColumnDefinition>({
     {"symbol", "Symbol", 110.0f, true},
     {"side", "Side", 75.0f}, {"status", "Status", 105.0f},
-    {"type", "Type", 95.0f}, {"qty", "Shares", 85.0f},
+    {"type", "Type", 95.0f}, {"price", "Price", 170.0f, true},
+    {"qty", "Shares", 85.0f},
     {"notional", "Order Notional", 110.0f}, {"filled", "Filled Shares", 100.0f},
     {"filled_avg", "Average Fill", 105.0f}, {"filled_value", "Filled Value", 110.0f}, {"limit", "Limit", 90.0f},
     {"stop", "Stop", 90.0f}, {"tif", "TIF", 70.0f},
@@ -148,12 +149,22 @@ std::expected<void, std::string> CreatePositionsWindow(WorkspaceState& state) {
 }
 std::expected<void, std::string> CreateOrdersWindow(WorkspaceState& state) {
     const auto created = CreateWindow(state, kOrdersWindowId, "orders", "Orders", kOrdersTableId,
-                        {"symbol", "side", "status", "class", "qty", "filled",
-                         "filled_avg", "filled_value", "limit", "stop", "submitted"},
+                        {"symbol", "side", "status", "type", "class", "qty", "price",
+                         "filled", "filled_avg", "filled_value", "submitted"},
                         {820.0f, 650.0f, 760.0f, 300.0f});
     if (!created) return created;
     PersistentTableState& table = state.windows.at(std::string(kOrdersWindowId))
                                       .tables.at(std::string(kOrdersTableId));
+    if (const auto price = std::ranges::find(table.columns, "price",
+                                             &ColumnState::id);
+        price == table.columns.end()) {
+        const int next_order = table.columns.empty()
+                                   ? 0
+                                   : std::ranges::max(table.columns, {},
+                                                      &ColumnState::order).order + 1;
+        table.columns.push_back({.id = "price", .order = next_order,
+                                 .width = 170.0f, .visible = true});
+    }
     if (std::ranges::none_of(table.columns, [](const ColumnState& column) {
             return !column.sort_direction.empty();
         })) {

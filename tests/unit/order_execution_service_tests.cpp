@@ -643,6 +643,35 @@ TEST(OrderExecutionService, ReplacementGetsIdempotentClientOrderId) {
               "tb-replace-1");
 }
 
+TEST(OrderExecutionService, BracketCancellationTargetsOnlyActiveChildLegs) {
+    EventJournal event_journal;
+    FixedClock clock;
+    core::TradingCore core(event_journal, clock);
+    core::OrderState parent{.id = "parent", .asset_class = "us_equity",
+                            .order_class = "bracket", .status = "filled"};
+    core::OrderState target{.id = "target", .parent_order_id = "parent",
+                            .asset_class = "us_equity", .status = "new",
+                            .limit_price = *core::Decimal::Parse("110")};
+    core::OrderState stop{.id = "stop", .parent_order_id = "parent",
+                          .asset_class = "us_equity", .status = "accepted",
+                          .stop_price = *core::Decimal::Parse("90")};
+    MakeLive(core, {parent, target, stop});
+    Gateway gateway;
+    CommandJournal command_journal;
+    application::OrderExecutionService service(core, gateway, command_journal,
+                                               clock);
+
+    const auto result = service.Submit(core::CancelBracketOrderCommand{
+        .context = Context("cancel-bracket"), .parent_order_id = "parent"}).get();
+
+    EXPECT_EQ(result.outcome, core::OrderCommandOutcome::BrokerAccepted);
+    ASSERT_EQ(gateway.canceled.size(), 2U);
+    EXPECT_TRUE(std::ranges::find(gateway.canceled, "target") !=
+                gateway.canceled.end());
+    EXPECT_TRUE(std::ranges::find(gateway.canceled, "stop") !=
+                gateway.canceled.end());
+}
+
 TEST(OrderExecutionService,
      CompletionFailureMakesKnownBrokerResponseIndeterminate) {
     EventJournal event_journal;
@@ -905,6 +934,69 @@ TEST(OrderExecutionService,
     EXPECT_EQ(gateway.close_quantities[1]->ToString(), "3.25");
     ASSERT_TRUE(gateway.close_percentages[2]);
     EXPECT_EQ(gateway.close_percentages[2]->ToString(), "40");
+}
+
+TEST(OrderExecutionService,
+     ClosingOnePositionDoesNotCancelItsOpenOrdersUnlessRequested) {
+    EventJournal event_journal;
+    FixedClock clock;
+    core::TradingCore core(event_journal, clock);
+    MakeLive(core,
+             {{.id = "open-aapl-order", .symbol = "AAPL", .status = "new"}},
+             {EquityPosition()});
+    Gateway gateway;
+    CommandJournal command_journal;
+    application::OrderExecutionService service(
+        core, gateway, command_journal, clock);
+
+    const auto result = service.Submit(core::ClosePositionCommand{
+        .context = Context("close-with-open-order"),
+        .symbol_or_asset_id = "AAPL",
+    }).get();
+
+    EXPECT_EQ(result.outcome, core::OrderCommandOutcome::BrokerAccepted);
+    EXPECT_TRUE(gateway.canceled.empty());
+    ASSERT_EQ(gateway.closed_positions.size(), 1U);
+    EXPECT_EQ(gateway.closed_positions.front(), "AAPL");
+}
+
+TEST(OrderExecutionService,
+     ClosingOnePositionCancelsOrdersThenWaitsForTheirConfirmation) {
+    EventJournal event_journal;
+    FixedClock clock;
+    core::TradingCore core(event_journal, clock);
+    MakeLive(core,
+             {{.id = "open-aapl-order", .symbol = "AAPL", .status = "new"}},
+             {EquityPosition()});
+    Gateway gateway;
+    CommandJournal command_journal;
+    application::OrderExecutionService service(
+        core, gateway, command_journal, clock);
+
+    std::thread confirmation([&core] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        EXPECT_TRUE(core.Ingest({
+            .kind = core::BrokerEventKind::OrdersSnapshot,
+            .generation = core::ConnectionGeneration{1},
+            .payload = core::OrdersSnapshotPayload{.orders = {{
+                .id = "open-aapl-order",
+                .symbol = "AAPL",
+                .status = "canceled",
+            }}},
+        }));
+    });
+    const auto result = service.Submit(core::ClosePositionCommand{
+        .context = Context("close-after-cancel"),
+        .symbol_or_asset_id = "AAPL",
+        .cancel_open_orders = true,
+    }).get();
+    confirmation.join();
+
+    EXPECT_EQ(result.outcome, core::OrderCommandOutcome::BrokerAccepted);
+    ASSERT_EQ(gateway.canceled.size(), 1U);
+    EXPECT_EQ(gateway.canceled.front(), "open-aapl-order");
+    ASSERT_EQ(gateway.closed_positions.size(), 1U);
+    EXPECT_EQ(gateway.closed_positions.front(), "AAPL");
 }
 
 TEST(OrderExecutionService, RejectsInvalidOrUnavailableCloseAmounts) {

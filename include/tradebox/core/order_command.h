@@ -30,6 +30,11 @@ struct CancelOrderCommand {
     std::string order_id;
 };
 
+struct CancelBracketOrderCommand {
+    OrderCommandContext context;
+    std::string parent_order_id;
+};
+
 struct ReplaceOrderCommand {
     OrderCommandContext context;
     std::string order_id;
@@ -65,7 +70,7 @@ struct CancelAllOrdersCommand {
 };
 
 using NativeOrderCommand =
-    std::variant<PlaceOrderCommand, CancelOrderCommand,
+    std::variant<PlaceOrderCommand, CancelOrderCommand, CancelBracketOrderCommand,
                  ReplaceOrderCommand, AmendBracketOrderCommand,
                  ClosePositionCommand,
                  CloseAllPositionsCommand, CancelAllOrdersCommand>;
@@ -126,6 +131,7 @@ enum class OrderCommandKind {
     ClosePosition,
     CloseAllPositions,
     CancelAllOrders,
+    CancelBracket,
 };
 
 struct OrderCommandRecord {

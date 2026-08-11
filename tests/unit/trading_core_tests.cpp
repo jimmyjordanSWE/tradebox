@@ -134,6 +134,33 @@ TEST(TradingCore, RetainsAdvancedOrderLegsFromAuthoritativeSnapshot) {
     EXPECT_EQ(target_found->parent_order_id, "entry");
 }
 
+TEST(TradingCore, DoesNotLetOlderOrderSnapshotReopenCanceledOrder) {
+    MemoryJournal journal;
+    FixedClock clock;
+    TradingCore core(journal, clock);
+    ASSERT_TRUE(core.Ingest(Event(BrokerEventKind::ConnectionAttemptStarted, 1)));
+    OrderState open;
+    open.id = "order-1";
+    open.status = "new";
+    open.updated_at_ms = 100;
+    ASSERT_TRUE(core.Ingest(OrdersEvent(1, {open})));
+
+    OrderState canceled = open;
+    canceled.status = "canceled";
+    canceled.updated_at_ms = 200;
+    ASSERT_TRUE(core.Ingest({
+        .kind = BrokerEventKind::TradeUpdate,
+        .generation = ConnectionGeneration{1},
+        .payload = TradeUpdatePayload{.event = "canceled", .order = canceled,
+                                      .event_at_ms = 200},
+    }));
+
+    ASSERT_TRUE(core.Ingest(OrdersEvent(1, {open})));
+    const CoreSnapshot snapshot = core.Snapshot();
+    ASSERT_EQ(snapshot.orders.size(), 1U);
+    EXPECT_EQ(snapshot.orders.front().status, "canceled");
+}
+
 TEST(TradingCore, AvoidsCopyingUnchangedSnapshots) {
     MemoryJournal journal;
     FixedClock clock;

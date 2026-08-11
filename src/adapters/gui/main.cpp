@@ -1171,6 +1171,8 @@ int RunApplication(const LaunchOptions& options) {
         }
         orders_renderer.Draw(
             workspace, workstation_state.workspace, snapshot);
+        if (auto error = orders_renderer.ConsumeLocalError())
+            ReportUiWarning(events, std::move(*error));
         if (application != nullptr) {
             if (auto request = orders_renderer.ConsumeActionRequest()) {
                 if (!snapshot.core.account) {
@@ -1192,6 +1194,21 @@ int RunApplication(const LaunchOptions& options) {
                             tradebox::core::CancelOrderCommand{
                                 .context = context,
                                 .order_id = std::move(request->order_id),
+                            }));
+                    } else if (request->kind ==
+                               tradebox::gui::OrdersWindowRenderer::ActionRequest::Kind::CancelBracket) {
+                        orders_renderer.SetSubmissionResult(application->SubmitOrder(
+                            tradebox::core::CancelBracketOrderCommand{
+                                .context = context,
+                                .parent_order_id = std::move(request->order_id),
+                            }));
+                    } else if (request->kind ==
+                               tradebox::gui::OrdersWindowRenderer::ActionRequest::Kind::AmendBracket) {
+                        orders_renderer.SetSubmissionResult(application->SubmitOrder(
+                            tradebox::core::AmendBracketOrderCommand{
+                                .context = context,
+                                .parent_order_id = std::move(request->order_id),
+                                .amendments = std::move(request->bracket_amendments),
                             }));
                     } else {
                         orders_renderer.SetSubmissionResult(application->SubmitOrder(

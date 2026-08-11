@@ -30,6 +30,9 @@ core::OrderCommandKind Kind(const core::NativeOrderCommand& command) {
                 std::is_same_v<T, core::CancelOrderCommand>) {
                 return core::OrderCommandKind::Cancel;
             } else if constexpr (
+                std::is_same_v<T, core::CancelBracketOrderCommand>) {
+                return core::OrderCommandKind::CancelBracket;
+            } else if constexpr (
                 std::is_same_v<T, core::ReplaceOrderCommand>) {
                 return core::OrderCommandKind::Replace;
             } else if constexpr (
@@ -89,6 +92,7 @@ core::OrderCommandResult Rejected(
 
 bool RequiresLiveSafety(const core::NativeOrderCommand& command) {
     return !std::holds_alternative<core::CancelOrderCommand>(command) &&
+           !std::holds_alternative<core::CancelBracketOrderCommand>(command) &&
            !std::holds_alternative<core::CancelAllOrdersCommand>(command);
 }
 
@@ -358,6 +362,23 @@ OrderExecutionService::ResolveRecovery(
             "Authoritative order state does not confirm cancellation",
             target->id);
     }
+    case core::OrderCommandKind::CancelBracket: {
+        const auto parent = find_order_by_id(command.target_order_id);
+        if (parent != snapshot.orders.end() &&
+            std::ranges::none_of(snapshot.orders, [&parent](const core::OrderState& order) {
+                return order.parent_order_id == parent->id &&
+                       !TerminalOrderStatus(order.status);
+            }))
+            return result(core::OrderCommandOutcome::BrokerAccepted,
+                          core::CommandRecoveryState::Resolved,
+                          "Authoritative bracket state confirms cancellation",
+                          parent->id);
+        if (!grace_elapsed) return std::nullopt;
+        return result(core::OrderCommandOutcome::Indeterminate,
+                      core::CommandRecoveryState::OperatorAttention,
+                      "Authoritative bracket cancellation requires operator review",
+                      command.target_order_id);
+    }
     case core::OrderCommandKind::ClosePosition: {
         const auto position = std::ranges::find_if(
             snapshot.positions,
@@ -615,6 +636,48 @@ core::OrderCommandResult OrderExecutionService::Execute(
             return complete(std::move(*failed));
         broker_result =
             gateway_.ReplaceOrder(replace->order_id, replace->replacement);
+    } else if (const auto* bracket_cancel =
+                   std::get_if<core::CancelBracketOrderCommand>(&command)) {
+        const auto parent = std::ranges::find_if(
+            snapshot.orders, [bracket_cancel](const core::OrderState& order) {
+                return order.id == bracket_cancel->parent_order_id &&
+                       order.order_class == "bracket";
+            });
+        if (parent == snapshot.orders.end())
+            return complete(Rejected(context.request_id,
+                core::OrderCommandOutcome::ValidationRejected,
+                "Bracket cancellation requires an authoritative bracket parent"));
+        std::vector<const core::OrderState*> active_legs;
+        for (const core::OrderState& order : snapshot.orders)
+            if (order.parent_order_id == parent->id &&
+                !TerminalOrderStatus(order.status))
+                active_legs.push_back(&order);
+        if (active_legs.empty())
+            return complete(Rejected(context.request_id,
+                core::OrderCommandOutcome::ValidationRejected,
+                "Bracket has no active legs to cancel"));
+        if (auto failed = mark_dispatch()) return complete(std::move(*failed));
+        std::vector<core::CommandItemResult> items;
+        std::size_t accepted = 0;
+        for (const core::OrderState* leg : active_legs) {
+            const auto result = gateway_.CancelOrder(leg->id);
+            accepted += result.disposition == broker::BrokerCommandDisposition::Accepted;
+            items.push_back({.id = leg->id, .http_status = result.http_status,
+                .accepted = result.disposition == broker::BrokerCommandDisposition::Accepted,
+                .message = result.message, .raw_response = result.raw_response});
+        }
+        return complete({.request_id = context.request_id,
+            .outcome = accepted == active_legs.size()
+                ? core::OrderCommandOutcome::BrokerAccepted
+                : accepted == 0 ? core::OrderCommandOutcome::BrokerRejected
+                                : core::OrderCommandOutcome::PartiallyAccepted,
+            .message = accepted == active_legs.size()
+                ? "Bracket cancellation accepted; reconciling order state"
+                : "Bracket cancellation only partially completed; operator review required",
+            .items = std::move(items), .reconciliation_required = true,
+            .recovery_state = accepted == active_legs.size()
+                ? core::CommandRecoveryState::NotRequired
+                : core::CommandRecoveryState::OperatorAttention});
     } else if (const auto* bracket =
                    std::get_if<core::AmendBracketOrderCommand>(&command)) {
         const auto parent = std::ranges::find_if(
@@ -740,6 +803,36 @@ core::OrderCommandResult OrderExecutionService::Execute(
                     .recovery_message = "Reconcile open orders before retrying the position close",
                 });
             }
+            const auto orders_canceled = [this, close] {
+                const core::CoreSnapshot current = core_.Snapshot();
+                const auto current_position = std::ranges::find_if(
+                    current.positions,
+                    [close](const core::PositionState& candidate) {
+                        return candidate.symbol == close->symbol_or_asset_id ||
+                               candidate.asset_id == close->symbol_or_asset_id;
+                    });
+                if (current_position == current.positions.end()) return true;
+                const bool orders_remain = std::ranges::any_of(
+                    current.orders, [&current_position](const core::OrderState& order) {
+                        return order.symbol == current_position->symbol &&
+                               !TerminalOrderStatus(order.status);
+                    });
+                return !orders_remain;
+            };
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(10);
+            while (!orders_canceled() &&
+                   std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!orders_canceled()) return complete({
+                .request_id = context.request_id,
+                .outcome = core::OrderCommandOutcome::PartiallyAccepted,
+                .message = "Open orders were cancelled, but their cancellation was not confirmed in time",
+                .items = std::move(canceled_orders),
+                .reconciliation_required = true,
+                .recovery_state = core::CommandRecoveryState::OperatorAttention,
+                .recovery_message = "Reconcile the position before retrying the exit",
+            });
         }
         broker_result = gateway_.ClosePosition(
             close->symbol_or_asset_id, close->qty, close->percentage);

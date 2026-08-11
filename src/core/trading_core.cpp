@@ -465,7 +465,14 @@ std::expected<void, CoreError> TradingCore::ApplyOrdersSnapshot(
                 .message = "Order snapshot contains an order without an ID",
             });
         }
-        replacement.insert_or_assign(order.id, order);
+        const auto current = orders_by_id_.find(order.id);
+        if (current != orders_by_id_.end() &&
+            current->second.updated_at_ms > 0 &&
+            order.updated_at_ms > 0 &&
+            current->second.updated_at_ms > order.updated_at_ms)
+            replacement.insert_or_assign(order.id, current->second);
+        else
+            replacement.insert_or_assign(order.id, order);
     }
     orders_by_id_ = std::move(replacement);
     return {};

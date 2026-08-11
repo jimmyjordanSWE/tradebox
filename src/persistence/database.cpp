@@ -285,6 +285,11 @@ std::string SerializeCommand(
                        value["order_id"] = typed.order_id;
                    } else if constexpr (std::is_same_v<
                                             T,
+                                            tradebox::core::CancelBracketOrderCommand>) {
+                       value["kind"] = "cancel_bracket";
+                       value["parent_order_id"] = typed.parent_order_id;
+                   } else if constexpr (std::is_same_v<
+                                            T,
                                             tradebox::core::ReplaceOrderCommand>) {
                        value["kind"] = "replace";
                        value["order_id"] = typed.order_id;
@@ -1042,6 +1047,9 @@ Database::LoadRecoverableOrderCommands() {
                 nlohmann::json::parse(text(12));
             command.target_order_id =
                 JsonString(payload, "order_id");
+            if (command.record.kind ==
+                tradebox::core::OrderCommandKind::CancelBracket)
+                command.target_order_id = JsonString(payload, "parent_order_id");
             command.symbol_or_asset_id =
                 JsonString(payload, "symbol_or_asset_id");
             if (payload.contains("qty") &&

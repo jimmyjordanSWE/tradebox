@@ -92,6 +92,10 @@ TEST(PositionsAndOrdersWindows, CreateSeparatePersistentWindows) {
     ASSERT_TRUE(orders->second.tables.contains(std::string(kOrdersTableId)));
     EXPECT_EQ(orders->second.tables.at(std::string(kOrdersTableId))
                   .columns.size(), 11U);
+    EXPECT_NE(std::ranges::find(
+                  orders->second.tables.at(std::string(kOrdersTableId)).columns,
+                  "price", &ColumnState::id),
+              orders->second.tables.at(std::string(kOrdersTableId)).columns.end());
 
     ASSERT_TRUE(AddPositionColumn(state.workspace, "day_pnl"));
     EXPECT_TRUE(RemovePositionColumn(state.workspace, "day_pnl"));

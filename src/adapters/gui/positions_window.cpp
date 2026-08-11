@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -186,6 +187,34 @@ std::string_view OrderText(const core::OrderState& order,
     return {};
 }
 
+struct OrderDisplayRow {
+    const core::OrderState* order = nullptr;
+    const core::OrderState* target_leg = nullptr;
+    const core::OrderState* stop_leg = nullptr;
+    std::string bracket_parent_id;
+
+    [[nodiscard]] bool IsBracket() const {
+        return !bracket_parent_id.empty();
+    }
+};
+
+std::string PriceText(const OrderDisplayRow& row) {
+    if (row.IsBracket()) {
+        std::string result;
+        if (row.target_leg && row.target_leg->limit_price)
+            result = std::format("T {}", Money(*row.target_leg->limit_price));
+        if (row.stop_leg && row.stop_leg->stop_price) {
+            if (!result.empty()) result += "  ";
+            result += std::format("S {}", Money(*row.stop_leg->stop_price));
+        }
+        return result.empty() ? "--" : result;
+    }
+    if (row.order->type == "market") return "Market";
+    if (row.order->type == "stop" || row.order->type == "stop_limit")
+        return row.order->stop_price ? Money(*row.order->stop_price) : "--";
+    return row.order->limit_price ? Money(*row.order->limit_price) : "--";
+}
+
 }  // namespace
 
 void PositionsWindowRenderer::AppendSnapshotQuery(
@@ -224,16 +253,6 @@ void PositionsWindowRenderer::Draw(
         ImGui::PopStyleVar();
         return;
     }
-    if (pending_exit_result_)
-        ImGui::TextDisabled("Exit request pending...");
-    else if (exit_result_)
-        ImGui::TextColored(
-            exit_result_->AcceptedByBroker() ? ImVec4{.30f, .85f, .40f, 1.0f}
-                                              : ImVec4{.95f, .32f, .32f, 1.0f},
-            "%s", exit_result_->AcceptedByBroker()
-                       ? "Exit accepted; reconciling position state."
-                       : exit_result_->message.c_str());
-
     auto& table = persisted.tables[std::string(workstation::kPositionsTableId)];
     const auto choices = TableColumnChoices(
         workstation::PositionColumnDefinitions());
@@ -289,7 +308,7 @@ void PositionsWindowRenderer::Draw(
                         "X##exit-position-{}", position->asset_id);
                     if (ImGui::SmallButton(exit_button_id.c_str())) {
                         exit_confirmation_symbol_ = position->symbol;
-                        ImGui::OpenPopup("Exit position?##positions");
+                        exit_confirmation_requested_ = true;
                     }
                     if (!can_exit) {
                         ImGui::EndDisabled();
@@ -333,6 +352,10 @@ void PositionsWindowRenderer::Draw(
     if (column_actions.add &&
         workstation::AddPositionColumn(state, *column_actions.add))
         persistent_changed_ = true;
+    if (exit_confirmation_requested_) {
+        ImGui::OpenPopup("Exit position?##positions");
+        exit_confirmation_requested_ = false;
+    }
     if (exit_confirmation_symbol_ &&
         ImGui::BeginPopupModal("Exit position?##positions", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -402,15 +425,6 @@ void OrdersWindowRenderer::Draw(
     if (ImGui::Checkbox("Completed##orders", &state.show_filled_orders))
         persistent_changed_ = true;
     ImGui::SameLine();
-    if (pending_result_)
-        ImGui::TextDisabled("Order request pending...");
-    else if (result_)
-        ImGui::TextColored(
-            result_->AcceptedByBroker() ? ImVec4{.30f, .85f, .40f, 1.0f}
-                                        : ImVec4{.95f, .32f, .32f, 1.0f},
-            "%s", result_->AcceptedByBroker()
-                       ? "Order request accepted; reconciling order state."
-                       : result_->message.c_str());
     auto& table = persisted.tables[std::string(workstation::kOrdersTableId)];
     const auto choices = TableColumnChoices(
         workstation::OrderColumnDefinitions());
@@ -434,105 +448,154 @@ void OrdersWindowRenderer::Draw(
         const ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs();
         persistent_changed_ =
             PersistTableSortSpecs(table, sort_specs) || persistent_changed_;
-        std::vector<const core::OrderState*> rows;
+        const auto visible = [&state](const core::OrderState& order) {
+            return IsCompletedOrder(order.status) ? state.show_filled_orders
+                                                  : state.show_active_orders;
+        };
+        std::unordered_map<std::string, const core::OrderState*> orders_by_id;
+        orders_by_id.reserve(snapshot.core.orders.size());
+        for (const core::OrderState& order : snapshot.core.orders)
+            orders_by_id.emplace(order.id, &order);
+        std::unordered_map<std::string, OrderDisplayRow> bracket_rows;
+        std::vector<OrderDisplayRow> rows;
         rows.reserve(snapshot.core.orders.size());
         for (const core::OrderState& order : snapshot.core.orders) {
-            const bool completed = IsCompletedOrder(order.status);
-            if ((completed && !state.show_filled_orders) ||
-                (!completed && !state.show_active_orders))
+            if (order.parent_order_id.empty()) {
+                if (order.order_class == "bracket") {
+                    auto& group = bracket_rows[order.id];
+                    group.order = &order;
+                    group.bracket_parent_id = order.id;
+                } else if (visible(order))
+                    rows.push_back({.order = &order});
                 continue;
-            rows.push_back(&order);
+            }
+            const auto parent = orders_by_id.find(order.parent_order_id);
+            if (parent == orders_by_id.end() ||
+                parent->second->order_class != "bracket") {
+                if (visible(order)) rows.push_back({.order = &order});
+                continue;
+            }
+            auto& group = bracket_rows[order.parent_order_id];
+            group.order = parent->second;
+            group.bracket_parent_id = order.parent_order_id;
+            if (order.stop_price) group.stop_leg = &order;
+            else if (order.limit_price) group.target_leg = &order;
+        }
+        for (auto& [parent_id, group] : bracket_rows) {
+            static_cast<void>(parent_id);
+            const bool any_visible = visible(*group.order) ||
+                (group.target_leg && visible(*group.target_leg)) ||
+                (group.stop_leg && visible(*group.stop_leg));
+            if (any_visible) rows.push_back(std::move(group));
         }
         if (sort_specs != nullptr && sort_specs->SpecsCount > 0) {
             const std::string column = TableColumnIdFromLabel(
                 ImGui::TableGetColumnName(sort_specs->Specs[0].ColumnIndex));
             const bool descending = sort_specs->Specs[0].SortDirection ==
                                     ImGuiSortDirection_Descending;
-            std::unordered_map<std::string, const core::OrderState*> roots;
-            roots.reserve(rows.size());
-            for (const core::OrderState* row : rows) {
-                if (row->parent_order_id.empty()) roots.emplace(row->id, row);
-            }
             std::stable_sort(rows.begin(), rows.end(),
-                             [&](const auto* left, const auto* right) {
+                             [&](const auto& left, const auto& right) {
                 if (column == "symbol") {
-                    const auto root_for = [&](const core::OrderState* order) {
-                        if (order->parent_order_id.empty()) return order;
-                        const auto parent = roots.find(order->parent_order_id);
-                        return parent == roots.end() ? order : parent->second;
-                    };
-                    const core::OrderState* const left_root = root_for(left);
-                    const core::OrderState* const right_root = root_for(right);
-                    if (left_root->symbol != right_root->symbol)
-                        return descending ? left_root->symbol > right_root->symbol
-                                          : left_root->symbol < right_root->symbol;
-                    if (left_root->id != right_root->id)
-                        return left_root->id < right_root->id;
-                    if (left == left_root || right == right_root)
-                        return left == left_root;
-                    return left->id < right->id;
+                    if (left.order->symbol != right.order->symbol)
+                        return descending ? left.order->symbol > right.order->symbol
+                                          : left.order->symbol < right.order->symbol;
+                    return left.order->id < right.order->id;
                 }
-                const auto left_number = OrderNumber(*left, column);
-                const auto right_number = OrderNumber(*right, column);
+                const auto left_number = OrderNumber(*left.order, column);
+                const auto right_number = OrderNumber(*right.order, column);
                 if (left_number && right_number && *left_number != *right_number)
                     return descending ? *left_number > *right_number
                                       : *left_number < *right_number;
                 if (left_number.has_value() != right_number.has_value())
                     return left_number.has_value();
-                const auto left_text = OrderText(*left, column);
-                const auto right_text = OrderText(*right, column);
+                const auto left_text = column == "price" ? PriceText(left) : OrderText(*left.order, column);
+                const auto right_text = column == "price" ? PriceText(right) : OrderText(*right.order, column);
                 if (left_text != right_text)
                     return descending ? left_text > right_text : left_text < right_text;
-                return left->id < right->id;
+                return left.order->id < right.order->id;
             });
         } else {
             std::stable_sort(rows.begin(), rows.end(),
-                             [](const auto* left, const auto* right) {
-                if (left->parent_order_id.empty() != right->parent_order_id.empty())
-                    return left->parent_order_id.empty();
-                if (left->parent_order_id != right->parent_order_id)
-                    return left->parent_order_id < right->parent_order_id;
-                return left->submitted_at_ms > right->submitted_at_ms;
+                             [](const auto& left, const auto& right) {
+                if (left.order->symbol != right.order->symbol)
+                    return left.order->symbol < right.order->symbol;
+                return left.order->submitted_at_ms > right.order->submitted_at_ms;
             });
         }
-        for (const core::OrderState* order : rows) {
+        for (const OrderDisplayRow& row : rows) {
+            const core::OrderState* const order = row.order;
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            const bool active = IsActiveOrder(*order);
-            const bool bracket_leg = !order->parent_order_id.empty();
-            if (!active || bracket_leg) ImGui::BeginDisabled();
-            const std::string cancel_id = std::format("Cancel##order-{}", order->id);
-            if (ImGui::SmallButton(cancel_id.c_str())) {
-                cancel_confirmation_order_id_ = order->id;
-                ImGui::OpenPopup("Cancel order?##orders");
-            }
-            ImGui::SameLine();
-            const std::string replace_id = std::format("Replace##order-{}", order->id);
-            if (ImGui::SmallButton(replace_id.c_str())) {
-                ReplaceDraft draft{.order_id = order->id, .symbol = order->symbol};
-                SetDecimalText(draft.qty, order->qty);
-                SetDecimalText(draft.notional, order->notional);
-                SetDecimalText(draft.limit_price, order->limit_price);
-                SetDecimalText(draft.stop_price, order->stop_price);
-                draft.time_in_force_index = TimeInForceIndex(order->time_in_force);
-                replace_draft_ = std::move(draft);
-                ImGui::OpenPopup("Replace order?##orders");
-            }
-            if (!active || bracket_leg) {
-                ImGui::EndDisabled();
-                ImGui::SetItemTooltip(bracket_leg
-                    ? "Use the bracket group action to change this leg."
-                    : "Terminal orders cannot be changed.");
+            const bool bracket = row.IsBracket();
+            const bool active = IsActiveOrder(*order) ||
+                (row.target_leg && IsActiveOrder(*row.target_leg)) ||
+                (row.stop_leg && IsActiveOrder(*row.stop_leg));
+            {
+                if (!active) ImGui::BeginDisabled();
+                const std::string& action_order_id =
+                    bracket ? row.bracket_parent_id : order->id;
+                const std::string cancel_id = std::format(
+                    "{}##order-{}",
+                    "Cancel",
+                    action_order_id);
+                if (ImGui::SmallButton(cancel_id.c_str())) {
+                    cancel_confirmation_order_id_ = action_order_id;
+                    cancel_confirmation_is_bracket_ = bracket;
+                    cancel_confirmation_requested_ = true;
+                }
+                ImGui::SameLine();
+                if (bracket) {
+                    const std::string replace_id = std::format(
+                        "Replace##order-{}", action_order_id);
+                    if (ImGui::SmallButton(replace_id.c_str())) {
+                        if (!row.target_leg || !row.target_leg->limit_price ||
+                            !row.stop_leg || !row.stop_leg->stop_price) {
+                            local_error_ =
+                                "Bracket replace requires an authoritative active target and stop-loss leg";
+                        } else {
+                            BracketReplaceDraft draft{
+                                .parent_order_id = action_order_id,
+                                .symbol = order->symbol,
+                                .target_order_id = row.target_leg->id,
+                                .stop_order_id = row.stop_leg->id,
+                            };
+                            SetDecimalText(draft.target_price,
+                                           row.target_leg->limit_price);
+                            SetDecimalText(draft.stop_price,
+                                           row.stop_leg->stop_price);
+                            bracket_replace_draft_ = std::move(draft);
+                            bracket_replace_requested_ = true;
+                        }
+                    }
+                } else {
+                    const std::string replace_id = std::format(
+                        "Replace##order-{}", order->id);
+                    if (ImGui::SmallButton(replace_id.c_str())) {
+                        ReplaceDraft draft{.order_id = order->id,
+                                           .symbol = order->symbol};
+                        SetDecimalText(draft.qty, order->qty);
+                        SetDecimalText(draft.notional, order->notional);
+                        SetDecimalText(draft.limit_price, order->limit_price);
+                        SetDecimalText(draft.stop_price, order->stop_price);
+                        draft.time_in_force_index =
+                            TimeInForceIndex(order->time_in_force);
+                        replace_draft_ = std::move(draft);
+                        ImGui::OpenPopup("Replace order?##orders");
+                    }
+                }
+                if (!active) {
+                    ImGui::EndDisabled();
+                    ImGui::SetItemTooltip("Terminal orders cannot be changed.");
+                }
             }
             for (const std::string& column : display_column_ids) {
                 ImGui::TableNextColumn();
                 if (column == "symbol") {
-                    if (!order->parent_order_id.empty()) ImGui::Indent();
                     ImGui::TextUnformatted(order->symbol.c_str());
-                    if (!order->parent_order_id.empty()) ImGui::Unindent();
                 } else if (column == "side") ImGui::TextUnformatted(order->side.c_str());
                 else if (column == "status") ImGui::TextUnformatted(order->status.c_str());
                 else if (column == "type") ImGui::TextUnformatted(order->type.c_str());
+                else if (column == "price") ImGui::TextUnformatted(PriceText(row).c_str());
                 else if (column == "qty") ImGui::TextUnformatted(order->qty ? order->qty->ToString().c_str() : "--");
                 else if (column == "notional") ImGui::TextUnformatted(order->notional ? Money(*order->notional).c_str() : "--");
                 else if (column == "filled") ImGui::TextUnformatted(order->filled_qty.ToString().c_str());
@@ -572,6 +635,11 @@ void OrdersWindowRenderer::Draw(
         workstation::AddOrderColumn(state, *column_actions.add))
         persistent_changed_ = true;
 
+    if (cancel_confirmation_requested_) {
+        ImGui::OpenPopup("Cancel order?##orders");
+        cancel_confirmation_requested_ = false;
+    }
+
     if (cancel_confirmation_order_id_ &&
         ImGui::BeginPopupModal("Cancel order?##orders", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -580,15 +648,70 @@ void OrdersWindowRenderer::Draw(
         ImGui::Separator();
         if (ImGui::Button("Cancel Order", {120.0f, 0.0f})) {
             action_request_ = ActionRequest{
-                .kind = ActionRequest::Kind::Cancel,
+                .kind = cancel_confirmation_is_bracket_
+                    ? ActionRequest::Kind::CancelBracket
+                    : ActionRequest::Kind::Cancel,
                 .order_id = std::move(*cancel_confirmation_order_id_),
             };
             cancel_confirmation_order_id_.reset();
+            cancel_confirmation_is_bracket_ = false;
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
         if (ImGui::Button("Keep Order", {100.0f, 0.0f})) {
             cancel_confirmation_order_id_.reset();
+            cancel_confirmation_is_bracket_ = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (bracket_replace_requested_) {
+        ImGui::OpenPopup("Replace bracket?##orders");
+        bracket_replace_requested_ = false;
+    }
+    if (bracket_replace_draft_ &&
+        ImGui::BeginPopupModal("Replace bracket?##orders", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        BracketReplaceDraft& draft = *bracket_replace_draft_;
+        ImGui::Text("Replace bracket %s", draft.symbol.c_str());
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::InputText("Target price", draft.target_price.data(),
+                         draft.target_price.size(),
+                         ImGuiInputTextFlags_CharsDecimal);
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::InputText("Stop-loss price", draft.stop_price.data(),
+                         draft.stop_price.size(),
+                         ImGuiInputTextFlags_CharsDecimal);
+        ImGui::Separator();
+        if (ImGui::Button("Replace Bracket", {120.0f, 0.0f})) {
+            std::string error;
+            const auto target = ParseReplacementDecimal(
+                draft.target_price, "Target price", error);
+            const auto stop = target ? ParseReplacementDecimal(
+                                           draft.stop_price, "Stop-loss price",
+                                           error)
+                                     : std::nullopt;
+            if (!target || !stop) {
+                local_error_ = std::move(error);
+            } else {
+                action_request_ = ActionRequest{
+                    .kind = ActionRequest::Kind::AmendBracket,
+                    .order_id = draft.parent_order_id,
+                    .bracket_amendments = {
+                        {.order_id = draft.target_order_id,
+                         .replacement = {.limit_price = *target}},
+                        {.order_id = draft.stop_order_id,
+                         .replacement = {.stop_price = *stop}},
+                    },
+                };
+                bracket_replace_draft_.reset();
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", {100.0f, 0.0f})) {
+            bracket_replace_draft_.reset();
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
@@ -625,9 +748,6 @@ void OrdersWindowRenderer::Draw(
                 return kTimeInForceChoices[static_cast<std::size_t>(index)].first;
             }, nullptr, static_cast<int>(kTimeInForceChoices.size()));
         if (!draft.change_time_in_force) ImGui::EndDisabled();
-        if (!draft.error.empty())
-            ImGui::TextColored({.95f, .32f, .32f, 1.0f}, "%s",
-                               draft.error.c_str());
         ImGui::Separator();
         if (ImGui::Button("Replace Order", {120.0f, 0.0f})) {
             core::ReplaceOrderRequest replacement;
@@ -651,11 +771,12 @@ void OrdersWindowRenderer::Draw(
                 replacement.time_in_force = kTimeInForceChoices[
                     static_cast<std::size_t>(draft.time_in_force_index)].second;
             if (!valid) {
-                draft.error = std::move(error);
+                local_error_ = std::move(error);
+                draft.error.clear();
             } else if (!replacement.qty && !replacement.notional &&
                        !replacement.limit_price && !replacement.stop_price &&
                        !replacement.trail && !replacement.time_in_force) {
-                draft.error = "Select at least one field to change.";
+                local_error_ = "Select at least one field to change.";
             } else {
                 action_request_ = ActionRequest{
                     .kind = ActionRequest::Kind::Replace,
@@ -681,6 +802,10 @@ void OrdersWindowRenderer::Draw(
 std::optional<OrdersWindowRenderer::ActionRequest>
 OrdersWindowRenderer::ConsumeActionRequest() {
     return std::exchange(action_request_, std::nullopt);
+}
+
+std::optional<std::string> OrdersWindowRenderer::ConsumeLocalError() {
+    return std::exchange(local_error_, std::nullopt);
 }
 
 void OrdersWindowRenderer::SetSubmissionResult(
