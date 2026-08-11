@@ -499,7 +499,8 @@ void OrdersWindowRenderer::Draw(
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             const bool active = IsActiveOrder(*order);
-            if (!active) ImGui::BeginDisabled();
+            const bool bracket_leg = !order->parent_order_id.empty();
+            if (!active || bracket_leg) ImGui::BeginDisabled();
             const std::string cancel_id = std::format("Cancel##order-{}", order->id);
             if (ImGui::SmallButton(cancel_id.c_str())) {
                 cancel_confirmation_order_id_ = order->id;
@@ -517,9 +518,11 @@ void OrdersWindowRenderer::Draw(
                 replace_draft_ = std::move(draft);
                 ImGui::OpenPopup("Replace order?##orders");
             }
-            if (!active) {
+            if (!active || bracket_leg) {
                 ImGui::EndDisabled();
-                ImGui::SetItemTooltip("Terminal orders cannot be changed.");
+                ImGui::SetItemTooltip(bracket_leg
+                    ? "Use the bracket group action to change this leg."
+                    : "Terminal orders cannot be changed.");
             }
             for (const std::string& column : display_column_ids) {
                 ImGui::TableNextColumn();
