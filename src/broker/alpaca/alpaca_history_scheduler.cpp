@@ -112,7 +112,7 @@ void HistoricalWorkScheduler::WorkerLoop() {
         {
             std::unique_lock lock(mutex_);
             ready_.wait(lock, [this] {
-                return stopping_ || !EmptyLocked();
+                return stopping_ || health_.queued != 0;
             });
             if (stopping_ && health_.queued == 0) return;
             auto take = [&](std::deque<HistoricalWork>& queue) {

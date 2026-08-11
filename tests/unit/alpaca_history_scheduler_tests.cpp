@@ -6,6 +6,7 @@
 #include <chrono>
 #include <future>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -140,6 +141,48 @@ TEST(HistoricalWorkScheduler, CancelsPendingWorkWithoutCancelingActiveWork) {
     release.set_value();
     scheduler.WaitForIdle();
     EXPECT_EQ(scheduler.Health().canceled, 1U);
+}
+
+TEST(HistoricalWorkScheduler, DoesNotTreatOtherInFlightWorkAsQueuedWork) {
+    HistoricalWorkScheduler scheduler{2, 4};
+    std::promise<void> first_started;
+    std::promise<void> second_started;
+    std::promise<void> release_first;
+    std::promise<void> release_second;
+    const std::shared_future<void> first_release =
+        release_first.get_future().share();
+    const std::shared_future<void> second_release =
+        release_second.get_future().share();
+
+    ASSERT_EQ(scheduler.Submit({
+                  .key = "first",
+                  .execute = [&] {
+                      first_started.set_value();
+                      first_release.wait();
+                  },
+              }),
+              HistoricalWorkSubmission::Accepted);
+    ASSERT_EQ(scheduler.Submit({
+                  .key = "second",
+                  .execute = [&] {
+                      second_started.set_value();
+                      second_release.wait();
+                  },
+              }),
+              HistoricalWorkSubmission::Accepted);
+    first_started.get_future().wait();
+    second_started.get_future().wait();
+
+    release_first.set_value();
+    while (scheduler.Health().completed == 0)
+        std::this_thread::yield();
+
+    const auto health = scheduler.Health();
+    EXPECT_EQ(health.queued, 0U);
+    EXPECT_EQ(health.in_flight, 1U);
+    release_second.set_value();
+    scheduler.WaitForIdle();
+    EXPECT_EQ(scheduler.Health().completed, 2U);
 }
 
 }  // namespace
