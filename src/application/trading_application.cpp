@@ -223,10 +223,14 @@ private:
         return left.key == right.key && left.symbol == right.symbol &&
                left.range == right.range;
     }
-    static bool Same(const core::TickQuery& left, const core::TickQuery& right) {
-        return left.instrument_id == right.instrument_id && left.symbol == right.symbol &&
-               left.start_ns == right.start_ns && left.end_ns == right.end_ns &&
-               left.feed == right.feed && left.include_trades == right.include_trades &&
+    // A visible consumer republishes its desired recent-history horizon every
+    // frame. The application owns that horizon after admission, so advancing
+    // the clock alone must not replace an in-flight or completed request.
+    static bool SameTickConsumer(const core::TickQuery& left,
+                                 const core::TickQuery& right) {
+        return left.instrument_id == right.instrument_id &&
+               left.symbol == right.symbol && left.feed == right.feed &&
+               left.include_trades == right.include_trades &&
                left.include_quotes == right.include_quotes;
     }
     static bool Same(const std::vector<core::HistoricalBarQuery>& left,
@@ -267,20 +271,29 @@ private:
         bars_ = next;
     }
     void ReconcileTicks(const std::unordered_map<std::string, core::TickQuery>& next,
-                        bool authenticated, AlpacaService& broker) {
+        bool authenticated, AlpacaService& broker) {
         if (!authenticated) {
-            ticks_.clear();
-            for (const auto& [consumer, demand] : next)
-                ticks_.emplace(consumer, TickState{
+            for (const auto& [consumer, demand] : next) {
+                const auto current = ticks_.find(consumer);
+                if (current != ticks_.end() &&
+                    SameTickConsumer(current->second.query, demand))
+                    continue;
+                ticks_[consumer] = {
                     .query = demand,
                     .series = {.query = demand,
                                .error = "Historical ticks are unavailable while disconnected"},
-                });
+                };
+            }
+            std::erase_if(ticks_, [&](const auto& entry) {
+                return !next.contains(entry.first);
+            });
             return;
         }
         for (const auto& [consumer, demand] : next) {
             const auto current = ticks_.find(consumer);
-            if (current != ticks_.end() && Same(current->second.query, demand)) continue;
+            if (current != ticks_.end() &&
+                SameTickConsumer(current->second.query, demand))
+                continue;
             ticks_[consumer] = {.query = demand, .request = broker.RequestTicks(demand)};
         }
         std::erase_if(ticks_, [&](const auto& entry) { return !next.contains(entry.first); });

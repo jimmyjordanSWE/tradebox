@@ -349,7 +349,7 @@ TEST(ChartApplicationSnapshotTest,
 }
 
 TEST(ChartApplicationSnapshotTest,
-     TickDemandPublishesReplacesAndReleasesDocumentSnapshot) {
+     TickDemandKeepsItsAdmittedRangeUntilDocumentReplacementOrRelease) {
     TemporaryDatabase temporary;
     Database database;
     std::string error;
@@ -373,6 +373,14 @@ TEST(ChartApplicationSnapshotTest,
     tick.query.end_ns = 30;
     snapshot = application.SnapshotForUi({.ticks = {tick}});
     ASSERT_EQ(snapshot.ticks.size(), 1U);
+    EXPECT_EQ(snapshot.ticks.front().series.query.end_ns, 20);
+
+    tick.query.instrument_id = "asset-msft";
+    tick.query.symbol = "MSFT";
+    snapshot = application.SnapshotForUi({.ticks = {tick}});
+    ASSERT_EQ(snapshot.ticks.size(), 1U);
+    EXPECT_EQ(snapshot.ticks.front().series.query.instrument_id,
+              "asset-msft");
     EXPECT_EQ(snapshot.ticks.front().series.query.end_ns, 30);
 
     snapshot = application.SnapshotForUi({});
