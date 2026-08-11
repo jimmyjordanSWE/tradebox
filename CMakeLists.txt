@@ -249,6 +249,9 @@ target_link_libraries(tradebox_gui PRIVATE
   d3d11
   dxgi
 )
+if(MSVC)
+  target_link_options(tradebox_gui PRIVATE /DEBUG:FULL)
+endif()
 add_custom_command(TARGET tradebox_gui POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
     ${CMAKE_SOURCE_DIR}/assets ${CMAKE_CURRENT_BINARY_DIR}/assets
