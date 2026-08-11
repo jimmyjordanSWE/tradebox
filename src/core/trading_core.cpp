@@ -279,7 +279,8 @@ void TradingCore::ApplyMarketData(
             positions_by_asset_id_.find(market.instrument_id);
         if (found != positions_by_asset_id_.end())
             position = &found->second;
-    } else if (!market.symbol.empty()) {
+    }
+    if (position == nullptr && !market.symbol.empty()) {
         const auto found = std::ranges::find_if(
             positions_by_asset_id_,
             [&market](const auto& entry) {

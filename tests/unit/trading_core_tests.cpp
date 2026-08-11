@@ -619,6 +619,39 @@ TEST(TradingCore, ProjectsLongPositionFromCanonicalMarketPriceExactly) {
     EXPECT_EQ(valued.change_today.ToString(), "0.017085427");
 }
 
+TEST(TradingCore, ValuesPositionBySymbolWhenMarketIdentityUsesAnotherNamespace) {
+    MemoryJournal journal;
+    FixedClock clock;
+    TradingCore core(journal, clock);
+    PositionState position;
+    position.asset_id = "provider-asset-id";
+    position.symbol = "AMD";
+    position.qty = D("10");
+    position.avg_entry_price = D("100");
+    position.lastday_price = D("99");
+    ASSERT_TRUE(core.Ingest(PositionsEvent(0, {position})));
+
+    core.ApplyMarketData(MarketDataSnapshot{
+        .instrument_id = "alpaca:provider-asset-id",
+        .symbol = "AMD",
+        .feed = MarketDataFeed::Iex,
+        .stream_status = MarketStreamStatus::Subscribed,
+        .trades_subscribed = true,
+        .latest_price = CanonicalMarketPrice{
+            .price = D("101.5"),
+            .event_time_ns = 10,
+            .received_at_ms = 2000,
+        },
+    });
+
+    const CoreSnapshot snapshot = core.Snapshot();
+    const PositionState& valued = snapshot.positions.front();
+    EXPECT_TRUE(valued.valuation_current);
+    EXPECT_EQ(valued.current_price.ToString(), "101.5");
+    EXPECT_EQ(valued.market_value.ToString(), "1015");
+    EXPECT_EQ(valued.unrealized_pl.ToString(), "15");
+}
+
 TEST(TradingCore, ProjectsShortPositionWithSignedExactPnL) {
     MemoryJournal journal;
     FixedClock clock;

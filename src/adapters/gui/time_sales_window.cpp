@@ -51,6 +51,39 @@ std::string Conditions(const core::MarketTrade& trade) {
     return result;
 }
 
+int CompareTrades(const core::MarketTrade& left,
+                  const core::MarketTrade& right,
+                  std::string_view column) {
+    if (column == "timestamp" || column == "time" || column == "minute") {
+        if (left.event_time_ns < right.event_time_ns) return -1;
+        if (left.event_time_ns > right.event_time_ns) return 1;
+    } else if (column == "price") {
+        if (left.price < right.price) return -1;
+        if (left.price > right.price) return 1;
+    } else if (column == "size") {
+        if (left.size < right.size) return -1;
+        if (left.size > right.size) return 1;
+    } else {
+        const std::string left_text =
+            column == "exchange" ? left.exchange
+            : column == "conditions" ? Conditions(left)
+            : column == "tape" ? left.tape
+                                : left.trade_id;
+        const std::string right_text =
+            column == "exchange" ? right.exchange
+            : column == "conditions" ? Conditions(right)
+            : column == "tape" ? right.tape
+                                : right.trade_id;
+        if (left_text < right_text) return -1;
+        if (left_text > right_text) return 1;
+    }
+    if (left.event_time_ns < right.event_time_ns) return -1;
+    if (left.event_time_ns > right.event_time_ns) return 1;
+    if (left.trade_id < right.trade_id) return -1;
+    if (left.trade_id > right.trade_id) return 1;
+    return 0;
+}
+
 const application::UiAssetSearchResult* MatchesFor(
     const application::ApplicationUiSnapshot& snapshot, std::string_view query) {
     const auto found = std::ranges::find(snapshot.asset_search_results, query,
@@ -179,33 +212,36 @@ void TimeSalesWindowRenderer::Draw(
             ImGui::TextDisabled("Choose an instrument to view live trades.");
         } else {
             ImGui::SameLine(); ImGui::TextDisabled("%s", document.symbol.c_str());
-            const auto columns = OrderedVisibleTableColumns(state.time_sales_table);
+            const auto columns = OrderedTableColumns(state.time_sales_table);
             const TableColumnActions actions = DrawTableColumnControls(
                 state.time_sales_table, kColumns, "time_sales_columns");
             if (actions.add) {
                 const auto choice = std::ranges::find(kColumns, *actions.add,
                                                       &TableColumnChoice::id);
                 if (choice != kColumns.end()) {
-                    const int order = static_cast<int>(state.time_sales_table.columns.size());
-                    state.time_sales_table.columns.push_back({.id = std::string(choice->id), .order = order,
-                                                              .width = 110.0f, .visible = true});
+                    const auto existing = std::ranges::find(
+                        state.time_sales_table.columns, choice->id,
+                        &workstation::ColumnState::id);
+                    if (existing != state.time_sales_table.columns.end())
+                        existing->visible = true;
+                    else {
+                        const int order = static_cast<int>(
+                            state.time_sales_table.columns.size());
+                        state.time_sales_table.columns.push_back({
+                            .id = std::string(choice->id),
+                            .order = order,
+                            .width = 110.0f,
+                            .visible = true});
+                    }
                     persistent_changed_ = true;
                 }
-            }
-            if (actions.remove) {
-                const auto old_size = state.time_sales_table.columns.size();
-                std::erase_if(state.time_sales_table.columns, [&](const auto& column) {
-                    return column.id == *actions.remove;
-                });
-                persistent_changed_ = persistent_changed_ ||
-                                      old_size != state.time_sales_table.columns.size();
             }
             const core::MarketDataSnapshot* market = snapshot.markets.Find(document.instrument_id);
             const auto tick = std::ranges::find(
                 snapshot.ticks, document.id,
                 &application::UiTickSnapshot::document_id);
             const std::vector<core::MarketTrade> empty_history;
-            const auto trades = DisplayTrades(
+            auto trades = DisplayTrades(
                 tick == snapshot.ticks.end() ? empty_history : tick->series.trades,
                 market);
             if (tick != snapshot.ticks.end() && tick->loading)
@@ -215,10 +251,34 @@ void TimeSalesWindowRenderer::Draw(
                                     tick->series.error.c_str());
             if (ImGui::BeginTable("trades", static_cast<int>(columns.size()),
                                   ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                                  ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY |
-                                  ImGuiTableFlags_NoSavedSettings, {0, 0})) {
+                                  PersistentTableInteractionFlags(), {0, 0})) {
                 SetupPersistentTableColumns(columns, kColumns, 110.0f);
                 ImGui::TableHeadersRow();
+                const std::vector<std::string> display_column_ids =
+                    CurrentVisibleTableColumnIds();
+                const ImGuiTableSortSpecs* sort_specs =
+                    ImGui::TableGetSortSpecs();
+                persistent_changed_ =
+                    PersistTableSortSpecs(state.time_sales_table,
+                                          sort_specs) ||
+                    persistent_changed_;
+                if (sort_specs != nullptr && sort_specs->SpecsCount > 0) {
+                    const std::string sort_column = TableColumnIdFromLabel(
+                        ImGui::TableGetColumnName(
+                            sort_specs->Specs[0].ColumnIndex));
+                    const bool descending =
+                        sort_specs->Specs[0].SortDirection ==
+                        ImGuiSortDirection_Descending;
+                    std::stable_sort(
+                        trades.begin(), trades.end(),
+                        [&](const core::MarketTrade* left,
+                            const core::MarketTrade* right) {
+                            const int comparison = CompareTrades(
+                                *left, *right, sort_column);
+                            return descending ? comparison > 0
+                                              : comparison < 0;
+                        });
+                }
                 ImGuiListClipper clipper;
                 clipper.Begin(static_cast<int>(trades.size()));
                 while (clipper.Step()) {
@@ -228,8 +288,8 @@ void TimeSalesWindowRenderer::Draw(
                         trades[static_cast<std::size_t>(index)];
                     const core::MarketTrade& trade = *trade_ptr;
                     ImGui::TableNextRow();
-                    for (const auto* column : columns) { ImGui::TableNextColumn();
-                        const std::string& id = column->id;
+                    for (const std::string& id : display_column_ids) {
+                        ImGui::TableNextColumn();
                         const std::string value = id == "timestamp" ? Time(trade.event_time_ns, "%Y-%m-%d %H:%M:%S") :
                             id == "time" ? Time(trade.event_time_ns, "%H:%M:%S") :
                             id == "minute" ? Time(trade.event_time_ns, "%H:%M") :
@@ -240,6 +300,9 @@ void TimeSalesWindowRenderer::Draw(
                     }
                     }
                 }
+                persistent_changed_ =
+                    PersistCurrentTableLayout(state.time_sales_table) ||
+                    persistent_changed_;
                 ImGui::EndTable();
             }
         }

@@ -176,29 +176,17 @@ void PositionsWindowRenderer::Draw(
     auto& table = persisted.tables[std::string(workstation::kPositionsTableId)];
     const auto choices = TableColumnChoices(
         workstation::PositionColumnDefinitions());
-    const auto columns = OrderedVisibleTableColumns(table);
+    const auto columns = OrderedTableColumns(table);
     const TableColumnActions column_actions = DrawTableColumnControls(
         table, choices, "positions_columns");
     if (ImGui::BeginTable("positions", static_cast<int>(columns.size()),
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                              ImGuiTableFlags_Sortable |
-                              ImGuiTableFlags_Reorderable |
-                              ImGuiTableFlags_SizingFixedFit |
-                              ImGuiTableFlags_ScrollX |
-                              ImGuiTableFlags_ScrollY |
-                              ImGuiTableFlags_NoSavedSettings,
+                              PersistentTableInteractionFlags(),
                           {0.0f, 0.0f})) {
         SetupPersistentTableColumns(columns, choices, 125.0f);
-        std::vector<std::string> display_column_ids;
-        display_column_ids.reserve(columns.size());
-        ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
-        for (const auto* column : columns) {
-            static_cast<void>(column);
-            ImGui::TableNextColumn();
-            display_column_ids.push_back(TableColumnIdFromLabel(
-                ImGui::TableGetColumnName()));
-            ImGui::TableHeader(ImGui::TableGetColumnName());
-        }
+        ImGui::TableHeadersRow();
+        const std::vector<std::string> display_column_ids =
+            CurrentVisibleTableColumnIds();
         const ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs();
         persistent_changed_ =
             PersistTableSortSpecs(table, sort_specs) || persistent_changed_;
@@ -277,13 +265,10 @@ void PositionsWindowRenderer::Draw(
             }
         }
         persistent_changed_ =
-            PersistTableColumnOrder(table, display_column_ids) ||
+            PersistCurrentTableLayout(table) ||
             persistent_changed_;
         ImGui::EndTable();
     }
-    if (column_actions.remove &&
-        workstation::RemovePositionColumn(state, *column_actions.remove))
-        persistent_changed_ = true;
     if (column_actions.add &&
         workstation::AddPositionColumn(state, *column_actions.add))
         persistent_changed_ = true;
@@ -347,29 +332,17 @@ void OrdersWindowRenderer::Draw(
     auto& table = persisted.tables[std::string(workstation::kOrdersTableId)];
     const auto choices = TableColumnChoices(
         workstation::OrderColumnDefinitions());
-    const auto columns = OrderedVisibleTableColumns(table);
+    const auto columns = OrderedTableColumns(table);
     const TableColumnActions column_actions = DrawTableColumnControls(
         table, choices, "orders_columns");
     if (ImGui::BeginTable("orders", static_cast<int>(columns.size()),
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                              ImGuiTableFlags_Sortable |
-                              ImGuiTableFlags_Reorderable |
-                              ImGuiTableFlags_SizingFixedFit |
-                              ImGuiTableFlags_ScrollX |
-                              ImGuiTableFlags_ScrollY |
-                              ImGuiTableFlags_NoSavedSettings,
+                              PersistentTableInteractionFlags(),
                           {0.0f, 0.0f})) {
         SetupPersistentTableColumns(columns, choices, 125.0f);
-        std::vector<std::string> display_column_ids;
-        display_column_ids.reserve(columns.size());
-        ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
-        for (const auto* column : columns) {
-            static_cast<void>(column);
-            ImGui::TableNextColumn();
-            display_column_ids.push_back(TableColumnIdFromLabel(
-                ImGui::TableGetColumnName()));
-            ImGui::TableHeader(ImGui::TableGetColumnName());
-        }
+        ImGui::TableHeadersRow();
+        const std::vector<std::string> display_column_ids =
+            CurrentVisibleTableColumnIds();
         const ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs();
         persistent_changed_ =
             PersistTableSortSpecs(table, sort_specs) || persistent_changed_;
@@ -476,13 +449,10 @@ void OrdersWindowRenderer::Draw(
             }
         }
         persistent_changed_ =
-            PersistTableColumnOrder(table, display_column_ids) ||
+            PersistCurrentTableLayout(table) ||
             persistent_changed_;
         ImGui::EndTable();
     }
-    if (column_actions.remove &&
-        workstation::RemoveOrderColumn(state, *column_actions.remove))
-        persistent_changed_ = true;
     if (column_actions.add &&
         workstation::AddOrderColumn(state, *column_actions.add))
         persistent_changed_ = true;

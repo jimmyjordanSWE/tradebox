@@ -95,9 +95,17 @@ TEST(PositionsAndOrdersWindows, CreateSeparatePersistentWindows) {
 
     ASSERT_TRUE(AddPositionColumn(state.workspace, "day_pnl"));
     EXPECT_TRUE(RemovePositionColumn(state.workspace, "day_pnl"));
+    EXPECT_FALSE(std::ranges::find(
+        positions->second.tables.at(std::string(kPositionsTableId)).columns,
+        "day_pnl", &ColumnState::id)->visible);
+    EXPECT_TRUE(AddPositionColumn(state.workspace, "day_pnl"));
     EXPECT_FALSE(RemovePositionColumn(state.workspace, "symbol"));
     ASSERT_TRUE(AddOrderColumn(state.workspace, "client_order_id"));
     EXPECT_TRUE(RemoveOrderColumn(state.workspace, "client_order_id"));
+    EXPECT_FALSE(std::ranges::find(
+        orders->second.tables.at(std::string(kOrdersTableId)).columns,
+        "client_order_id", &ColumnState::id)->visible);
+    EXPECT_TRUE(AddOrderColumn(state.workspace, "client_order_id"));
     EXPECT_FALSE(RemoveOrderColumn(state.workspace, "symbol"));
     EXPECT_NE(FindPositionColumn("valuation_received_ms"), nullptr);
     EXPECT_NE(FindOrderColumn("filled_at"), nullptr);
@@ -378,6 +386,35 @@ TEST(WatchListDocuments, DeletesRowsThroughWorkstationOwner) {
         state.workspace, *document_id, first_id));
 }
 
+TEST(WatchListDocuments, RejectsDuplicateTickerAssignments) {
+    WatchListDocumentState document{
+        .id = "watch-list.test",
+        .rows = {
+            {.id = "row.first"},
+            {.id = "row.second"},
+        },
+    };
+    ASSERT_TRUE(AssignWatchListRowAsset(
+        document, "row.first", "asset-amd", "AMD"));
+
+    const auto same_identity = AssignWatchListRowAsset(
+        document, "row.second", "asset-amd", "AMD");
+    ASSERT_FALSE(same_identity);
+    EXPECT_EQ(same_identity.error().message,
+              "ticker is already in this watch list");
+    EXPECT_TRUE(document.rows[1].instrument_id.empty());
+    EXPECT_TRUE(document.rows[1].symbol.empty());
+
+    const auto same_symbol = AssignWatchListRowAsset(
+        document, "row.second", "another-amd-identity", "AMD");
+    ASSERT_FALSE(same_symbol);
+    EXPECT_EQ(same_symbol.error().message,
+              "ticker is already in this watch list");
+
+    EXPECT_TRUE(AssignWatchListRowAsset(
+        document, "row.first", "asset-amd", "AMD"));
+}
+
 TEST(WatchListDocuments, KeepsOneEmptyDraftRowAtTheEnd) {
     WatchListDocumentState document{
         .id = "watch-list.test",
@@ -443,6 +480,8 @@ TEST(WatchListDocuments, InitializesAndAddsTableColumns) {
 
     ASSERT_TRUE(RemoveWatchListColumn(
         state.workspace, *created, WatchListColumnKind::CurrentPrice));
+    EXPECT_FALSE(std::ranges::find(
+        table->second.columns, "current_price", &ColumnState::id)->visible);
     table->second.columns.front().order = 6;
     table->second.columns.back().order = 0;
     ASSERT_TRUE(AddWatchListColumn(
@@ -451,15 +490,15 @@ TEST(WatchListDocuments, InitializesAndAddsTableColumns) {
         table->second.columns, "current_price",
         &ColumnState::id);
     ASSERT_NE(newest, table->second.columns.end());
-    EXPECT_EQ(newest->order, 7);
+    EXPECT_TRUE(newest->visible);
 
     EXPECT_FALSE(RemoveWatchListColumn(
         state.workspace, *created, WatchListColumnKind::Symbol));
     ASSERT_TRUE(RemoveWatchListColumn(
         state.workspace, *created, WatchListColumnKind::CurrentPrice));
-    ASSERT_EQ(table->second.columns.size(), 6U);
-    EXPECT_EQ(table->second.columns[0].id, "symbol");
-    EXPECT_EQ(table->second.columns[1].id, "trade_time");
+    ASSERT_EQ(table->second.columns.size(), 7U);
+    EXPECT_FALSE(std::ranges::find(
+        table->second.columns, "current_price", &ColumnState::id)->visible);
 
     std::string error;
     EXPECT_TRUE(ValidateAndNormalize(state, error)) << error;
@@ -470,7 +509,7 @@ TEST(WatchListDocuments, InitializesAndAddsTableColumns) {
     ASSERT_NE(decoded_window, decoded->workspace.windows.end());
     EXPECT_EQ(decoded_window->second.tables.at(std::string(kWatchListTableId))
                   .columns.size(),
-              6U);
+              7U);
 }
 
 TEST(WatchListDocuments, MigratesCloseColumnsToOpenColumns) {

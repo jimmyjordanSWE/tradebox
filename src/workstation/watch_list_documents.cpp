@@ -352,11 +352,15 @@ std::expected<void, WatchListDocumentError> AddWatchListColumn(
             "watch list document has no matching window"});
     PersistentTableState& table =
         window->second.tables[std::string(kWatchListTableId)];
-    if (std::ranges::any_of(table.columns, [&](const ColumnState& column) {
-            return column.id == definition->id;
-        }))
-        return std::unexpected(
-            WatchListDocumentError{"watch list column is already present"});
+    const auto existing = std::ranges::find(
+        table.columns, definition->id, &ColumnState::id);
+    if (existing != table.columns.end()) {
+        if (existing->visible)
+            return std::unexpected(WatchListDocumentError{
+                "watch list column is already present"});
+        existing->visible = true;
+        return {};
+    }
     int next_order = 0;
     for (const ColumnState& column : table.columns)
         next_order = std::max(next_order, column.order + 1);
@@ -392,9 +396,10 @@ std::expected<void, WatchListDocumentError> RemoveWatchListColumn(
     if (found == columns.end())
         return std::unexpected(
             WatchListDocumentError{"watch list column is not present"});
-    columns.erase(found);
-    for (std::size_t index = 0; index < columns.size(); ++index)
-        columns[index].order = static_cast<int>(index);
+    if (!found->visible)
+        return std::unexpected(
+            WatchListDocumentError{"watch list column is not visible"});
+    found->visible = false;
     return {};
 }
 
@@ -408,6 +413,15 @@ std::expected<void, WatchListDocumentError> AssignWatchListRowAsset(
     if (row == nullptr)
         return std::unexpected(
             WatchListDocumentError{"watch list row does not exist"});
+    const bool already_present = std::ranges::any_of(
+        document.rows, [&](const WatchListRowState& candidate) {
+            return candidate.id != row_id &&
+                   (candidate.instrument_id == instrument_id ||
+                    candidate.symbol == symbol);
+        });
+    if (already_present)
+        return std::unexpected(WatchListDocumentError{
+            "ticker is already in this watch list"});
     row->instrument_id = std::move(instrument_id);
     row->symbol = std::move(symbol);
     row->ticker_input = row->symbol;

@@ -29,15 +29,29 @@ struct TableColumnChoice {
 
 struct TableColumnActions {
     std::optional<std::string> add;
-    std::optional<std::string> remove;
+};
+
+struct TableColumnLayout {
+    std::string id;
+    float width = 0.0f;
+    bool visible = true;
 };
 
 [[nodiscard]] std::vector<workstation::ColumnState*>
+OrderedTableColumns(workstation::PersistentTableState& table);
+[[nodiscard]] std::vector<workstation::ColumnState*>
 OrderedVisibleTableColumns(workstation::PersistentTableState& table);
+[[nodiscard]] ImGuiTableFlags PersistentTableInteractionFlags();
 [[nodiscard]] std::string TableColumnIdFromLabel(const char* label);
 [[nodiscard]] bool PersistTableColumnOrder(
     workstation::PersistentTableState& table,
     std::span<const std::string> display_ids);
+[[nodiscard]] bool PersistTableColumnLayout(
+    workstation::PersistentTableState& table,
+    std::span<const TableColumnLayout> display_columns);
+[[nodiscard]] bool PersistCurrentTableLayout(
+    workstation::PersistentTableState& table);
+[[nodiscard]] std::vector<std::string> CurrentVisibleTableColumnIds();
 [[nodiscard]] bool PersistTableSortSpecs(
     workstation::PersistentTableState& table,
     const ImGuiTableSortSpecs* sort_specs);

@@ -1,5 +1,7 @@
 #include "gui_controls.h"
 
+#include "imgui_internal.h"
+
 #include <algorithm>
 #include <cmath>
 #include <ranges>
@@ -57,17 +59,35 @@ void DrawChromeButtonSymbol(
 
 }  // namespace
 
-std::vector<workstation::ColumnState*> OrderedVisibleTableColumns(
+std::vector<workstation::ColumnState*> OrderedTableColumns(
     workstation::PersistentTableState& table) {
     std::vector<workstation::ColumnState*> columns;
     columns.reserve(table.columns.size());
     for (workstation::ColumnState& column : table.columns)
-        if (column.visible) columns.push_back(&column);
+        columns.push_back(&column);
     std::ranges::stable_sort(columns, [](const auto* left, const auto* right) {
         if (left->order != right->order) return left->order < right->order;
         return left->id < right->id;
     });
     return columns;
+}
+
+std::vector<workstation::ColumnState*> OrderedVisibleTableColumns(
+    workstation::PersistentTableState& table) {
+    auto columns = OrderedTableColumns(table);
+    std::erase_if(columns, [](const workstation::ColumnState* column) {
+        return !column->visible;
+    });
+    return columns;
+}
+
+ImGuiTableFlags PersistentTableInteractionFlags() {
+    return ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable |
+           ImGuiTableFlags_Hideable |
+           ImGuiTableFlags_Sortable | ImGuiTableFlags_SizingFixedFit |
+           ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY |
+           ImGuiTableFlags_NoSavedSettings |
+           ImGuiTableFlags_ContextMenuInBody;
 }
 
 std::string TableColumnIdFromLabel(const char* label) {
@@ -112,6 +132,90 @@ bool PersistTableColumnOrder(
     return changed;
 }
 
+bool PersistTableColumnLayout(
+    workstation::PersistentTableState& table,
+    std::span<const TableColumnLayout> display_columns) {
+    if (display_columns.size() != table.columns.size()) return false;
+
+    std::vector<std::string> display_ids;
+    display_ids.reserve(display_columns.size());
+    for (const TableColumnLayout& layout : display_columns) {
+        const auto found = std::ranges::find(
+            table.columns, layout.id, &workstation::ColumnState::id);
+        if (layout.id.empty() || found == table.columns.end() ||
+            !std::isfinite(layout.width) ||
+            layout.width <= 0.0f ||
+            std::ranges::find(display_ids, layout.id) != display_ids.end())
+            return false;
+        display_ids.push_back(layout.id);
+    }
+
+    std::vector<workstation::ColumnState> reordered;
+    reordered.reserve(table.columns.size());
+    bool changed = false;
+    for (std::size_t index = 0; index < display_columns.size(); ++index) {
+        const TableColumnLayout& layout = display_columns[index];
+        const auto found = std::ranges::find(
+            table.columns, layout.id, &workstation::ColumnState::id);
+        workstation::ColumnState column = *found;
+        changed = changed || column.id != table.columns[index].id ||
+                  column.order != static_cast<int>(index) ||
+                  std::fabs(column.width - layout.width) > 0.5f ||
+                  column.visible != layout.visible;
+        column.order = static_cast<int>(index);
+        column.width = layout.width;
+        column.visible = layout.visible;
+        reordered.push_back(std::move(column));
+    }
+    if (changed) table.columns = std::move(reordered);
+    return changed;
+}
+
+bool PersistCurrentTableLayout(
+    workstation::PersistentTableState& table) {
+    const ImGuiTable* current = ImGui::GetCurrentTable();
+    if (current == nullptr || current->ColumnsCount <= 0) return false;
+    std::vector<TableColumnLayout> display_columns(
+        static_cast<std::size_t>(current->ColumnsCount));
+    for (int index = 0; index < current->ColumnsCount; ++index) {
+        const ImGuiTableColumn& column = current->Columns[index];
+        if (column.DisplayOrder < 0 ||
+            column.DisplayOrder >= current->ColumnsCount)
+            return false;
+        display_columns[static_cast<std::size_t>(column.DisplayOrder)] = {
+            .id = TableColumnIdFromLabel(
+                ImGui::TableGetColumnName(index)),
+            .width = column.WidthRequest > 0.0f
+                         ? column.WidthRequest
+                         : column.WidthGiven,
+            .visible = column.IsUserEnabledNextFrame,
+        };
+    }
+    return PersistTableColumnLayout(table, display_columns);
+}
+
+std::vector<std::string> CurrentVisibleTableColumnIds() {
+    const ImGuiTable* current = ImGui::GetCurrentTable();
+    if (current == nullptr || current->ColumnsCount <= 0) return {};
+    std::vector<std::pair<int, std::string>> ordered;
+    ordered.reserve(static_cast<std::size_t>(current->ColumnsCount));
+    for (int index = 0; index < current->ColumnsCount; ++index) {
+        const ImGuiTableColumn& column = current->Columns[index];
+        if (!column.IsUserEnabled) continue;
+        ordered.emplace_back(
+            column.DisplayOrder,
+            TableColumnIdFromLabel(ImGui::TableGetColumnName(index)));
+    }
+    std::ranges::sort(ordered, {}, &std::pair<int, std::string>::first);
+    std::vector<std::string> ids;
+    ids.reserve(ordered.size());
+    for (auto& [order, id] : ordered) {
+        static_cast<void>(order);
+        ids.push_back(std::move(id));
+    }
+    return ids;
+}
+
 bool PersistTableSortSpecs(
     workstation::PersistentTableState& table,
     const ImGuiTableSortSpecs* sort_specs) {
@@ -146,6 +250,10 @@ void SetupPersistentTableColumns(
         const std::string label =
             std::string(text) + "###" + column->id;
         ImGuiTableColumnFlags flags = ImGuiTableColumnFlags_WidthFixed;
+        if (!column->visible)
+            flags |= ImGuiTableColumnFlags_DefaultHide;
+        if (choice != choices.end() && choice->required)
+            flags |= ImGuiTableColumnFlags_NoHide;
         if (column->sort_direction == "descending")
             flags |= ImGuiTableColumnFlags_DefaultSort |
                      ImGuiTableColumnFlags_PreferSortDescending;
@@ -154,6 +262,17 @@ void SetupPersistentTableColumns(
         ImGui::TableSetupColumn(
             label.c_str(), flags,
             column->width > 0.0f ? column->width : fallback_width);
+    }
+    ImGuiTable* current = ImGui::GetCurrentTable();
+    if (current == nullptr || current->ColumnsCount !=
+                                  static_cast<int>(columns.size()))
+        return;
+    for (int index = 0; index < current->ColumnsCount; ++index) {
+        ImGuiTableColumn& runtime = current->Columns[index];
+        const bool requested = columns[static_cast<std::size_t>(index)]->visible;
+        if (runtime.IsUserEnabled == runtime.IsUserEnabledNextFrame &&
+            runtime.IsUserEnabled != requested)
+            ImGui::TableSetColumnEnabled(index, requested);
     }
 }
 
@@ -165,35 +284,17 @@ TableColumnActions DrawTableColumnControls(
     ImGui::PushID(scope.c_str());
     if (ImGui::Button("Add Column##add_column_button"))
         ImGui::OpenPopup("add_column");
-    ImGui::SameLine();
-    if (ImGui::Button("Remove Column##remove_column_button"))
-        ImGui::OpenPopup("remove_column");
 
     if (ImGui::BeginPopup("add_column")) {
         for (const TableColumnChoice& choice : choices) {
+            const auto existing = std::ranges::find(
+                table.columns, choice.id, &workstation::ColumnState::id);
             if (choice.id.empty() || choice.label.empty() || choice.required ||
-                std::ranges::find(table.columns, choice.id,
-                                  &workstation::ColumnState::id) !=
-                    table.columns.end())
+                (existing != table.columns.end() && existing->visible))
                 continue;
             const std::string label(choice.label);
             if (ImGui::MenuItem(label.c_str())) {
                 actions.add = std::string(choice.id);
-                ImGui::CloseCurrentPopup();
-            }
-        }
-        ImGui::EndPopup();
-    }
-    if (ImGui::BeginPopup("remove_column")) {
-        for (const workstation::ColumnState& column : table.columns) {
-            const auto choice = std::ranges::find(
-                choices, column.id, &TableColumnChoice::id);
-            if (choice == choices.end() || choice->required ||
-                choice->label.empty())
-                continue;
-            const std::string label(choice->label);
-            if (ImGui::MenuItem(label.c_str())) {
-                actions.remove = column.id;
                 ImGui::CloseCurrentPopup();
             }
         }

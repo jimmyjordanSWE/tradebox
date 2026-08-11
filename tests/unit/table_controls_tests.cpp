@@ -66,5 +66,48 @@ TEST(TableControls, ExtractsSemanticIdFromImGuiColumnLabel) {
     EXPECT_TRUE(TableColumnIdFromLabel(nullptr).empty());
 }
 
+TEST(TableControls, PersistsValidatedDisplayOrderAndWidthsTogether) {
+    workstation::PersistentTableState table{
+        .columns = {
+            {.id = "symbol", .order = 0, .width = 100.0f, .visible = true},
+            {.id = "hidden", .order = 1, .width = 80.0f, .visible = false},
+            {.id = "last", .order = 2, .width = 90.0f, .visible = true},
+        }};
+    const std::vector<TableColumnLayout> layout{
+        {.id = "last", .width = 145.0f, .visible = true},
+        {.id = "hidden", .width = 80.0f, .visible = true},
+        {.id = "symbol", .width = 175.0f, .visible = false},
+    };
+
+    EXPECT_TRUE(PersistTableColumnLayout(table, layout));
+    ASSERT_EQ(table.columns.size(), 3U);
+    EXPECT_EQ(table.columns[0].id, "last");
+    EXPECT_FLOAT_EQ(table.columns[0].width, 145.0f);
+    EXPECT_EQ(table.columns[1].id, "hidden");
+    EXPECT_TRUE(table.columns[1].visible);
+    EXPECT_EQ(table.columns[2].id, "symbol");
+    EXPECT_FLOAT_EQ(table.columns[2].width, 175.0f);
+    EXPECT_FALSE(table.columns[2].visible);
+}
+
+TEST(TableControls, RejectsInvalidWidthWithoutPartiallyChangingLayout) {
+    workstation::PersistentTableState table{
+        .columns = {
+            {.id = "symbol", .order = 0, .width = 100.0f, .visible = true},
+            {.id = "last", .order = 1, .width = 90.0f, .visible = true},
+        }};
+    const workstation::PersistentTableState original = table;
+    const std::vector<TableColumnLayout> layout{
+        {.id = "last", .width = 145.0f},
+        {.id = "symbol", .width = 0.0f},
+    };
+
+    EXPECT_FALSE(PersistTableColumnLayout(table, layout));
+    EXPECT_EQ(table.columns[0].id, original.columns[0].id);
+    EXPECT_FLOAT_EQ(table.columns[0].width, original.columns[0].width);
+    EXPECT_EQ(table.columns[1].id, original.columns[1].id);
+    EXPECT_FLOAT_EQ(table.columns[1].width, original.columns[1].width);
+}
+
 }  // namespace
 }  // namespace tradebox::gui

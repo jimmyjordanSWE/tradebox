@@ -71,7 +71,10 @@ std::expected<void, std::string> ChangeColumn(
     PersistentTableState& table = window->second.tables[std::string(table_id)];
     const auto found = std::ranges::find(table.columns, id, &ColumnState::id);
     if (add) {
-        if (found != table.columns.end()) return {};
+        if (found != table.columns.end()) {
+            found->visible = true;
+            return {};
+        }
         const int next_order = table.columns.empty()
                                    ? 0
                                    : std::ranges::max(table.columns, {},
@@ -85,10 +88,7 @@ std::expected<void, std::string> ChangeColumn(
     if (definition->required)
         return std::unexpected("This column is required");
     if (found == table.columns.end()) return {};
-    table.columns.erase(found);
-    std::ranges::sort(table.columns, {}, &ColumnState::order);
-    for (std::size_t index = 0; index < table.columns.size(); ++index)
-        table.columns[index].order = static_cast<int>(index);
+    found->visible = false;
     return {};
 }
 

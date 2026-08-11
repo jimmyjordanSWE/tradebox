@@ -355,7 +355,7 @@ void WatchListWindowRenderer::Draw(
         auto table = window_state->second.tables.find(
             std::string(workstation::kWatchListTableId));
         if (table == window_state->second.tables.end()) return;
-        const auto columns = OrderedVisibleTableColumns(table->second);
+        const auto columns = OrderedTableColumns(table->second);
         if (columns.empty()) return;
 
         ui::WorkspaceWindow window{
@@ -378,10 +378,15 @@ void WatchListWindowRenderer::Draw(
         ImGui::TextDisabled("Double-click a ticker to open Order Ticket");
         ImGui::SameLine();
         if (ImGui::Button("Add Ticker##watch_list_add_ticker")) {
-            const auto added = workstation::AddWatchListRow(state, document.id);
+            const auto added =
+                document.id == workstation::kWatchListDraftId
+                    ? workstation::AddWatchListRow(document)
+                    : workstation::AddWatchListRow(state, document.id);
             if (added) {
                 focus_row_id_ = *added;
                 persistent_changed_ = true;
+            } else {
+                message_ = added.error().message;
             }
         }
         ImGui::SameLine();
@@ -399,27 +404,16 @@ void WatchListWindowRenderer::Draw(
         const ImGuiTableFlags table_flags =
             ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_BordersInnerH |
             ImGuiTableFlags_BordersOuter | ImGuiTableFlags_RowBg |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable |
-            ImGuiTableFlags_Sortable |
-            ImGuiTableFlags_SizingFixedFit |
-            ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_NoSavedSettings;
+            PersistentTableInteractionFlags();
         std::optional<std::string> pending_delete_row;
         if (ImGui::BeginTable(table_id.c_str(),
                               static_cast<int>(columns.size()), table_flags,
                               ImVec2(0.0f, table_height))) {
             SetupPersistentTableColumns(
                 columns, kWatchListTableChoices, 140.0f);
-            std::vector<std::string> display_column_ids;
-            display_column_ids.reserve(columns.size());
-            ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
-            for (std::size_t index = 0; index < columns.size(); ++index) {
-                ImGui::TableNextColumn();
-                const std::string id =
-                    TableColumnIdFromLabel(ImGui::TableGetColumnName());
-                display_column_ids.push_back(id);
-                ImGui::TableHeader(ImGui::TableGetColumnName());
-            }
+            ImGui::TableHeadersRow();
+            const std::vector<std::string> display_column_ids =
+                CurrentVisibleTableColumnIds();
 
             persistent_changed_ =
                 PersistTableSortSpecs(
@@ -450,20 +444,22 @@ void WatchListWindowRenderer::Draw(
                         RowInteraction& interaction = interactions_[row.id];
                         const bool populated = !row.instrument_id.empty();
                         if (populated) {
+                            const bool clear_requested = ImGui::SmallButton(
+                                "X##clear_symbol");
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Remove ticker");
+                            if (clear_requested) {
+                                pending_delete_row = row.id;
+                                // Remove after EndTable so the loop never
+                                // invalidates its current row reference.
+                            }
+                            ImGui::SameLine();
                             const bool selected = ImGui::Selectable(
                                 row.symbol.c_str(),
                                 row.symbol == state.selected_symbol);
                             if (selected) {
                                 state.selected_symbol = row.symbol;
                                 persistent_changed_ = true;
-                            }
-                            ImGui::SameLine();
-                            const bool clear_requested = ImGui::SmallButton(
-                                "X##clear_symbol");
-                            if (clear_requested) {
-                                pending_delete_row = row.id;
-                                // Remove after EndTable so the loop never
-                                // invalidates its current row reference.
                             }
                         } else {
                         if (!interaction.initialized) {
@@ -544,6 +540,9 @@ void WatchListWindowRenderer::Draw(
                                     interaction.ticker[count] = '\0';
                                     interaction.highlighted_match = -1;
                                     persistent_changed_ = true;
+                                    message_.clear();
+                                } else {
+                                    message_ = assigned.error().message;
                                 }
                             }
                         }
@@ -612,11 +611,18 @@ void WatchListWindowRenderer::Draw(
                 ImGui::PopID();
             }
 
+            persistent_changed_ =
+                PersistCurrentTableLayout(table->second) ||
+                persistent_changed_;
             ImGui::EndTable();
 
             if (pending_delete_row) {
-                const auto deleted = workstation::DeleteWatchListRow(
-                    state, document.id, *pending_delete_row);
+                const auto deleted =
+                    document.id == workstation::kWatchListDraftId
+                        ? workstation::DeleteWatchListRow(
+                              document, *pending_delete_row)
+                        : workstation::DeleteWatchListRow(
+                              state, document.id, *pending_delete_row);
                 if (deleted) {
                     interactions_.erase(*pending_delete_row);
                     persistent_changed_ = true;
@@ -625,26 +631,8 @@ void WatchListWindowRenderer::Draw(
                 }
             }
 
-            persistent_changed_ =
-                PersistTableColumnOrder(
-                    table->second, display_column_ids) ||
-                persistent_changed_;
         }
 
-        if (column_actions.remove) {
-            const auto kind = workstation::WatchListColumnKindFromId(
-                *column_actions.remove);
-            if (!kind) {
-                message_ = "Unknown watch list column";
-            } else {
-                const auto removed = workstation::RemoveWatchListColumn(
-                    state, document.id, *kind);
-                if (removed)
-                    persistent_changed_ = true;
-                else
-                    message_ = removed.error().message;
-            }
-        }
         if (column_actions.add) {
             const auto kind = workstation::WatchListColumnKindFromId(
                 *column_actions.add);
