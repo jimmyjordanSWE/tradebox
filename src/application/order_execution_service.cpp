@@ -740,27 +740,6 @@ core::OrderCommandResult OrderExecutionService::Execute(
                     .recovery_message = "Reconcile open orders before retrying the position close",
                 });
             }
-            bool canceled_confirmed = false;
-            for (int attempt = 0; attempt < 50 && !canceled_confirmed;
-                 ++attempt) {
-                canceled_confirmed = std::ranges::none_of(
-                    core_.Snapshot().orders,
-                    [position](const core::OrderState& order) {
-                        return order.symbol == position->symbol &&
-                               !TerminalOrderStatus(order.status);
-                    });
-                if (!canceled_confirmed)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            if (!canceled_confirmed) return complete({
-                .request_id = context.request_id,
-                .outcome = core::OrderCommandOutcome::PartiallyAccepted,
-                .message = "Close deferred: broker state has not confirmed cancellation of all open orders",
-                .items = std::move(canceled_orders),
-                .reconciliation_required = true,
-                .recovery_state = core::CommandRecoveryState::OperatorAttention,
-                .recovery_message = "Wait for reconciliation, then retry the close",
-            });
         }
         broker_result = gateway_.ClosePosition(
             close->symbol_or_asset_id, close->qty, close->percentage);
