@@ -952,6 +952,7 @@ TradingApplication::ClosePosition(std::string symbol_or_asset_id,
             .live_trading_confirmed = live_trading_confirmed,
         },
         .symbol_or_asset_id = std::move(symbol_or_asset_id),
+        .cancel_open_orders = true,
     });
 }
 

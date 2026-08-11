@@ -50,14 +50,17 @@ OrderedVisibleTableColumns(workstation::PersistentTableState& table);
     workstation::PersistentTableState& table,
     std::span<const TableColumnLayout> display_columns);
 [[nodiscard]] bool PersistCurrentTableLayout(
-    workstation::PersistentTableState& table);
-[[nodiscard]] std::vector<std::string> CurrentVisibleTableColumnIds();
+    workstation::PersistentTableState& table,
+    std::size_t leading_transient_columns = 0);
+[[nodiscard]] std::vector<std::string> CurrentVisibleTableColumnIds(
+    std::size_t leading_transient_columns = 0);
 [[nodiscard]] bool PersistTableSortSpecs(
     workstation::PersistentTableState& table,
     const ImGuiTableSortSpecs* sort_specs);
 void SetupPersistentTableColumns(
     std::span<workstation::ColumnState* const> columns,
-    std::span<const TableColumnChoice> choices, float fallback_width);
+    std::span<const TableColumnChoice> choices, float fallback_width,
+    std::size_t leading_transient_columns = 0);
 [[nodiscard]] TableColumnActions DrawTableColumnControls(
     const workstation::PersistentTableState& table,
     std::span<const TableColumnChoice> choices, std::string_view id_scope);

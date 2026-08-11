@@ -8,6 +8,8 @@
 #include "imgui.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <format>
 #include <ranges>
 #include <string>
@@ -53,7 +55,51 @@ void DrawPnl(const core::Decimal& value, std::string_view text) {
 
 bool IsCompletedOrder(std::string_view status) {
     return status == "filled" || status == "canceled" ||
-           status == "expired" || status == "rejected" || status == "failed";
+           status == "cancelled" || status == "expired" ||
+           status == "rejected" || status == "failed" ||
+           status == "done_for_day" || status == "stopped";
+}
+
+constexpr std::array kTimeInForceChoices{
+    std::pair{"day", core::TimeInForce::Day},
+    std::pair{"gtc", core::TimeInForce::Gtc},
+    std::pair{"opg", core::TimeInForce::Opg},
+    std::pair{"cls", core::TimeInForce::Cls},
+    std::pair{"ioc", core::TimeInForce::Ioc},
+    std::pair{"fok", core::TimeInForce::Fok},
+};
+
+int TimeInForceIndex(std::string_view value) {
+    for (std::size_t index = 0; index < kTimeInForceChoices.size(); ++index)
+        if (value == kTimeInForceChoices[index].first)
+            return static_cast<int>(index);
+    return 0;
+}
+
+bool IsActiveOrder(const core::OrderState& order) {
+    return !IsCompletedOrder(order.status);
+}
+
+void SetDecimalText(std::array<char, 64>& output,
+                    const std::optional<core::Decimal>& value) {
+    if (!value) return;
+    const std::string text = value->ToString();
+    std::snprintf(output.data(), output.size(), "%s", text.c_str());
+}
+
+std::optional<core::Decimal> ParseReplacementDecimal(
+    const std::array<char, 64>& value, std::string_view label,
+    std::string& error) {
+    if (value.front() == '\0') {
+        error = std::string(label) + " is required";
+        return std::nullopt;
+    }
+    const auto parsed = core::Decimal::Parse(value.data());
+    if (!parsed) {
+        error = std::string(label) + " must be a valid decimal";
+        return std::nullopt;
+    }
+    return *parsed;
 }
 
 std::vector<TableColumnChoice> TableColumnChoices(
@@ -153,6 +199,12 @@ void PositionsWindowRenderer::AppendSnapshotQuery(
 void PositionsWindowRenderer::Draw(
     ui::Workspace& workspace, workstation::WorkspaceState& state,
     const application::ApplicationUiSnapshot& snapshot) {
+    if (pending_exit_result_ &&
+        pending_exit_result_->wait_for(std::chrono::seconds(0)) ==
+            std::future_status::ready) {
+        exit_result_ = pending_exit_result_->get();
+        pending_exit_result_.reset();
+    }
     const auto found = state.windows.find(
         std::string(workstation::kPositionsWindowId));
     if (found == state.windows.end() || !found->second.open) return;
@@ -172,6 +224,15 @@ void PositionsWindowRenderer::Draw(
         ImGui::PopStyleVar();
         return;
     }
+    if (pending_exit_result_)
+        ImGui::TextDisabled("Exit request pending...");
+    else if (exit_result_)
+        ImGui::TextColored(
+            exit_result_->AcceptedByBroker() ? ImVec4{.30f, .85f, .40f, 1.0f}
+                                              : ImVec4{.95f, .32f, .32f, 1.0f},
+            "%s", exit_result_->AcceptedByBroker()
+                       ? "Exit accepted; reconciling position state."
+                       : exit_result_->message.c_str());
 
     auto& table = persisted.tables[std::string(workstation::kPositionsTableId)];
     const auto choices = TableColumnChoices(
@@ -299,6 +360,12 @@ std::optional<std::string> PositionsWindowRenderer::ConsumeExitRequest() {
     return std::exchange(exit_request_, std::nullopt);
 }
 
+void PositionsWindowRenderer::SetExitResult(
+    std::future<core::OrderCommandResult> result) {
+    pending_exit_result_ = std::move(result);
+    exit_result_.reset();
+}
+
 bool PositionsWindowRenderer::ConsumePersistentChanges() {
     const bool changed = persistent_changed_;
     persistent_changed_ = false;
@@ -308,6 +375,12 @@ bool PositionsWindowRenderer::ConsumePersistentChanges() {
 void OrdersWindowRenderer::Draw(
     ui::Workspace& workspace, workstation::WorkspaceState& state,
     const application::ApplicationUiSnapshot& snapshot) {
+    if (pending_result_ &&
+        pending_result_->wait_for(std::chrono::seconds(0)) ==
+            std::future_status::ready) {
+        result_ = pending_result_->get();
+        pending_result_.reset();
+    }
     const auto found = state.windows.find(
         std::string(workstation::kOrdersWindowId));
     if (found == state.windows.end() || !found->second.open) return;
@@ -329,20 +402,35 @@ void OrdersWindowRenderer::Draw(
     if (ImGui::Checkbox("Completed##orders", &state.show_filled_orders))
         persistent_changed_ = true;
     ImGui::SameLine();
+    if (pending_result_)
+        ImGui::TextDisabled("Order request pending...");
+    else if (result_)
+        ImGui::TextColored(
+            result_->AcceptedByBroker() ? ImVec4{.30f, .85f, .40f, 1.0f}
+                                        : ImVec4{.95f, .32f, .32f, 1.0f},
+            "%s", result_->AcceptedByBroker()
+                       ? "Order request accepted; reconciling order state."
+                       : result_->message.c_str());
     auto& table = persisted.tables[std::string(workstation::kOrdersTableId)];
     const auto choices = TableColumnChoices(
         workstation::OrderColumnDefinitions());
     const auto columns = OrderedTableColumns(table);
     const TableColumnActions column_actions = DrawTableColumnControls(
         table, choices, "orders_columns");
-    if (ImGui::BeginTable("orders", static_cast<int>(columns.size()),
+    if (ImGui::BeginTable("orders", static_cast<int>(columns.size() + 1U),
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                               PersistentTableInteractionFlags(),
                           {0.0f, 0.0f})) {
-        SetupPersistentTableColumns(columns, choices, 125.0f);
+        ImGui::TableSetupColumn(
+            "Actions", ImGuiTableColumnFlags_WidthFixed |
+                           ImGuiTableColumnFlags_NoHide |
+                           ImGuiTableColumnFlags_NoReorder |
+                           ImGuiTableColumnFlags_NoSort,
+            126.0f);
+        SetupPersistentTableColumns(columns, choices, 125.0f, 1);
         ImGui::TableHeadersRow();
         const std::vector<std::string> display_column_ids =
-            CurrentVisibleTableColumnIds();
+            CurrentVisibleTableColumnIds(1);
         const ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs();
         persistent_changed_ =
             PersistTableSortSpecs(table, sort_specs) || persistent_changed_;
@@ -409,6 +497,30 @@ void OrdersWindowRenderer::Draw(
         }
         for (const core::OrderState* order : rows) {
             ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            const bool active = IsActiveOrder(*order);
+            if (!active) ImGui::BeginDisabled();
+            const std::string cancel_id = std::format("Cancel##order-{}", order->id);
+            if (ImGui::SmallButton(cancel_id.c_str())) {
+                cancel_confirmation_order_id_ = order->id;
+                ImGui::OpenPopup("Cancel order?##orders");
+            }
+            ImGui::SameLine();
+            const std::string replace_id = std::format("Replace##order-{}", order->id);
+            if (ImGui::SmallButton(replace_id.c_str())) {
+                ReplaceDraft draft{.order_id = order->id, .symbol = order->symbol};
+                SetDecimalText(draft.qty, order->qty);
+                SetDecimalText(draft.notional, order->notional);
+                SetDecimalText(draft.limit_price, order->limit_price);
+                SetDecimalText(draft.stop_price, order->stop_price);
+                draft.time_in_force_index = TimeInForceIndex(order->time_in_force);
+                replace_draft_ = std::move(draft);
+                ImGui::OpenPopup("Replace order?##orders");
+            }
+            if (!active) {
+                ImGui::EndDisabled();
+                ImGui::SetItemTooltip("Terminal orders cannot be changed.");
+            }
             for (const std::string& column : display_column_ids) {
                 ImGui::TableNextColumn();
                 if (column == "symbol") {
@@ -449,7 +561,7 @@ void OrdersWindowRenderer::Draw(
             }
         }
         persistent_changed_ =
-            PersistCurrentTableLayout(table) ||
+            PersistCurrentTableLayout(table, 1) ||
             persistent_changed_;
         ImGui::EndTable();
     }
@@ -457,8 +569,121 @@ void OrdersWindowRenderer::Draw(
         workstation::AddOrderColumn(state, *column_actions.add))
         persistent_changed_ = true;
 
+    if (cancel_confirmation_order_id_ &&
+        ImGui::BeginPopupModal("Cancel order?##orders", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Cancel this open order?");
+        ImGui::TextDisabled("The broker may still fill it before cancellation completes.");
+        ImGui::Separator();
+        if (ImGui::Button("Cancel Order", {120.0f, 0.0f})) {
+            action_request_ = ActionRequest{
+                .kind = ActionRequest::Kind::Cancel,
+                .order_id = std::move(*cancel_confirmation_order_id_),
+            };
+            cancel_confirmation_order_id_.reset();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Keep Order", {100.0f, 0.0f})) {
+            cancel_confirmation_order_id_.reset();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (replace_draft_ &&
+        ImGui::BeginPopupModal("Replace order?##orders", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ReplaceDraft& draft = *replace_draft_;
+        ImGui::Text("Replace %s", draft.symbol.c_str());
+        ImGui::TextDisabled("Only checked fields will be changed.");
+        const auto field = [](const char* label, bool& enabled,
+                              std::array<char, 64>& text) {
+            ImGui::Checkbox(label, &enabled);
+            ImGui::SameLine();
+            if (!enabled) ImGui::BeginDisabled();
+            ImGui::SetNextItemWidth(160.0f);
+            ImGui::InputText(std::format("##{}", label).c_str(), text.data(),
+                             text.size(), ImGuiInputTextFlags_CharsDecimal);
+            if (!enabled) ImGui::EndDisabled();
+        };
+        field("Quantity", draft.change_qty, draft.qty);
+        field("Notional", draft.change_notional, draft.notional);
+        field("Limit price", draft.change_limit_price, draft.limit_price);
+        field("Stop price", draft.change_stop_price, draft.stop_price);
+        field("Trail", draft.change_trail, draft.trail);
+        ImGui::Checkbox("Time in force", &draft.change_time_in_force);
+        ImGui::SameLine();
+        if (!draft.change_time_in_force) ImGui::BeginDisabled();
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::Combo(
+            "##time-in-force", &draft.time_in_force_index,
+            [](void*, int index) {
+                return kTimeInForceChoices[static_cast<std::size_t>(index)].first;
+            }, nullptr, static_cast<int>(kTimeInForceChoices.size()));
+        if (!draft.change_time_in_force) ImGui::EndDisabled();
+        if (!draft.error.empty())
+            ImGui::TextColored({.95f, .32f, .32f, 1.0f}, "%s",
+                               draft.error.c_str());
+        ImGui::Separator();
+        if (ImGui::Button("Replace Order", {120.0f, 0.0f})) {
+            core::ReplaceOrderRequest replacement;
+            std::string error;
+            const auto add = [&](bool enabled, const std::array<char, 64>& text,
+                                 std::string_view label,
+                                 std::optional<core::Decimal>& target) {
+                if (!enabled) return true;
+                const auto parsed = ParseReplacementDecimal(text, label, error);
+                if (!parsed) return false;
+                target = *parsed;
+                return true;
+            };
+            const bool valid =
+                add(draft.change_qty, draft.qty, "Quantity", replacement.qty) &&
+                add(draft.change_notional, draft.notional, "Notional", replacement.notional) &&
+                add(draft.change_limit_price, draft.limit_price, "Limit price", replacement.limit_price) &&
+                add(draft.change_stop_price, draft.stop_price, "Stop price", replacement.stop_price) &&
+                add(draft.change_trail, draft.trail, "Trail", replacement.trail);
+            if (valid && draft.change_time_in_force)
+                replacement.time_in_force = kTimeInForceChoices[
+                    static_cast<std::size_t>(draft.time_in_force_index)].second;
+            if (!valid) {
+                draft.error = std::move(error);
+            } else if (!replacement.qty && !replacement.notional &&
+                       !replacement.limit_price && !replacement.stop_price &&
+                       !replacement.trail && !replacement.time_in_force) {
+                draft.error = "Select at least one field to change.";
+            } else {
+                action_request_ = ActionRequest{
+                    .kind = ActionRequest::Kind::Replace,
+                    .order_id = std::move(draft.order_id),
+                    .replacement = std::move(replacement),
+                };
+                replace_draft_.reset();
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", {100.0f, 0.0f})) {
+            replace_draft_.reset();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
     workspace.EndWindow(window);
     ImGui::PopStyleVar();
+}
+
+std::optional<OrdersWindowRenderer::ActionRequest>
+OrdersWindowRenderer::ConsumeActionRequest() {
+    return std::exchange(action_request_, std::nullopt);
+}
+
+void OrdersWindowRenderer::SetSubmissionResult(
+    std::future<core::OrderCommandResult> result) {
+    pending_result_ = std::move(result);
+    result_.reset();
 }
 
 bool OrdersWindowRenderer::ConsumePersistentChanges() {

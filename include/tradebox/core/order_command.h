@@ -36,11 +36,23 @@ struct ReplaceOrderCommand {
     ReplaceOrderRequest replacement;
 };
 
+struct BracketLegAmendment {
+    std::string order_id;
+    ReplaceOrderRequest replacement;
+};
+
+struct AmendBracketOrderCommand {
+    OrderCommandContext context;
+    std::string parent_order_id;
+    std::vector<BracketLegAmendment> amendments;
+};
+
 struct ClosePositionCommand {
     OrderCommandContext context;
     std::string symbol_or_asset_id;
     std::optional<Decimal> qty;
     std::optional<Decimal> percentage;
+    bool cancel_open_orders = false;
 };
 
 struct CloseAllPositionsCommand {
@@ -54,7 +66,8 @@ struct CancelAllOrdersCommand {
 
 using NativeOrderCommand =
     std::variant<PlaceOrderCommand, CancelOrderCommand,
-                 ReplaceOrderCommand, ClosePositionCommand,
+                 ReplaceOrderCommand, AmendBracketOrderCommand,
+                 ClosePositionCommand,
                  CloseAllPositionsCommand, CancelAllOrdersCommand>;
 
 enum class OrderCommandOutcome {
@@ -109,6 +122,7 @@ enum class OrderCommandKind {
     Place,
     Cancel,
     Replace,
+    AmendBracket,
     ClosePosition,
     CloseAllPositions,
     CancelAllOrders,

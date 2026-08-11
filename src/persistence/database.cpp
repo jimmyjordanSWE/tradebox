@@ -292,6 +292,17 @@ std::string SerializeCommand(
                            ReplacementJson(typed.replacement);
                    } else if constexpr (std::is_same_v<
                                             T,
+                                            tradebox::core::AmendBracketOrderCommand>) {
+                       value["kind"] = "amend_bracket";
+                       value["parent_order_id"] = typed.parent_order_id;
+                       value["amendments"] = nlohmann::json::array();
+                       for (const auto& amendment : typed.amendments)
+                           value["amendments"].push_back({
+                               {"order_id", amendment.order_id},
+                               {"replacement", ReplacementJson(amendment.replacement)},
+                           });
+                   } else if constexpr (std::is_same_v<
+                                            T,
                                             tradebox::core::ClosePositionCommand>) {
                        value["kind"] = "close_position";
                        value["symbol_or_asset_id"] =
@@ -301,6 +312,8 @@ std::string SerializeCommand(
                        if (typed.percentage)
                            value["percentage"] =
                                typed.percentage->ToString();
+                       value["cancel_open_orders"] =
+                           typed.cancel_open_orders;
                    } else if constexpr (std::is_same_v<
                                             T,
                                             tradebox::core::CloseAllPositionsCommand>) {

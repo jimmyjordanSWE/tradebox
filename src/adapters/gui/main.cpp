@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <cstdint>
@@ -38,6 +39,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <future>
+#include <format>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -726,6 +728,7 @@ int RunApplication(const LaunchOptions& options) {
     tradebox::gui::TimeSalesWindowRenderer time_sales_renderer;
     tradebox::gui::PositionsWindowRenderer positions_renderer;
     tradebox::gui::OrdersWindowRenderer orders_renderer;
+    std::atomic_uint64_t next_orders_window_request{1};
 
     if (!profile_existed) profile_store.MarkDirty();
 
@@ -1158,13 +1161,51 @@ int RunApplication(const LaunchOptions& options) {
             if (auto symbol = positions_renderer.ConsumeExitRequest()) {
                 auto submitted = application->ClosePosition(
                     std::move(*symbol), true);
-                if (!submitted) ReportUiWarning(events, submitted.error());
+                if (submitted)
+                    positions_renderer.SetExitResult(std::move(*submitted));
+                else
+                    ReportUiWarning(events, submitted.error());
             }
         } else {
             static_cast<void>(positions_renderer.ConsumeExitRequest());
         }
         orders_renderer.Draw(
             workspace, workstation_state.workspace, snapshot);
+        if (application != nullptr) {
+            if (auto request = orders_renderer.ConsumeActionRequest()) {
+                if (!snapshot.core.account) {
+                    ReportUiWarning(events, "Account data is unavailable");
+                } else {
+                    const auto context = tradebox::core::OrderCommandContext{
+                        .request_id = std::format(
+                            "orders-window-{}-{}", SDL_GetTicks(),
+                            next_orders_window_request.fetch_add(1)),
+                        .source = "orders_window",
+                        .account_id = snapshot.core.account->id,
+                        .environment = snapshot.core.environment,
+                        .generation = snapshot.core.generation,
+                        .live_trading_confirmed = true,
+                    };
+                    if (request->kind ==
+                        tradebox::gui::OrdersWindowRenderer::ActionRequest::Kind::Cancel) {
+                        orders_renderer.SetSubmissionResult(application->SubmitOrder(
+                            tradebox::core::CancelOrderCommand{
+                                .context = context,
+                                .order_id = std::move(request->order_id),
+                            }));
+                    } else {
+                        orders_renderer.SetSubmissionResult(application->SubmitOrder(
+                            tradebox::core::ReplaceOrderCommand{
+                                .context = context,
+                                .order_id = std::move(request->order_id),
+                                .replacement = std::move(request->replacement),
+                            }));
+                    }
+                }
+            }
+        } else {
+            static_cast<void>(orders_renderer.ConsumeActionRequest());
+        }
         time_sales_renderer.Draw(workspace, workstation_state.workspace, snapshot);
         const DebugSnapshot debug_snapshot = BuildDebugSnapshot(
             renderer, window, workstation_state.application,

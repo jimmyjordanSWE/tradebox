@@ -172,17 +172,24 @@ bool PersistTableColumnLayout(
 }
 
 bool PersistCurrentTableLayout(
-    workstation::PersistentTableState& table) {
+    workstation::PersistentTableState& table,
+    std::size_t leading_transient_columns) {
     const ImGuiTable* current = ImGui::GetCurrentTable();
-    if (current == nullptr || current->ColumnsCount <= 0) return false;
+    if (current == nullptr || current->ColumnsCount <= 0 ||
+        leading_transient_columns >=
+            static_cast<std::size_t>(current->ColumnsCount))
+        return false;
     std::vector<TableColumnLayout> display_columns(
-        static_cast<std::size_t>(current->ColumnsCount));
-    for (int index = 0; index < current->ColumnsCount; ++index) {
+        static_cast<std::size_t>(current->ColumnsCount) -
+        leading_transient_columns);
+    for (int index = static_cast<int>(leading_transient_columns);
+         index < current->ColumnsCount; ++index) {
         const ImGuiTableColumn& column = current->Columns[index];
-        if (column.DisplayOrder < 0 ||
+        if (column.DisplayOrder < static_cast<int>(leading_transient_columns) ||
             column.DisplayOrder >= current->ColumnsCount)
             return false;
-        display_columns[static_cast<std::size_t>(column.DisplayOrder)] = {
+        display_columns[static_cast<std::size_t>(column.DisplayOrder) -
+                        leading_transient_columns] = {
             .id = TableColumnIdFromLabel(
                 ImGui::TableGetColumnName(index)),
             .width = column.WidthRequest > 0.0f
@@ -194,12 +201,18 @@ bool PersistCurrentTableLayout(
     return PersistTableColumnLayout(table, display_columns);
 }
 
-std::vector<std::string> CurrentVisibleTableColumnIds() {
+std::vector<std::string> CurrentVisibleTableColumnIds(
+    std::size_t leading_transient_columns) {
     const ImGuiTable* current = ImGui::GetCurrentTable();
-    if (current == nullptr || current->ColumnsCount <= 0) return {};
+    if (current == nullptr || current->ColumnsCount <= 0 ||
+        leading_transient_columns >=
+            static_cast<std::size_t>(current->ColumnsCount))
+        return {};
     std::vector<std::pair<int, std::string>> ordered;
-    ordered.reserve(static_cast<std::size_t>(current->ColumnsCount));
-    for (int index = 0; index < current->ColumnsCount; ++index) {
+    ordered.reserve(static_cast<std::size_t>(current->ColumnsCount) -
+                    leading_transient_columns);
+    for (int index = static_cast<int>(leading_transient_columns);
+         index < current->ColumnsCount; ++index) {
         const ImGuiTableColumn& column = current->Columns[index];
         if (!column.IsUserEnabled) continue;
         ordered.emplace_back(
@@ -240,7 +253,8 @@ bool PersistTableSortSpecs(
 
 void SetupPersistentTableColumns(
     std::span<workstation::ColumnState* const> columns,
-    std::span<const TableColumnChoice> choices, float fallback_width) {
+    std::span<const TableColumnChoice> choices, float fallback_width,
+    std::size_t leading_transient_columns) {
     for (const workstation::ColumnState* column : columns) {
         const auto choice = std::ranges::find(
             choices, column->id, &TableColumnChoice::id);
@@ -265,11 +279,14 @@ void SetupPersistentTableColumns(
     }
     ImGuiTable* current = ImGui::GetCurrentTable();
     if (current == nullptr || current->ColumnsCount !=
-                                  static_cast<int>(columns.size()))
+                                  static_cast<int>(columns.size() +
+                                                   leading_transient_columns))
         return;
     for (int index = 0; index < current->ColumnsCount; ++index) {
+        if (index < static_cast<int>(leading_transient_columns)) continue;
         ImGuiTableColumn& runtime = current->Columns[index];
-        const bool requested = columns[static_cast<std::size_t>(index)]->visible;
+        const bool requested = columns[static_cast<std::size_t>(index) -
+                                       leading_transient_columns]->visible;
         if (runtime.IsUserEnabled == runtime.IsUserEnabledNextFrame &&
             runtime.IsUserEnabled != requested)
             ImGui::TableSetColumnEnabled(index, requested);
