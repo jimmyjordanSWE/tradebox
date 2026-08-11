@@ -82,6 +82,7 @@ target_include_directories(imgui PUBLIC
   ${dear_imgui_SOURCE_DIR}
   ${dear_imgui_SOURCE_DIR}/backends
 )
+target_compile_definitions(imgui PRIVATE IMGUI_DISABLE_DEBUG_TOOLS)
 target_link_libraries(imgui PUBLIC SDL3::SDL3-static d3d11 dxgi)
 
 function(tradebox_enable_strict_warnings target)
