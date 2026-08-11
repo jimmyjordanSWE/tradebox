@@ -418,6 +418,23 @@ std::string EncodeProfile(const WorkstationState& state) {
         }
     }
 
+    output << "[time_sales_table]\n";
+    for (const ColumnState& column : state.workspace.time_sales_table.columns) {
+        output << "[[time_sales_table.columns]]\n";
+        output << "id = " << Quote(column.id) << '\n';
+        output << "order = " << column.order << '\n';
+        output << "width = " << column.width << '\n';
+        output << "visible = " << (column.visible ? "true" : "false") << '\n';
+        output << "sort_direction = " << Quote(column.sort_direction) << "\n\n";
+    }
+    for (const TimeSalesDocumentState& document : state.workspace.time_sales) {
+        output << "[[time_sales]]\n";
+        output << "id = " << Quote(document.id) << '\n';
+        output << "instrument_id = " << Quote(document.instrument_id) << '\n';
+        output << "symbol = " << Quote(document.symbol) << '\n';
+        output << "ticker_input = " << Quote(document.ticker_input) << "\n\n";
+    }
+
     for (const ChartDocumentState& chart : state.workspace.charts) {
         output << "[[charts]]\n";
         output << "id = " << Quote(chart.id) << '\n';
@@ -467,24 +484,6 @@ std::string EncodeProfile(const WorkstationState& state) {
         output << "line_width = " << drawing.line_width << "\n\n";
     }
 
-    for (const OrderTicketState& ticket : state.workspace.order_tickets) {
-        output << "[[order_tickets]]\n";
-        output << "id = " << Quote(ticket.id) << '\n';
-        output << "open = " << (ticket.open ? "true" : "false") << '\n';
-        output << "name = " << Quote(ticket.name) << '\n';
-        output << "symbol = " << Quote(ticket.symbol) << '\n';
-        output << "side = " << Quote(ticket.side) << '\n';
-        output << "amount = " << Quote(ticket.amount) << '\n';
-        output << "amount_is_notional = " << (ticket.amount_is_notional ? "true" : "false") << '\n';
-        output << "type = " << Quote(ticket.type) << '\n';
-        output << "limit_price = " << Quote(ticket.limit_price) << '\n';
-        output << "stop_price = " << Quote(ticket.stop_price) << '\n';
-        output << "time_in_force = " << Quote(ticket.time_in_force) << '\n';
-        output << "extended_hours = " << (ticket.extended_hours ? "true" : "false") << '\n';
-        output << "credential_slot = " << Quote(ticket.credential_slot) << '\n';
-        output << "account_id = " << Quote(ticket.account_id) << '\n';
-        output << "paper = " << (ticket.paper ? "true" : "false") << "\n\n";
-    }
     return output.str();
 }
 
@@ -500,7 +499,7 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
         const int source_schema_version = state.profile.schema_version;
         if (source_schema_version != 1 && source_schema_version != 2 &&
             source_schema_version != 3 && source_schema_version != 4 &&
-            source_schema_version != 5 &&
+            source_schema_version != 5 && source_schema_version != 6 &&
             source_schema_version != kCurrentSchemaVersion)
             return std::unexpected(
                 "Unsupported workstation profile schema version");
@@ -685,6 +684,35 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
                 state.workspace.watch_lists.push_back(std::move(document));
             }
         }
+        state.workspace.time_sales.clear();
+        if (const toml::array* documents = root["time_sales"].as_array()) {
+            for (const toml::node& node : *documents) {
+                const toml::table* document = node.as_table();
+                if (document == nullptr) continue;
+                state.workspace.time_sales.push_back({
+                    .id = ValueOr(*document, "id", std::string{}),
+                    .instrument_id = ValueOr(*document, "instrument_id", std::string{}),
+                    .symbol = ValueOr(*document, "symbol", std::string{}),
+                    .ticker_input = ValueOr(*document, "ticker_input", std::string{}),
+                });
+            }
+        }
+        state.workspace.time_sales_table.columns.clear();
+        if (const toml::table* table = root["time_sales_table"].as_table()) {
+            if (const toml::array* columns = (*table)["columns"].as_array()) {
+                for (const toml::node& node : *columns) {
+                    const toml::table* column = node.as_table();
+                    if (column == nullptr) continue;
+                    state.workspace.time_sales_table.columns.push_back({
+                        .id = ValueOr(*column, "id", std::string{}),
+                        .order = ValueOr(*column, "order", 0),
+                        .width = ValueOr(*column, "width", 0.0f),
+                        .visible = ValueOr(*column, "visible", true),
+                        .sort_direction = ValueOr(*column, "sort_direction", std::string{}),
+                    });
+                }
+            }
+        }
         state.workspace.charts.clear();
         if (const toml::array* charts = root["charts"].as_array()) {
             for (const toml::node& node : *charts) {
@@ -751,30 +779,6 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
                     };
                 }
                 state.workspace.chart_drawings.push_back(std::move(value));
-            }
-        }
-        state.workspace.order_tickets.clear();
-        if (const toml::array* tickets = root["order_tickets"].as_array()) {
-            for (const toml::node& node : *tickets) {
-                const toml::table* ticket = node.as_table();
-                if (ticket == nullptr) continue;
-                state.workspace.order_tickets.push_back({
-                    .id = ValueOr(*ticket, "id", std::string{}),
-                    .open = ValueOr(*ticket, "open", true),
-                    .name = ValueOr(*ticket, "name", std::string{"Untitled order"}),
-                    .symbol = ValueOr(*ticket, "symbol", std::string{}),
-                    .side = ValueOr(*ticket, "side", std::string{"buy"}),
-                    .amount = ValueOr(*ticket, "amount", std::string{"1"}),
-                    .amount_is_notional = ValueOr(*ticket, "amount_is_notional", false),
-                    .type = ValueOr(*ticket, "type", std::string{"market"}),
-                    .limit_price = ValueOr(*ticket, "limit_price", std::string{}),
-                    .stop_price = ValueOr(*ticket, "stop_price", std::string{}),
-                    .time_in_force = ValueOr(*ticket, "time_in_force", std::string{"day"}),
-                    .extended_hours = ValueOr(*ticket, "extended_hours", false),
-                    .credential_slot = ValueOr(*ticket, "credential_slot", std::string{}),
-                    .account_id = ValueOr(*ticket, "account_id", std::string{}),
-                    .paper = ValueOr(*ticket, "paper", true),
-                });
             }
         }
         std::string validation_error;

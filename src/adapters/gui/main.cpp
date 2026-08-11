@@ -4,16 +4,17 @@
 #include "tradebox/ui/workspace.h"
 #include "tradebox/workstation/chart_documents.h"
 #include "tradebox/workstation/profile_store.h"
+#include "tradebox/workstation/trade_hotkey.h"
 #include "tradebox/workstation/watch_list_documents.h"
-#include "tradebox/workstation/order_tickets.h"
+#include "tradebox/workstation/time_sales_documents.h"
 
 #include "chart_window.h"
 #include "debug_window.h"
 #include "event_window.h"
-#include "order_ticket_window.h"
 #include "positions_window.h"
 #include "watch_list_window.h"
 #include "trade_hotkey_window.h"
+#include "time_sales_window.h"
 #include "tradebox/workstation/positions_orders_windows.h"
 #include "account_popup.h"
 #include "application_chrome.h"
@@ -38,6 +39,7 @@
 #include <filesystem>
 #include <future>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -195,6 +197,17 @@ std::string MarketTimeText(const MarketTimeZone& time_zone) {
     return std::string(time.data()) + " ET";
 }
 
+void ReportUiWarning(UiEventQueue& events, std::string message) {
+    const auto now = std::chrono::time_point_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now());
+    events.Push({
+        .type = UiEventType::Status,
+        .message = std::move(message),
+        .received_at_ms = now.time_since_epoch().count(),
+        .operational_severity = OperationalSeverity::Warning,
+    });
+}
+
 bool CreateRenderTarget(Dx11Renderer& renderer) {
     ComPtr<ID3D11Texture2D> back_buffer;
     if (FAILED(renderer.swap_chain->GetBuffer(
@@ -327,10 +340,12 @@ bool CreateRenderer(SDL_Window* window, Dx11Renderer& renderer) {
 DebugSnapshot BuildDebugSnapshot(
     const Dx11Renderer& renderer, SDL_Window* window,
     const tradebox::workstation::ApplicationSettings& settings,
-    double frames_per_second, double frame_time_ms) {
+    double frames_per_second, double frame_time_ms,
+    std::optional<tradebox::core::RestTransportHealth> rest_health) {
     DebugSnapshot snapshot;
     snapshot.frames_per_second = frames_per_second;
     snapshot.frame_time_ms = frame_time_ms;
+    snapshot.rest_health = std::move(rest_health);
     snapshot.vsync_requested = settings.vsync_requested;
     snapshot.frame_latency_waitable =
         renderer.frame_latency_waitable != nullptr;
@@ -721,12 +736,14 @@ int RunApplication(const LaunchOptions& options) {
     std::string startup_status = "Opening local market database...";
     tradebox::ui::Workspace workspace;
     workspace.SetPersistentState(&workstation_state.workspace);
+    tradebox::ui::UiScaleController ui_scale_controller;
+    ui_scale_controller.CaptureBaseline();
     tradebox::gui::ChartWindowRenderer chart_renderer;
       DebugWindowRenderer debug_renderer;
       EventWindowRenderer event_renderer;
     tradebox::gui::WatchListWindowRenderer watch_list_renderer;
     tradebox::gui::TradeHotkeyWindowRenderer trade_hotkey_renderer;
-    tradebox::gui::OrderTicketWindowRenderer order_ticket_renderer;
+    tradebox::gui::TimeSalesWindowRenderer time_sales_renderer;
     tradebox::gui::PositionsWindowRenderer positions_renderer;
     tradebox::gui::OrdersWindowRenderer orders_renderer;
 
@@ -734,6 +751,9 @@ int RunApplication(const LaunchOptions& options) {
 
     bool done = false;
     AccountPopupState account_popup;
+    std::vector<tradebox::application::SavedAccountDescriptor> saved_accounts;
+    std::string saved_accounts_error;
+    bool refresh_saved_accounts = true;
     const std::string initial_account_name =
         workstation_state.account_context.account_alias;
     std::copy_n(
@@ -843,9 +863,13 @@ int RunApplication(const LaunchOptions& options) {
             }
         }
 
+        ui_scale_controller.SetScale(workstation_state.application.ui_scale);
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
+        const bool scale_shortcut_changed = ui_scale_controller.HandleShortcuts();
+        if (scale_shortcut_changed)
+            workstation_state.application.ui_scale = ui_scale_controller.Scale();
 
         const auto now = std::chrono::time_point_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now());
@@ -859,6 +883,16 @@ int RunApplication(const LaunchOptions& options) {
             workstation_state.workspace, snapshot_query);
         positions_renderer.AppendSnapshotQuery(
             workstation_state.workspace, snapshot_query);
+        time_sales_renderer.AppendSnapshotQuery(
+            workstation_state.workspace, snapshot_query);
+        if (application != nullptr) {
+            for (auto request : time_sales_renderer.ConsumeHistoryRequests()) {
+                request.query.feed = application->ActiveMarketDataFeed();
+                time_sales_renderer.SetHistoryRequest(
+                    std::move(request.document_id),
+                    application->RequestTicks(std::move(request.query)));
+            }
+        }
         if (application != nullptr) {
             const auto core_snapshot = application->Snapshot();
             static_cast<void>(application->UpdateMarketDataInterest({
@@ -873,15 +907,16 @@ int RunApplication(const LaunchOptions& options) {
             application != nullptr
                 ? application->SnapshotForUi(snapshot_query)
                 : tradebox::application::ApplicationUiSnapshot{};
-        std::vector<tradebox::application::SavedAccountDescriptor>
-            saved_accounts;
-        std::string saved_accounts_error;
-        if (application != nullptr) {
+        if (application != nullptr && refresh_saved_accounts) {
             const auto listed_accounts = application->SavedAccounts();
-            if (listed_accounts)
+            if (listed_accounts) {
                 saved_accounts = std::move(*listed_accounts);
-            else
+                saved_accounts_error.clear();
+            } else {
+                saved_accounts.clear();
                 saved_accounts_error = listed_accounts.error();
+            }
+            refresh_saved_accounts = false;
         }
         if (snapshot.core.authenticated && snapshot.core.account &&
             workstation_state.account_context.account_id !=
@@ -952,7 +987,13 @@ int RunApplication(const LaunchOptions& options) {
                 workstation_state.workspace, *chrome_actions.open_watch_list_id);
         }
         if (chrome_actions.new_events) event_renderer.Open();
-        if (chrome_actions.settings_changed) profile_store.MarkDirty();
+        if (chrome_actions.new_time_sales) {
+            const auto created = tradebox::workstation::CreateTimeSalesDocument(
+                workstation_state.workspace);
+            if (created) profile_store.MarkDirty();
+        }
+        if (chrome_actions.settings_changed || scale_shortcut_changed)
+            profile_store.MarkDirty();
 
         if (chrome_actions.account == AccountPopupAction::SaveAccount) {
             const std::string account_name = account_popup.account_name.data();
@@ -976,6 +1017,7 @@ int RunApplication(const LaunchOptions& options) {
                     account_popup.message = "Account saved";
                     account_popup.adding_account = false;
                     ClearCredentialInputs(account_popup);
+                    refresh_saved_accounts = true;
                 }
             }
         } else if (chrome_actions.account == AccountPopupAction::EditName) {
@@ -1021,6 +1063,7 @@ int RunApplication(const LaunchOptions& options) {
                     account_popup.editing_name = false;
                     account_popup.message.clear();
                     profile_store.MarkDirty();
+                    refresh_saved_accounts = true;
                 }
             }
         } else if (chrome_actions.account == AccountPopupAction::Connect) {
@@ -1108,6 +1151,7 @@ int RunApplication(const LaunchOptions& options) {
                 if (forgotten) {
                     account_popup.remember_credentials = false;
                     account_popup.editing_name = false;
+                    refresh_saved_accounts = true;
                 }
             }
         }
@@ -1127,12 +1171,12 @@ int RunApplication(const LaunchOptions& options) {
              std::max(0.0f, viewport->Size.y -
                                 static_cast<float>(chrome_metrics.title_bar_height))},
             true);
+        if (chrome_actions.return_all_windows_to_workspace)
+            workspace.ReturnAllWindowsToWorkspace();
         chart_renderer.Draw(workspace, workstation_state.workspace, snapshot);
         watch_list_renderer.Draw(
             workspace, workstation_state.workspace, snapshot,
             workstation_state.application, gui_fonts.mono, gui_fonts.icons);
-        order_ticket_renderer.Draw(
-            workspace, workstation_state.workspace, snapshot);
         trade_hotkey_renderer.Draw(workspace, workstation_state.workspace, workstation_state.application);
         if (application != nullptr) {
             if (auto request = trade_hotkey_renderer.ConsumePreviewRequest())
@@ -1145,7 +1189,7 @@ int RunApplication(const LaunchOptions& options) {
                 if (submitted)
                     trade_hotkey_renderer.SetSubmissionResult(std::move(*submitted));
                 else
-                    trade_hotkey_renderer.SetSubmissionError(submitted.error());
+                    ReportUiWarning(events, submitted.error());
             }
         } else {
             static_cast<void>(trade_hotkey_renderer.ConsumePreviewRequest());
@@ -1157,16 +1201,20 @@ int RunApplication(const LaunchOptions& options) {
             if (auto symbol = positions_renderer.ConsumeExitRequest()) {
                 auto submitted = application->ClosePosition(
                     std::move(*symbol), true);
-                if (!submitted) positions_renderer.SetExitError(submitted.error());
+                if (!submitted) ReportUiWarning(events, submitted.error());
             }
         } else {
             static_cast<void>(positions_renderer.ConsumeExitRequest());
         }
         orders_renderer.Draw(
             workspace, workstation_state.workspace, snapshot);
+        time_sales_renderer.Draw(workspace, workstation_state.workspace, snapshot);
         const DebugSnapshot debug_snapshot = BuildDebugSnapshot(
             renderer, window, workstation_state.application,
-            measured_frames_per_second, measured_frame_time_ms);
+            measured_frames_per_second, measured_frame_time_ms,
+            application != nullptr
+                ? std::optional{application->RestHealth()}
+                : std::nullopt);
         debug_renderer.Draw(
               workspace, workstation_state.workspace, debug_snapshot);
         event_renderer.Draw(workspace, workstation_state.workspace);
@@ -1182,10 +1230,10 @@ int RunApplication(const LaunchOptions& options) {
 
         if (chart_renderer.ConsumePersistentChanges() ||
             watch_list_renderer.ConsumePersistentChanges() ||
-            order_ticket_renderer.ConsumePersistentChanges() ||
             trade_hotkey_renderer.ConsumePersistentChanges() ||
             positions_renderer.ConsumePersistentChanges() ||
             orders_renderer.ConsumePersistentChanges() ||
+            time_sales_renderer.ConsumePersistentChanges() ||
             workspace.ConsumeDirty())
             profile_store.MarkDirty();
 

@@ -4,6 +4,8 @@
 #include "imgui.h"
 
 #include <cfloat>
+#include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -70,6 +72,7 @@ public:
     void EndWindow(WorkspaceWindow& window);
     void ResetWindow(WorkspaceWindow& window);
     void ResetAll();
+    void ReturnAllWindowsToWorkspace();
 
     void MarkDirty() { dirty_ = true; }
     [[nodiscard]] bool ConsumeDirty() {
@@ -81,7 +84,12 @@ public:
     [[nodiscard]] int SnapPixels() const { return snap_pixels_; }
 
 private:
-    void KeepWindowInsideWorkArea();
+    [[nodiscard]] bool NormalizeBounds(workstation::LogicalRect& bounds) const;
+    void ApplyNextWindowSizeConstraints(std::string_view id);
+    void PersistWindowBounds(std::string_view id);
+    void SnapResizedBounds(workstation::LogicalRect& bounds,
+                           const workstation::LogicalRect& previous,
+                           ImVec2 minimum_size) const;
     [[nodiscard]] ImVec2 SnapPosition(ImVec2 position,
                                       ImVec2 window_size) const;
 
@@ -92,6 +100,12 @@ private:
     float ui_scale_ = 1.0f;
     bool dirty_ = false;
     workstation::WorkspaceState* persistent_state_ = nullptr;
+    ImVec2 next_minimum_size_{0.0f, 0.0f};
+    ImVec2 next_maximum_size_{FLT_MAX, FLT_MAX};
+    bool has_next_size_constraints_ = false;
+    std::set<std::string, std::less<>> pending_geometry_;
+    std::set<std::string, std::less<>> dragged_windows_;
+    std::map<std::string, ImVec2, std::less<>> minimum_sizes_;
 };
 
 }  // namespace tradebox::ui

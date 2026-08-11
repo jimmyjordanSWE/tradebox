@@ -1,6 +1,6 @@
 #include "trade_hotkey_window.h"
 
-#include "tradebox/workstation/order_tickets.h"
+#include "tradebox/workstation/trade_hotkey.h"
 
 #include "imgui.h"
 
@@ -80,7 +80,6 @@ void TradeHotkeyWindowRenderer::Draw(
             persistent_changed_ = true;
             long_preview_.reset();
             short_preview_.reset();
-            error_.clear();
         }
     };
     input("Stop Loss", draft.stop_percent, .01f, 100.f);
@@ -98,7 +97,6 @@ void TradeHotkeyWindowRenderer::Draw(
         const auto stop = DecimalFromPercent(draft.stop_percent);
         const auto target = DecimalFromPercent(draft.target_percent);
         if (!risk || !stop || !target) {
-            error_ = "Invalid risk, target, or stop percentage";
             return std::nullopt;
         }
         const float maximum = side == application::HotkeyOrderSide::Long
@@ -106,7 +104,6 @@ void TradeHotkeyWindowRenderer::Draw(
                                   : settings.max_short_buying_power_percent;
         const auto buying_power = DecimalFromPercent(maximum);
         if (!buying_power) {
-            error_ = "Invalid buying-power limit";
             return std::nullopt;
         }
         return application::HotkeyBracketIntent{
@@ -122,14 +119,12 @@ void TradeHotkeyWindowRenderer::Draw(
     if (ImGui::Button("LONG", {118, 34}) && long_intent) {
         active_intent_ = *long_intent;
         submission_request_ = *long_intent;
-        error_.clear();
         result_.reset();
     }
     ImGui::SameLine();
     if (ImGui::Button("SHORT", {118, 34}) && short_intent) {
         active_intent_ = *short_intent;
         submission_request_ = *short_intent;
-        error_.clear();
         result_.reset();
     }
 
@@ -139,14 +134,10 @@ void TradeHotkeyWindowRenderer::Draw(
         DrawCommitment("Long commitment", long_preview_, long_preview_error_);
         DrawCommitment("Short commitment", short_preview_, short_preview_error_);
     }
-    if (!error_.empty())
-        ImGui::TextColored({.95f, .32f, .32f, 1}, "%s", error_.c_str());
     if (result_) {
         const bool accepted = result_->AcceptedByBroker();
-        ImGui::TextColored(
-            accepted ? ImVec4{.30f, .85f, .40f, 1} : ImVec4{.95f, .32f, .32f, 1},
-            accepted ? "Order accepted" : "Order rejected: %s",
-            accepted ? "" : result_->message.c_str());
+        if (accepted)
+            ImGui::TextColored({.30f, .85f, .40f, 1}, "Order accepted");
     }
 
     workspace.EndWindow(window);
@@ -184,10 +175,6 @@ void TradeHotkeyWindowRenderer::SetPreviews(
 void TradeHotkeyWindowRenderer::SetSubmissionResult(
     std::future<core::OrderCommandResult> result) {
     pending_result_ = std::move(result);
-}
-
-void TradeHotkeyWindowRenderer::SetSubmissionError(std::string error) {
-    error_ = std::move(error);
 }
 
 bool TradeHotkeyWindowRenderer::ConsumePersistentChanges() {

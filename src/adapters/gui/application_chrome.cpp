@@ -20,6 +20,7 @@ struct CreationActions {
     bool new_orders = false;
     bool new_trade_hotkey = false;
     bool new_events = false;
+    bool new_time_sales = false;
     std::optional<std::string> open_watch_list_id;
 };
 
@@ -63,6 +64,7 @@ CreationActions DrawCreationMenu(
     if (ImGui::MenuItem("Orders", "")) actions.new_orders = true;
     if (ImGui::MenuItem("Trade Hotkey", "")) actions.new_trade_hotkey = true;
     if (ImGui::MenuItem("Events", "")) actions.new_events = true;
+    if (ImGui::MenuItem("Time & Sales", "")) actions.new_time_sales = true;
     ImGui::PopFont();
     ImGui::EndMenu();
     return actions;
@@ -70,7 +72,8 @@ CreationActions DrawCreationMenu(
 
 void DrawSettingsMenu(ImFont* regular_font,
                       workstation::ApplicationSettings& settings,
-                      bool& auto_connect, bool& changed) {
+                      bool& auto_connect, bool& changed,
+                      bool& return_all_windows_to_workspace) {
     if (!ImGui::BeginMenu("Settings")) return;
 
     ImGui::PushFont(regular_font, 18.0f);
@@ -82,6 +85,30 @@ void DrawSettingsMenu(ImFont* regular_font,
         changed = true;
     }
     ImGui::SetItemTooltip("Synchronizes rendering with the display refresh.");
+    float interface_scale_percent = settings.ui_scale * 100.0f;
+    if (ImGui::SliderFloat("Interface scale", &interface_scale_percent,
+                           70.0f, 200.0f, "%.0f%%")) {
+        settings.ui_scale = std::clamp(interface_scale_percent / 100.0f,
+                                       0.70f, 2.00f);
+        changed = true;
+    }
+    ImGui::SetItemTooltip(
+        "Scales text, controls, and workspace windows. Ctrl+Plus, Ctrl+Minus, "
+        "and Ctrl+0 also adjust this setting.");
+    int window_snap_pixels = settings.window_snap_pixels;
+    if (ImGui::SliderInt("Window snap", &window_snap_pixels, 1, 100,
+                         "%d px")) {
+        settings.window_snap_pixels = std::clamp(window_snap_pixels, 1, 1000);
+        changed = true;
+    }
+    ImGui::SetItemTooltip(
+        "When a window is dropped, it snaps to this grid or to an exact "
+        "workspace edge.");
+    if (ImGui::Button("Return all windows to workspace"))
+        return_all_windows_to_workspace = true;
+    ImGui::SetItemTooltip(
+        "Fits windows to this workspace and returns off-screen windows to "
+        "the top-left corner.");
     int maximum_frame_rate = settings.maximum_frame_rate;
     ImGui::SetNextItemWidth(90.0f);
     if (ImGui::InputInt("Max framerate", &maximum_frame_rate, 1, 10,
@@ -189,9 +216,12 @@ ChromeActions DrawApplicationChrome(
             current_environment, current_account_id, fonts.icons,
             account_popup);
         bool settings_changed = false;
+        bool return_all_windows_to_workspace = false;
         DrawSettingsMenu(fonts.regular, application_settings, auto_connect,
-                         settings_changed);
+                         settings_changed, return_all_windows_to_workspace);
         actions.settings_changed = settings_changed;
+        actions.return_all_windows_to_workspace =
+            return_all_windows_to_workspace;
         const CreationActions creation_actions =
             DrawCreationMenu(fonts.regular, workspace_state);
         actions.new_chart = creation_actions.new_chart;
@@ -200,6 +230,7 @@ ChromeActions DrawApplicationChrome(
         actions.new_orders = creation_actions.new_orders;
         actions.new_trade_hotkey = creation_actions.new_trade_hotkey;
         actions.new_events = creation_actions.new_events;
+        actions.new_time_sales = creation_actions.new_time_sales;
         actions.open_watch_list_id = creation_actions.open_watch_list_id;
 
         metrics.interactive_left_width =

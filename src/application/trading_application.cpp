@@ -44,9 +44,10 @@ constexpr std::int64_t kAssetCatalogRefreshIntervalMs =
 core::BarRange WatchListDailyRange(std::int64_t as_of_ns) {
     constexpr std::int64_t kDayNs = 24LL * 60LL * 60LL * 1'000'000'000LL;
     constexpr std::int64_t kLookbackDays = 45;
+    const std::int64_t day_start_ns = as_of_ns / kDayNs * kDayNs;
     return {
-        as_of_ns - kLookbackDays * kDayNs,
-        as_of_ns + kDayNs,
+        day_start_ns - kLookbackDays * kDayNs,
+        day_start_ns + kDayNs,
     };
 }
 

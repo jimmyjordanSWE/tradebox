@@ -36,6 +36,9 @@ UiEvent OperationalEvent(
     UiEvent event;
     event.type = UiEventType::Status;
     event.message = std::move(message);
+    event.received_at_ms = std::chrono::duration_cast<
+        std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     event.operational_component = component;
     event.operational_state = state;
     event.operational_reason = reason;
@@ -397,6 +400,16 @@ std::string TickRequestKey(
            (query.include_quotes ? "1" : "0");
 }
 
+std::string BarHistoryRequestKey(
+    const tradebox::core::HistoricalBarQuery& query) {
+    return query.key.instrument_id + "\x1f" +
+           std::to_string(static_cast<int>(query.key.feed)) + "\x1f" +
+           query.key.timeframe + "\x1f" +
+           std::to_string(static_cast<int>(query.key.adjustment)) + "\x1f" +
+           std::to_string(query.range.start_ns) + "\x1f" +
+           std::to_string(query.range.end_ns);
+}
+
 tradebox::broker::BrokerCommandResult CommandResult(
     const HttpResult& response) {
     tradebox::broker::BrokerCommandResult result{
@@ -533,6 +546,7 @@ AlpacaService::AlpacaService(UiEventQueue& events, Database& database,
 
 AlpacaService::~AlpacaService() {
     Disconnect();
+    historical_work_scheduler_.Stop();
     {
         std::scoped_lock lock(background_mutex_);
         background_stopping_ = true;
@@ -544,12 +558,22 @@ AlpacaService::~AlpacaService() {
 
 tradebox::core::RestTransportHealth AlpacaService::RestHealth() const {
     auto health = rest_transport_.Health();
-    std::scoped_lock lock(background_mutex_);
-    health.background_queued = background_tasks_.size();
-    health.background_in_flight = background_active_;
-    health.background_rejected = background_rejected_;
-    health.background_coalesced =
-        tick_requests_coalesced_.load();
+    {
+        std::scoped_lock lock(background_mutex_);
+        health.background_queued = background_tasks_.size();
+        health.background_in_flight = background_active_;
+        health.background_rejected = background_rejected_;
+        health.background_coalesced =
+            tick_requests_coalesced_.load();
+    }
+    const auto historical = historical_work_scheduler_.Health();
+    health.historical_work_queued = historical.queued;
+    health.historical_work_in_flight = historical.in_flight;
+    health.historical_work_queue_high_water = historical.queue_high_water;
+    health.historical_work_completed = historical.completed;
+    health.historical_work_rejected = historical.rejected;
+    health.historical_work_coalesced = historical.coalesced;
+    health.historical_work_canceled = historical.canceled;
     return health;
 }
 
@@ -725,6 +749,14 @@ void AlpacaService::RequestHistory(
 
 void AlpacaService::RequestHistory(
     tradebox::core::HistoricalBarQuery query) {
+    ScheduleBarHistory(
+        std::move(query),
+        tradebox::broker::alpaca::HistoricalWorkPriority::Visible);
+}
+
+void AlpacaService::ScheduleBarHistory(
+    tradebox::core::HistoricalBarQuery query,
+    tradebox::broker::alpaca::HistoricalWorkPriority priority) {
     if (!running_) {
         if (history_status_)
             history_status_->Publish({
@@ -738,8 +770,11 @@ void AlpacaService::RequestHistory(
     const std::string request_symbol = query.symbol;
     const tradebox::core::BarSeriesKey request_key = query.key;
     const tradebox::core::BarRange request_range = query.range;
-    if (!SubmitBackground(
-        [this, query = std::move(query)] {
+    const auto submission = historical_work_scheduler_.Submit({
+        .kind = tradebox::broker::alpaca::HistoricalWorkKind::Bars,
+        .priority = priority,
+        .key = "bars\x1f" + BarHistoryRequestKey(query),
+        .execute = [this, query = std::move(query)] {
             const auto& key = query.key;
             const auto& symbol = query.symbol;
             const auto range = query.range;
@@ -791,17 +826,44 @@ void AlpacaService::RequestHistory(
                     .state = tradebox::broker::HistoryRequestState::Loading,
                 });
             FetchHistory(symbol, key, range,
-                         std::move(reserved));
-        })) {
-        events_.Push({UiEventType::Status, request_symbol,
-                      "History request rejected: background queue full"});
+                         std::move(reserved),
+                         tradebox::broker::alpaca::RestPriority::Interactive);
+        },
+        .canceled = [this, request_symbol, request_key, request_range] {
+            events_.Push(OperationalEvent(
+                OperationalComponent::MarketDataStream,
+                OperationalState::Degraded,
+                OperationalSeverity::Warning,
+                "Historical bar request canceled during disconnect: " +
+                    request_symbol,
+                OperationalReason::TransportFailure));
+            if (history_status_)
+                history_status_->Publish({
+                    .key = request_key,
+                    .range = request_range,
+                    .state = tradebox::broker::HistoryRequestState::Failed,
+                    .message = "History request canceled during disconnect",
+                });
+        },
+    });
+    if (submission ==
+        tradebox::broker::alpaca::HistoricalWorkSubmission::Rejected) {
+        UiEvent rejected = OperationalEvent(
+            OperationalComponent::MarketDataStream,
+            OperationalState::Degraded,
+            OperationalSeverity::Warning,
+            "Historical bar request rejected for " + request_symbol +
+                ": historical work queue full",
+            OperationalReason::QueueOverload);
+        rejected.symbol = request_symbol;
+        events_.Push(std::move(rejected));
         if (history_status_)
             history_status_->Publish({
                 .key = request_key,
                 .range = request_range,
                 .state = tradebox::broker::HistoryRequestState::Failed,
                 .message =
-                    "History request rejected: background queue full",
+                    "History request rejected: historical work queue full",
             });
     }
 }
@@ -833,9 +895,15 @@ std::future<tradebox::core::TickSeries> AlpacaService::RequestTicks(
             request_key,
             std::vector{promise});
     }
-    if (!SubmitBackground(
-            [this, request_key,
-             query = std::move(query)]() {
+    const auto submission = historical_work_scheduler_.Submit({
+        .kind = tradebox::broker::alpaca::HistoricalWorkKind::Ticks,
+        .priority = tradebox::broker::alpaca::HistoricalWorkPriority::Interactive,
+        .key = "ticks\x1f" + request_key,
+        // tick_requests_ owns tick-query coalescing so every waiter receives
+        // the same TickSeries result.
+        .coalesce = false,
+        .execute = [this, request_key,
+                    query = std::move(query)]() {
                 tradebox::core::TickSeries completed{
                     .query = query};
                 try {
@@ -843,6 +911,14 @@ std::future<tradebox::core::TickSeries> AlpacaService::RequestTicks(
                 } catch (const std::exception& error) {
                     completed.error = error.what();
                 }
+                if (!completed.error.empty())
+                    events_.Push(OperationalEvent(
+                        OperationalComponent::MarketDataStream,
+                        OperationalState::Degraded,
+                        OperationalSeverity::Warning,
+                        "Tick history failed for " + query.symbol + ": " +
+                            completed.error,
+                        OperationalReason::TransportFailure));
                 std::vector<std::shared_ptr<std::promise<
                     tradebox::core::TickSeries>>>
                     waiters;
@@ -859,9 +935,37 @@ std::future<tradebox::core::TickSeries> AlpacaService::RequestTicks(
                 }
                 for (const auto& waiter : waiters)
                     waiter->set_value(completed);
-            })) {
+            },
+        .canceled = [this, request_key, rejected_query] {
+                tradebox::core::TickSeries failed{
+                    .query = rejected_query};
+                failed.error = "Tick request canceled during disconnect";
+                events_.Push(OperationalEvent(
+                    OperationalComponent::MarketDataStream,
+                    OperationalState::Degraded,
+                    OperationalSeverity::Warning,
+                    "Tick history request canceled during disconnect: " +
+                        rejected_query.symbol,
+                    OperationalReason::TransportFailure));
+                std::vector<std::shared_ptr<std::promise<
+                    tradebox::core::TickSeries>>>
+                    waiters;
+                {
+                    std::scoped_lock lock(tick_requests_mutex_);
+                    const auto found = tick_requests_.find(request_key);
+                    if (found != tick_requests_.end()) {
+                        waiters = std::move(found->second);
+                        tick_requests_.erase(found);
+                    }
+                }
+                for (const auto& waiter : waiters)
+                    waiter->set_value(failed);
+            },
+    });
+    if (submission !=
+        tradebox::broker::alpaca::HistoricalWorkSubmission::Accepted) {
         tradebox::core::TickSeries failed{.query = rejected_query};
-        failed.error = "Tick request rejected: background queue full";
+        failed.error = "Tick request rejected: historical work queue full";
         std::vector<std::shared_ptr<std::promise<
             tradebox::core::TickSeries>>>
             waiters;
@@ -876,6 +980,13 @@ std::future<tradebox::core::TickSeries> AlpacaService::RequestTicks(
         }
         for (const auto& waiter : waiters)
             waiter->set_value(failed);
+        events_.Push(OperationalEvent(
+            OperationalComponent::MarketDataStream,
+            OperationalState::Degraded,
+            OperationalSeverity::Warning,
+            "Tick history request rejected for " + rejected_query.symbol +
+                ": historical work queue full",
+            OperationalReason::QueueOverload));
     }
     return result;
 }
@@ -1420,6 +1531,7 @@ void AlpacaService::Disconnect() {
     // network calls during shutdown (which could otherwise take 10-20 seconds
     // due to WinHTTP timeouts).
     rest_transport_.Abort();
+    historical_work_scheduler_.CancelPending();
     HINTERNET socket = websocket_.exchange(nullptr);
     if (socket) WinHttpCloseHandle(socket);
     HINTERNET account_socket = account_websocket_.exchange(nullptr);
@@ -1428,6 +1540,7 @@ void AlpacaService::Disconnect() {
     if (account_stream_thread_.joinable()) account_stream_thread_.join();
     JoinWorkers();
     WaitForBackgroundIdle();
+    historical_work_scheduler_.WaitForIdle();
     {
         std::scoped_lock lock(credentials_mutex_);
         if (!credentials_.key.empty())
@@ -2088,7 +2201,8 @@ void AlpacaService::FetchHistory(
     std::string symbol,
     tradebox::core::BarSeriesKey key,
     tradebox::core::BarRange requested_range,
-    std::vector<tradebox::core::BarRange> reserved_ranges) {
+    std::vector<tradebox::core::BarRange> reserved_ranges,
+    tradebox::broker::alpaca::RestPriority priority) {
     const AlpacaCredentials credentials = CredentialsSnapshot();
     bool request_succeeded = true;
     std::string request_error;
@@ -2110,8 +2224,7 @@ void AlpacaService::FetchHistory(
                         });
                 const HttpResult response = Get(
                     rest_transport_, L"data.alpaca.markets",
-                    Wide(path), credentials,
-                    tradebox::broker::alpaca::RestPriority::Interactive);
+                    Wide(path), credentials, priority);
                 if (response.status != 200) {
                     complete = false;
                     request_succeeded = false;
@@ -2339,8 +2452,20 @@ void AlpacaService::ScheduleMarketGapBackfill(
         .end_ns =
             reconnected_at_ns / minute_ns * minute_ns,
     };
-    if (!SubmitBackground(
-            [this, symbols = std::move(symbols), range] {
+    std::ranges::sort(symbols);
+    std::string symbols_key;
+    for (const std::string& symbol : symbols) {
+        if (!symbols_key.empty()) symbols_key += ',';
+        symbols_key += symbol;
+    }
+    const std::string work_key =
+        "market-gap\x1f" + std::to_string(range.start_ns) + "\x1f" +
+        std::to_string(range.end_ns) + "\x1f" + symbols_key;
+    const auto submission = historical_work_scheduler_.Submit({
+        .kind = tradebox::broker::alpaca::HistoricalWorkKind::MarketGapBackfill,
+        .priority = tradebox::broker::alpaca::HistoricalWorkPriority::Recovery,
+        .key = work_key,
+        .execute = [this, symbols = std::move(symbols), range] {
                 for (const auto& symbol : symbols) {
                     if (!running_) return;
                     const tradebox::core::BarSeriesKey key{
@@ -2361,16 +2486,25 @@ void AlpacaService::ScheduleMarketGapBackfill(
                         in_flight_bar_ranges_.Reserve(key, missing);
                     if (reserved.empty()) continue;
                     FetchHistory(
-                        symbol, key, range, std::move(reserved));
+                        symbol, key, range, std::move(reserved),
+                        tradebox::broker::alpaca::RestPriority::Background);
                 }
-            })) {
+            },
+        .canceled = [this, disconnected_at_ns] {
+                std::int64_t expected = 0;
+                market_gap_started_ns_.compare_exchange_strong(
+                    expected, disconnected_at_ns);
+            },
+    });
+    if (submission ==
+        tradebox::broker::alpaca::HistoricalWorkSubmission::Rejected) {
         std::int64_t expected = 0;
         market_gap_started_ns_.compare_exchange_strong(
             expected, disconnected_at_ns);
         events_.Push({
             UiEventType::Status,
             {},
-            "Market gap backfill rejected: background queue full",
+            "Market gap backfill rejected: historical work queue full",
         });
     }
 }

@@ -28,6 +28,13 @@ struct RestTransportHealth {
     std::size_t background_in_flight = 0;
     std::uint64_t background_rejected = 0;
     std::uint64_t background_coalesced = 0;
+    std::size_t historical_work_queued = 0;
+    std::size_t historical_work_in_flight = 0;
+    std::size_t historical_work_queue_high_water = 0;
+    std::uint64_t historical_work_completed = 0;
+    std::uint64_t historical_work_rejected = 0;
+    std::uint64_t historical_work_coalesced = 0;
+    std::uint64_t historical_work_canceled = 0;
     bool stopping = false;
 };
 

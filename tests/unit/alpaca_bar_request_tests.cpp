@@ -31,6 +31,11 @@ TEST(AlpacaHistoricalPage,
     EXPECT_FALSE(ValidateHistoricalPage(
         R"({"bars":[1],"next_page_token":null})",
         "bars"));
+    const auto provider_error = ValidateHistoricalPage(
+        R"({"message":"insufficient subscription"})", "trades");
+    ASSERT_FALSE(provider_error);
+    EXPECT_NE(provider_error.error().find("insufficient subscription"),
+              std::string::npos);
 
     const auto valid = ValidateHistoricalPage(
         R"({"bars":[],"next_page_token":"next"})",

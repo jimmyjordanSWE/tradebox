@@ -11,7 +11,7 @@
 
 namespace tradebox::workstation {
 
-inline constexpr int kCurrentSchemaVersion = 6;
+inline constexpr int kCurrentSchemaVersion = 7;
 inline constexpr std::size_t kInstrumentLinkGroupCount = 32;
 
 enum class InstrumentLinkColor : std::uint8_t {
@@ -78,7 +78,7 @@ struct NativeWindowState {
 
 struct ApplicationSettings {
     float ui_scale = 1.0f;
-    int window_snap_pixels = 10;
+    int window_snap_pixels = 20;
     bool vsync_requested = true;
     int maximum_frame_rate = 120;
     float account_risk_per_trade_percent = 1.0f;
@@ -121,6 +121,13 @@ struct WatchListDocumentState {
     std::string id;
     std::string name = "Watch List";
     std::vector<WatchListRowState> rows;
+};
+
+struct TimeSalesDocumentState {
+    std::string id;
+    std::string instrument_id;
+    std::string symbol;
+    std::string ticker_input;
 };
 
 struct WindowInstanceState {
@@ -210,24 +217,6 @@ struct ChartDrawingState {
     float line_width = 1.5f;
 };
 
-struct OrderTicketState {
-    std::string id;
-    bool open = true;
-    std::string name = "Untitled order";
-    std::string symbol = "AMD";
-    std::string side = "buy";
-    std::string amount = "1";
-    bool amount_is_notional = false;
-    std::string type = "market";
-    std::string limit_price;
-    std::string stop_price;
-    std::string time_in_force = "day";
-    bool extended_hours = false;
-    std::string credential_slot;
-    std::string account_id;
-    bool paper = true;
-};
-
 struct BracketDraftState {
     float target_percent = 1.0f;
     float stop_percent = 0.5f;
@@ -247,6 +236,7 @@ struct WorkspaceState {
     bool show_filled_orders = true;
     std::string order_management_symbol;
     std::string time_sales_symbol = "AMD";
+    PersistentTableState time_sales_table;
     std::map<std::string, BracketDraftState, std::less<>> bracket_drafts;
     std::array<InstrumentLinkGroupState, kInstrumentLinkGroupCount>
         instrument_link_groups;
@@ -254,9 +244,9 @@ struct WorkspaceState {
     ChartDefaultsState chart_defaults;
     std::vector<ChartDocumentState> charts;
     std::vector<WatchListDocumentState> watch_lists;
+    std::vector<TimeSalesDocumentState> time_sales;
     std::vector<IndicatorSuiteState> indicator_suites;
     std::vector<ChartDrawingState> chart_drawings;
-    std::vector<OrderTicketState> order_tickets;
 };
 
 struct ProfileMetadata {

@@ -1,8 +1,10 @@
 #pragma once
 
+#include "tradebox/core/rest_health.h"
 #include "tradebox/ui/workspace.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -33,6 +35,7 @@ struct DebugSnapshot {
     std::string stl;
     std::string cxx_standard;
     std::string steady_clock;
+    std::optional<core::RestTransportHealth> rest_health;
 };
 
 class DebugWindowRenderer final {

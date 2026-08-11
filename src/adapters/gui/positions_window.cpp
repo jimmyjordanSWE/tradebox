@@ -179,11 +179,6 @@ void PositionsWindowRenderer::Draw(
     const auto columns = OrderedVisibleTableColumns(table);
     const TableColumnActions column_actions = DrawTableColumnControls(
         table, choices, "positions_columns");
-    if (!exit_error_.empty()) {
-        ImGui::SameLine();
-        ImGui::TextColored({0.95f, 0.32f, 0.32f, 1.0f}, "%s",
-                           exit_error_.c_str());
-    }
     if (ImGui::BeginTable("positions", static_cast<int>(columns.size()),
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                               ImGuiTableFlags_Sortable |
@@ -317,10 +312,6 @@ void PositionsWindowRenderer::Draw(
 
 std::optional<std::string> PositionsWindowRenderer::ConsumeExitRequest() {
     return std::exchange(exit_request_, std::nullopt);
-}
-
-void PositionsWindowRenderer::SetExitError(std::string error) {
-    exit_error_ = std::move(error);
 }
 
 bool PositionsWindowRenderer::ConsumePersistentChanges() {

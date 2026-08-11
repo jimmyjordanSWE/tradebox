@@ -345,4 +345,36 @@ TEST(ChartApplicationSnapshotTest,
     EXPECT_TRUE(snapshot.watch_lists.front().rows.front().history_missing);
 }
 
+TEST(ChartApplicationSnapshotTest,
+     WatchListDailyHistoryRangeIsStableWithinOneUtcDay) {
+    TemporaryDatabase temporary;
+    Database database;
+    std::string error;
+    ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+    tradebox::application::TradingApplication application(database);
+    constexpr std::int64_t kDayNs = 24LL * 60LL * 60LL * 1'000'000'000LL;
+    const auto query = [](std::int64_t as_of_ns) {
+        return tradebox::application::UiSnapshotQuery{
+            .as_of_ns = as_of_ns,
+            .watch_lists = {{
+                .document_id = "watch-list.default",
+                .rows = {{.row_id = "row.aapl",
+                          .instrument_id = "asset-aapl",
+                          .symbol = "AAPL"}},
+                .needs_change_from_open = true,
+            }},
+        };
+    };
+    const auto first = application.SnapshotForUi(query(100 * kDayNs + 1));
+    const auto second = application.SnapshotForUi(
+        query(100 * kDayNs + 12 * 60LL * 60LL * 1'000'000'000LL));
+
+    ASSERT_EQ(first.watch_lists.size(), 1U);
+    ASSERT_EQ(second.watch_lists.size(), 1U);
+    EXPECT_EQ(first.watch_lists.front().daily_range,
+              second.watch_lists.front().daily_range);
+    EXPECT_EQ(first.watch_lists.front().daily_range.start_ns, 55 * kDayNs);
+    EXPECT_EQ(first.watch_lists.front().daily_range.end_ns, 101 * kDayNs);
+}
+
 }  // namespace

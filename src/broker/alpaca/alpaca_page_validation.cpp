@@ -16,10 +16,16 @@ ValidateHistoricalPage(
                 "historical page is not an object");
         const auto items =
             value.find(std::string(array_field));
-        if (items == value.end() || !items->is_array())
+        if (items == value.end() || !items->is_array()) {
+            const auto message = value.find("message");
+            if (message != value.end() && message->is_string())
+                return std::unexpected(
+                    "historical page returned provider error: " +
+                    message->get<std::string>());
             return std::unexpected(
                 "historical page is missing array field '" +
                 std::string(array_field) + "'");
+        }
         for (const auto& item : *items)
             if (!item.is_object())
                 return std::unexpected(

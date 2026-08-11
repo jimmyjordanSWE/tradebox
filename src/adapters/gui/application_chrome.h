@@ -40,8 +40,10 @@ struct ChromeActions {
     bool new_orders = false;
     bool new_trade_hotkey = false;
     bool new_events = false;
+    bool new_time_sales = false;
     std::optional<std::string> open_watch_list_id;
     bool settings_changed = false;
+    bool return_all_windows_to_workspace = false;
 };
 
 [[nodiscard]] ChromeActions DrawApplicationChrome(

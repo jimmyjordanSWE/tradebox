@@ -26,7 +26,6 @@ public:
         std::expected<application::HotkeyBracketPreview, std::string> long_preview,
         std::expected<application::HotkeyBracketPreview, std::string> short_preview);
     void SetSubmissionResult(std::future<core::OrderCommandResult> result);
-    void SetSubmissionError(std::string error);
     [[nodiscard]] bool ConsumePersistentChanges();
 
 private:
@@ -40,7 +39,6 @@ private:
     std::string short_preview_error_;
     std::optional<std::future<core::OrderCommandResult>> pending_result_;
     std::optional<core::OrderCommandResult> result_;
-    std::string error_;
 };
 
 }  // namespace tradebox::gui

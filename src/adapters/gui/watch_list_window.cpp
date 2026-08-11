@@ -1,6 +1,5 @@
 #include "watch_list_window.h"
 
-#include "tradebox/workstation/order_tickets.h"
 #include "tradebox/workstation/asset_preferences.h"
 #include "tradebox/workstation/stable_id.h"
 #include "tradebox/workstation/watch_list_columns.h"
@@ -482,10 +481,6 @@ void WatchListWindowRenderer::Draw(
                             const bool selected = ImGui::Selectable(
                                 row.symbol.c_str(),
                                 row.symbol == state.selected_symbol);
-                            const bool open_order_ticket =
-                                ImGui::IsItemHovered() &&
-                                ImGui::IsMouseDoubleClicked(
-                                    ImGuiMouseButton_Left);
                             if (selected) {
                                 state.selected_symbol = row.symbol;
                                 persistent_changed_ = true;
@@ -493,16 +488,6 @@ void WatchListWindowRenderer::Draw(
                             ImGui::SameLine();
                             const bool clear_requested = ImGui::SmallButton(
                                 "X##clear_symbol");
-                            if (open_order_ticket) {
-                                const auto opened =
-                                    workstation::OpenOrderTicketForSymbol(
-                                        state, row.symbol);
-                                if (opened) {
-                                    persistent_changed_ = true;
-                                } else {
-                                    message_ = opened.error();
-                                }
-                            }
                             if (clear_requested) {
                                 pending_delete_row = row.id;
                                 // Remove after EndTable so the loop never

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace tradebox::ui {
 namespace {
@@ -89,23 +90,65 @@ void Workspace::SetSnapPixels(int pixels) {
 }
 
 void Workspace::ConstrainNextWindowSize(ImVec2 minimum, ImVec2 maximum) {
-    ImGui::SetNextWindowSizeConstraints(minimum, maximum);
+    next_minimum_size_ = minimum;
+    next_maximum_size_ = maximum;
+    has_next_size_constraints_ = true;
 }
 
-void Workspace::KeepWindowInsideWorkArea() {
-    const ImVec2 window_size = ImGui::GetWindowSize();
-    const ImVec2 current_position = ImGui::GetWindowPos();
-    const ImVec2 minimum_position = work_position_;
-    const ImVec2 maximum_position{
-        std::max(minimum_position.x,
-                 work_position_.x + work_size_.x - window_size.x),
-        std::max(minimum_position.y,
-                 work_position_.y + work_size_.y - window_size.y)};
-    const ImVec2 constrained_position{
-        std::clamp(current_position.x, minimum_position.x, maximum_position.x),
-        std::clamp(current_position.y, minimum_position.y, maximum_position.y)};
-    if (Different(current_position, constrained_position))
-        ImGui::SetWindowPos(constrained_position, ImGuiCond_Always);
+bool Workspace::NormalizeBounds(workstation::LogicalRect& bounds) const {
+    const float available_width = std::max(1.0f, work_size_.x / ui_scale_);
+    const float available_height = std::max(1.0f, work_size_.y / ui_scale_);
+    const workstation::LogicalRect original = bounds;
+
+    bounds.width = std::clamp(bounds.width,
+                              std::min(160.0f, available_width),
+                              available_width);
+    bounds.height = std::clamp(bounds.height,
+                               std::min(100.0f, available_height),
+                               available_height);
+    const bool fully_outside = bounds.x >= available_width ||
+                               bounds.y >= available_height ||
+                               bounds.x + bounds.width <= 0.0f ||
+                               bounds.y + bounds.height <= 0.0f;
+    if (fully_outside) {
+        bounds.x = 0.0f;
+        bounds.y = 0.0f;
+    } else {
+        bounds.x = std::clamp(bounds.x, 0.0f, available_width - bounds.width);
+        bounds.y = std::clamp(bounds.y, 0.0f, available_height - bounds.height);
+    }
+    return Different(original, bounds);
+}
+
+void Workspace::ApplyNextWindowSizeConstraints(std::string_view id) {
+    const ImVec2 requested_minimum = has_next_size_constraints_
+                                         ? next_minimum_size_
+                                         : ImVec2(0.0f, 0.0f);
+    const ImVec2 requested_maximum = has_next_size_constraints_
+                                         ? next_maximum_size_
+                                         : ImVec2(FLT_MAX, FLT_MAX);
+    has_next_size_constraints_ = false;
+
+    const auto constrained_axis = [this](float minimum, float maximum,
+                                         float available) {
+        const float physical_available = std::max(1.0f, available);
+        const float physical_minimum =
+            std::max(0.0f, minimum) * ui_scale_;
+        const float physical_maximum = maximum >= FLT_MAX
+                                           ? physical_available
+                                           : std::max(0.0f, maximum) * ui_scale_;
+        const float final_maximum = std::min(physical_maximum, physical_available);
+        return std::pair{std::min(physical_minimum, final_maximum),
+                         final_maximum};
+    };
+    const auto width = constrained_axis(requested_minimum.x, requested_maximum.x,
+                                        work_size_.x);
+    const auto height = constrained_axis(requested_minimum.y, requested_maximum.y,
+                                         work_size_.y);
+    minimum_sizes_[std::string(id)] = {width.first / ui_scale_,
+                                       height.first / ui_scale_};
+    ImGui::SetNextWindowSizeConstraints({width.first, height.first},
+                                        {width.second, height.second});
 }
 
 bool Workspace::BeginWindow(WorkspaceWindow& window) {
@@ -134,7 +177,10 @@ bool Workspace::BeginWindow(WorkspaceWindow& window) {
 bool Workspace::BeginWindow(std::string_view id, std::string_view title, bool* open,
                             ImVec2 default_offset, ImVec2 default_size,
                             ImGuiWindowFlags flags) {
-    if (open == nullptr) return false;
+    if (open == nullptr) {
+        has_next_size_constraints_ = false;
+        return false;
+    }
     if (!*open) {
         if (persistent_state_ != nullptr) {
             if (auto found = persistent_state_->windows.find(std::string(id));
@@ -163,60 +209,46 @@ bool Workspace::BeginWindow(std::string_view id, std::string_view title, bool* o
             dirty_ = true;
         }
     }
-    if (!state->open) return false;
+    if (!state->open) {
+        has_next_size_constraints_ = false;
+        return false;
+    }
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+        NormalizeBounds(state->bounds)) {
+        pending_geometry_.insert(state->id);
+        dirty_ = true;
+    }
+    ApplyNextWindowSizeConstraints(state->id);
+    const bool apply_pending_geometry =
+        pending_geometry_.erase(state->id) != 0U;
     ImGui::SetNextWindowPos(
         ImVec2(work_position_.x + state->bounds.x * ui_scale_,
-               work_position_.y + state->bounds.y * ui_scale_), ImGuiCond_FirstUseEver);
+               work_position_.y + state->bounds.y * ui_scale_),
+        apply_pending_geometry ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(state->bounds.width * ui_scale_,
                                     state->bounds.height * ui_scale_),
-                             ImGuiCond_FirstUseEver);
+                             apply_pending_geometry ? ImGuiCond_Always
+                                                    : ImGuiCond_FirstUseEver);
     const std::string label = std::string(title) + "###" + std::string(id);
     const bool open_before = state->open;
     const bool visible = ImGui::Begin(label.c_str(), &state->open, flags);
-    KeepWindowInsideWorkArea();
     if (state->open != open_before) dirty_ = true;
     *open = state->open;
     return visible;
 }
 
 void Workspace::EndWindow(std::string_view id) {
-    if (persistent_state_ != nullptr) {
-        if (auto found = persistent_state_->windows.find(std::string(id));
-            found != persistent_state_->windows.end()) {
-            const ImVec2 position = ImGui::GetWindowPos();
-            const ImVec2 size = ImGui::GetWindowSize();
-            auto& state = found->second;
-            const workstation::LogicalRect next_bounds{
-                (position.x - work_position_.x) / ui_scale_,
-                (position.y - work_position_.y) / ui_scale_,
-                size.x / ui_scale_,
-                size.y / ui_scale_};
-            if (Different(state.bounds, next_bounds)) {
-                state.bounds = next_bounds;
-                dirty_ = true;
-            }
-        }
-    }
+    PersistWindowBounds(id);
     ImGui::End();
 }
 
 void Workspace::EndWindow(WorkspaceWindow& window) {
     if (!window.began_this_frame) return;
-    const ImVec2 position = ImGui::GetWindowPos();
-    const ImVec2 size = ImGui::GetWindowSize();
+    PersistWindowBounds(window.id);
     if (persistent_state_ != nullptr) {
         auto found = persistent_state_->windows.find(window.id);
         if (found != persistent_state_->windows.end()) {
             auto& state = found->second;
-            const workstation::LogicalRect next_bounds{
-                (position.x - work_position_.x) / ui_scale_,
-                (position.y - work_position_.y) / ui_scale_,
-                size.x / ui_scale_,
-                size.y / ui_scale_};
-            if (Different(state.bounds, next_bounds)) {
-                state.bounds = next_bounds;
-                dirty_ = true;
-            }
             if (state.open != window.open) {
                 state.open = window.open;
                 dirty_ = true;
@@ -225,6 +257,103 @@ void Workspace::EndWindow(WorkspaceWindow& window) {
     }
     ImGui::End();
     window.began_this_frame = false;
+}
+
+void Workspace::PersistWindowBounds(std::string_view id) {
+    if (persistent_state_ == nullptr) return;
+    const auto found = persistent_state_->windows.find(std::string(id));
+    if (found == persistent_state_->windows.end()) return;
+
+    const ImVec2 position = ImGui::GetWindowPos();
+    const ImVec2 size = ImGui::GetWindowSize();
+    auto& state = found->second;
+    const workstation::LogicalRect previous_bounds = state.bounds;
+    const workstation::LogicalRect next_bounds{
+        (position.x - work_position_.x) / ui_scale_,
+        (position.y - work_position_.y) / ui_scale_,
+        size.x / ui_scale_,
+        size.y / ui_scale_};
+    const bool bounds_changed = Different(state.bounds, next_bounds);
+    if (bounds_changed) {
+        state.bounds = next_bounds;
+        dirty_ = true;
+    }
+
+    if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        if (bounds_changed) {
+            dragged_windows_.insert(state.id);
+            if (snap_enabled_) {
+                if (IsResizeCursor(ImGui::GetMouseCursor())) {
+                    const auto minimum = minimum_sizes_.find(state.id);
+                    SnapResizedBounds(
+                        state.bounds, previous_bounds,
+                        minimum == minimum_sizes_.end()
+                            ? ImVec2(0.0f, 0.0f)
+                            : minimum->second);
+                    ImGui::SetWindowPos(
+                        {work_position_.x + state.bounds.x * ui_scale_,
+                         work_position_.y + state.bounds.y * ui_scale_},
+                        ImGuiCond_Always);
+                    ImGui::SetWindowSize(
+                        {state.bounds.width * ui_scale_,
+                         state.bounds.height * ui_scale_},
+                        ImGuiCond_Always);
+                } else {
+                    const ImVec2 snapped = SnapPosition(
+                        {state.bounds.x, state.bounds.y},
+                        {state.bounds.width, state.bounds.height});
+                    state.bounds.x = snapped.x;
+                    state.bounds.y = snapped.y;
+                    ImGui::SetWindowPos(
+                        {work_position_.x + state.bounds.x * ui_scale_,
+                         work_position_.y + state.bounds.y * ui_scale_},
+                        ImGuiCond_Always);
+                }
+            }
+        }
+        return;
+    }
+    if (dragged_windows_.erase(state.id) == 0U) return;
+
+    if (snap_enabled_) {
+        const ImVec2 snapped = SnapPosition(
+            {state.bounds.x, state.bounds.y},
+            {state.bounds.width, state.bounds.height});
+        state.bounds.x = snapped.x;
+        state.bounds.y = snapped.y;
+    }
+    if (NormalizeBounds(state.bounds)) dirty_ = true;
+    pending_geometry_.insert(state.id);
+    dirty_ = true;
+}
+
+void Workspace::SnapResizedBounds(workstation::LogicalRect& bounds,
+                                  const workstation::LogicalRect& previous,
+                                  ImVec2 minimum_size) const {
+    const float available_width = std::max(1.0f, work_size_.x / ui_scale_);
+    const float available_height = std::max(1.0f, work_size_.y / ui_scale_);
+    const float step = static_cast<float>(snap_pixels_);
+    const auto snap_size = [step](float value, float minimum, float maximum) {
+        const float clamped = std::clamp(value, minimum, maximum);
+        const float lower = minimum +
+                            std::floor((clamped - minimum) / step) * step;
+        const float upper = std::min(maximum, lower + step);
+        return std::fabs(clamped - upper) < std::fabs(clamped - lower)
+                   ? upper
+                   : lower;
+    };
+    const bool resized_from_left = std::fabs(bounds.x - previous.x) > 0.25f;
+    const bool resized_from_top = std::fabs(bounds.y - previous.y) > 0.25f;
+    const float right = previous.x + previous.width;
+    const float bottom = previous.y + previous.height;
+    bounds.width = snap_size(bounds.width, minimum_size.x,
+                             resized_from_left ? right
+                                               : available_width - bounds.x);
+    bounds.height = snap_size(bounds.height, minimum_size.y,
+                              resized_from_top ? bottom
+                                               : available_height - bounds.y);
+    if (resized_from_left) bounds.x = right - bounds.width;
+    if (resized_from_top) bounds.y = bottom - bounds.height;
 }
 
 void Workspace::ResetWindow(WorkspaceWindow& window) {
@@ -248,17 +377,29 @@ void Workspace::ResetAll() {
     }
 }
 
+void Workspace::ReturnAllWindowsToWorkspace() {
+    if (persistent_state_ == nullptr) return;
+    for (auto& [id, window] : persistent_state_->windows) {
+        if (NormalizeBounds(window.bounds)) {
+            pending_geometry_.insert(id);
+            dirty_ = true;
+        }
+    }
+}
+
 ImVec2 Workspace::SnapPosition(ImVec2 position, ImVec2 window_size) const {
     const float step = static_cast<float>(snap_pixels_);
-    const auto snap_axis = [step](float value, float origin, float canvas_length, float size) {
-        const float available = std::max(0.0f, canvas_length - size);
-        const int last_cell = static_cast<int>(std::floor(available / step));
-        const int cell = std::clamp(static_cast<int>(std::lround((value - origin) / step)),
-                                    0, last_cell);
-        return origin + static_cast<float>(cell) * step;
+    const auto snap_axis = [step](float value, float canvas_length, float size) {
+        const float edge = std::max(0.0f, canvas_length - size);
+        const float clamped = std::clamp(value, 0.0f, edge);
+        const float grid = std::clamp(
+            std::round(clamped / step) * step, 0.0f, edge);
+        return std::fabs(edge - clamped) < std::fabs(grid - clamped)
+                   ? edge
+                   : grid;
     };
-    return {snap_axis(position.x, work_position_.x, work_size_.x, window_size.x),
-            snap_axis(position.y, work_position_.y, work_size_.y, window_size.y)};
+    return {snap_axis(position.x, work_size_.x / ui_scale_, window_size.x),
+            snap_axis(position.y, work_size_.y / ui_scale_, window_size.y)};
 }
 
 }  // namespace tradebox::ui

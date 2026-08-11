@@ -148,12 +148,13 @@ add_library(tradebox_workstation STATIC
   src/workstation/defaults.cpp
   src/workstation/event_window.cpp
   src/workstation/instrument_links.cpp
-  src/workstation/order_tickets.cpp
+  src/workstation/trade_hotkey.cpp
   src/workstation/profile_codec.cpp
   src/workstation/profile_lock.cpp
   src/workstation/profile_store.cpp
   src/workstation/positions_orders_windows.cpp
   src/workstation/stable_id.cpp
+  src/workstation/time_sales_documents.cpp
   src/workstation/validation.cpp
   src/workstation/watch_list_documents.cpp
 )
@@ -172,6 +173,7 @@ add_library(tradebox_broker_alpaca STATIC
   src/broker/alpaca/alpaca_account_activity.cpp
   src/broker/alpaca/alpaca_auth.cpp
   src/broker/alpaca/alpaca_bar_request.cpp
+  src/broker/alpaca/alpaca_history_scheduler.cpp
   src/broker/alpaca/alpaca_market_stream_decoder.cpp
   src/broker/alpaca/alpaca_order_codec.cpp
   src/broker/alpaca/alpaca_price_rules.cpp
@@ -221,9 +223,9 @@ add_executable(tradebox_gui WIN32
   src/adapters/gui/chart_window.cpp
   src/adapters/gui/debug_window.cpp
   src/adapters/gui/event_window.cpp
-  src/adapters/gui/order_ticket_window.cpp
   src/adapters/gui/positions_window.cpp
   src/adapters/gui/trade_hotkey_window.cpp
+  src/adapters/gui/time_sales_window.cpp
   src/adapters/gui/watch_list_window.cpp
   src/adapters/gui/gui_controls.cpp
   src/adapters/gui/gui_support.cpp
@@ -294,6 +296,7 @@ if(BUILD_TESTING)
     tests/unit/chart_application_tests.cpp
     tests/unit/alpaca_account_activity_tests.cpp
     tests/unit/alpaca_bar_request_tests.cpp
+    tests/unit/alpaca_history_scheduler_tests.cpp
     tests/unit/alpaca_market_stream_decoder_tests.cpp
     tests/unit/alpaca_order_codec_tests.cpp
     tests/unit/alpaca_polling_policy_tests.cpp
@@ -334,6 +337,7 @@ if(BUILD_TESTING)
   )
   target_sources(tradebox_workstation_tests PRIVATE
     src/adapters/gui/chart_geometry.cpp
+    src/adapters/gui/time_sales_window.cpp
   )
   target_link_libraries(tradebox_workstation_tests PRIVATE
     tradebox_workstation

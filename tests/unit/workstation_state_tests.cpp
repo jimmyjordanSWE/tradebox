@@ -1,13 +1,16 @@
 #include "tradebox/workstation/chart_documents.h"
 #include "tradebox/workstation/instrument_links.h"
-#include "tradebox/workstation/order_tickets.h"
+#include "tradebox/workstation/trade_hotkey.h"
 #include "tradebox/workstation/profile_codec.h"
 #include "tradebox/workstation/profile_store.h"
 #include "tradebox/workstation/positions_orders_windows.h"
+#include "tradebox/workstation/time_sales_documents.h"
 #include "tradebox/workstation/validation.h"
 #include "tradebox/workstation/watch_list_documents.h"
 #include "tradebox/workstation/watch_list_columns.h"
 #include "tradebox/workstation/asset_preferences.h"
+
+#include "time_sales_window.h"
 
 #include <gtest/gtest.h>
 
@@ -59,7 +62,6 @@ TEST(WorkstationState, DefaultsAreValidAndStable) {
     EXPECT_TRUE(state.workspace.charts.empty());
     EXPECT_TRUE(state.workspace.indicator_suites.empty());
     EXPECT_TRUE(state.workspace.chart_drawings.empty());
-    EXPECT_TRUE(state.workspace.order_tickets.empty());
     EXPECT_EQ(state.workspace.instrument_link_groups.size(), 32U);
     EXPECT_EQ(state.workspace.instrument_link_groups.front().id,
               "instrument-link.red");
@@ -110,6 +112,32 @@ TEST(PositionsAndOrdersWindows, CreateSeparatePersistentWindows) {
         std::string(kOrdersWindowId)));
 }
 
+TEST(TimeSalesWindow, QueuesOneInitialRecentTradeRequestPerInstrument) {
+    WorkstationState state = WorkstationState::Defaults();
+    ASSERT_TRUE(CreateTimeSalesDocument(state.workspace));
+    TimeSalesDocumentState& document = state.workspace.time_sales.front();
+    ASSERT_TRUE(AssignTimeSalesInstrument(
+        state.workspace, document.id, "asset:pltr", "PLTR"));
+
+    gui::TimeSalesWindowRenderer renderer;
+    application::UiSnapshotQuery query{.as_of_ns = 1'000'000'000'000LL};
+    renderer.AppendSnapshotQuery(state.workspace, query);
+
+    ASSERT_EQ(query.market_symbols, std::vector<std::string>({"PLTR"}));
+    const auto requests = renderer.ConsumeHistoryRequests();
+    ASSERT_EQ(requests.size(), 1U);
+    EXPECT_EQ(requests.front().document_id, document.id);
+    EXPECT_EQ(requests.front().query.instrument_id, "asset:pltr");
+    EXPECT_EQ(requests.front().query.symbol, "PLTR");
+    EXPECT_EQ(requests.front().query.start_ns, 100'000'000'000LL);
+    EXPECT_EQ(requests.front().query.end_ns, 1'000'000'000'000LL);
+    EXPECT_TRUE(requests.front().query.include_trades);
+    EXPECT_FALSE(requests.front().query.include_quotes);
+
+    renderer.AppendSnapshotQuery(state.workspace, query);
+    EXPECT_TRUE(renderer.ConsumeHistoryRequests().empty());
+}
+
 TEST(PositionsAndOrdersWindows, ColumnRegistriesContainOnlyUsableDefinitions) {
     const auto assert_usable = [](const auto definitions) {
         ASSERT_FALSE(definitions.empty());
@@ -122,46 +150,6 @@ TEST(PositionsAndOrdersWindows, ColumnRegistriesContainOnlyUsableDefinitions) {
 
     assert_usable(PositionColumnDefinitions());
     assert_usable(OrderColumnDefinitions());
-}
-
-TEST(OrderTickets, OpensOnePersistentConfigurationPerTicker) {
-    WorkstationState state = WorkstationState::Defaults();
-
-    ASSERT_TRUE(OpenOrderTicketForSymbol(state.workspace, "NVDA"));
-    OrderTicketState* nvda = FindOrderTicketForSymbol(state.workspace, "NVDA");
-    ASSERT_NE(nvda, nullptr);
-    const std::string nvda_id = nvda->id;
-    nvda->side = "sell";
-    nvda->amount = "250";
-    nvda->type = "limit";
-    nvda->limit_price = "175.50";
-
-    ASSERT_TRUE(OpenOrderTicketForSymbol(state.workspace, "AAPL"));
-    OrderTicketState* aapl = FindOrderTicketForSymbol(state.workspace, "AAPL");
-    ASSERT_NE(aapl, nullptr);
-    EXPECT_NE(aapl->id, nvda_id);
-    aapl->amount = "10";
-
-    ASSERT_TRUE(OpenOrderTicketForSymbol(state.workspace, "NVDA"));
-    nvda = FindOrderTicketForSymbol(state.workspace, "NVDA");
-    ASSERT_NE(nvda, nullptr);
-    EXPECT_EQ(state.workspace.selected_symbol, "NVDA");
-    EXPECT_EQ(nvda->id, nvda_id);
-    EXPECT_EQ(nvda->side, "sell");
-    EXPECT_EQ(nvda->amount, "250");
-    EXPECT_EQ(nvda->type, "limit");
-    EXPECT_EQ(nvda->limit_price, "175.50");
-    EXPECT_TRUE(state.workspace.windows.at(
-        std::string(kOrderTicketWindowId)).open);
-
-    const auto decoded = DecodeProfile(EncodeProfile(state));
-    ASSERT_TRUE(decoded) << decoded.error();
-    const OrderTicketState* restored_nvda = FindOrderTicketForSymbol(
-        decoded->workspace, "NVDA");
-    ASSERT_NE(restored_nvda, nullptr);
-    EXPECT_EQ(restored_nvda->id, nvda_id);
-    EXPECT_EQ(restored_nvda->side, "sell");
-    EXPECT_EQ(restored_nvda->limit_price, "175.50");
 }
 
 TEST(TradeHotkeyWindow, OpensThroughThePersistentWindowSystem) {
@@ -621,6 +609,27 @@ TEST(WorkstationState, StoreRoundTripsThroughOneProfileFile) {
     reader.Close();
 }
 
+TEST(TimeSalesDocuments, CreateAssignAndRoundTripThroughProfile) {
+    WorkstationState state = WorkstationState::Defaults();
+    const auto created = CreateTimeSalesDocument(state.workspace);
+    ASSERT_TRUE(created);
+    ASSERT_TRUE(AssignTimeSalesInstrument(
+        state.workspace, *created, "asset-pltr", "PLTR"));
+    state.workspace.time_sales_table.columns = {
+        {.id = "time", .order = 0, .width = 110.0f, .visible = true},
+        {.id = "price", .order = 1, .width = 110.0f, .visible = true},
+    };
+
+    const auto decoded = DecodeProfile(EncodeProfile(state));
+    ASSERT_TRUE(decoded);
+    ASSERT_EQ(decoded->workspace.time_sales.size(), 1U);
+    EXPECT_EQ(decoded->workspace.time_sales.front().instrument_id, "asset-pltr");
+    EXPECT_EQ(decoded->workspace.time_sales.front().symbol, "PLTR");
+    EXPECT_TRUE(decoded->workspace.windows.contains(*created));
+    ASSERT_EQ(decoded->workspace.time_sales_table.columns.size(), 2U);
+    EXPECT_EQ(decoded->workspace.time_sales_table.columns.front().id, "time");
+}
+
 TEST(WorkstationState, RejectsDuplicateDocumentIdentity) {
     WorkstationState state = WorkstationState::Defaults();
     state.workspace.charts = {
@@ -823,6 +832,25 @@ TEST(WorkstationState, MigratesLegacyHotkeyPositionCapAway) {
     EXPECT_FLOAT_EQ(decoded->workspace.bracket_drafts.at("AMD")
                         .target_percent,
                     1.0f);
+}
+
+TEST(WorkstationState, RemovesDormantOrderTicketDataFromLegacyProfiles) {
+    const auto decoded = DecodeProfile(
+        "[profile]\n"
+        "schema_version = 6\n"
+        "id = \"legacy-order-ticket-profile\"\n"
+        "name = \"Legacy\"\n\n"
+        "[windows.\"order-ticket.window\"]\n"
+        "id = \"order-ticket.window\"\n"
+        "kind = \"order-ticket\"\n"
+        "title = \"Order Ticket\"\n"
+        "open = true\n\n"
+        "[[order_tickets]]\n"
+        "id = \"order-ticket:legacy\"\n"
+        "symbol = \"PLTR\"\n");
+    ASSERT_TRUE(decoded) << decoded.error();
+    EXPECT_FALSE(decoded->workspace.windows.contains("order-ticket.window"));
+    EXPECT_EQ(EncodeProfile(*decoded).find("order_tickets"), std::string::npos);
 }
 
 TEST(InstrumentLinks, CommandsPreserveLocalWindowStateAndPublishOneContext) {

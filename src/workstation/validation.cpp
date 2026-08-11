@@ -155,6 +155,21 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
         }
     }
 
+    std::set<std::string, std::less<>> time_sales_ids;
+    for (TimeSalesDocumentState& document : state.workspace.time_sales) {
+        if (document.id.empty() || !time_sales_ids.insert(document.id).second ||
+            (document.instrument_id.empty() != document.symbol.empty())) {
+            error = "Time & Sales documents contain invalid identity";
+            return false;
+        }
+        const auto window = state.workspace.windows.find(document.id);
+        if (window == state.workspace.windows.end() ||
+            window->second.kind != "time-sales") {
+            error = "Time & Sales document has no matching window";
+            return false;
+        }
+    }
+
     std::set<std::string, std::less<>> watch_list_ids;
     std::set<std::string, std::less<>> watch_list_row_ids;
     for (auto iterator = state.workspace.windows.begin();
@@ -274,15 +289,10 @@ bool ValidateAndNormalize(WorkstationState& state, std::string& error) {
         }
     }
 
-    std::set<std::string, std::less<>> ticket_ids;
-    for (OrderTicketState& ticket : state.workspace.order_tickets) {
-        if (ticket.id.empty() || !ticket_ids.insert(ticket.id).second) {
-            error = "Order-ticket profile contains an invalid or duplicate document ID";
-            return false;
-        }
-        if (ticket.name.empty()) ticket.name = "Untitled order";
-        if (ticket.symbol.empty()) ticket.symbol = state.workspace.selected_symbol;
-    }
+    // Schema 7 removes the dormant Order Ticket feature. Discard its old
+    // window entry while loading older profiles so it cannot survive as
+    // invisible stale workstation state.
+    state.workspace.windows.erase("order-ticket.window");
     for (auto& [symbol, draft] : state.workspace.bracket_drafts) {
         if (symbol.empty()) {
             error = "Bracket draft profile contains an empty symbol";

@@ -2,6 +2,7 @@
 
 #include "tradebox/broker/gateway.h"
 #include "tradebox/broker/alpaca_bar_request.h"
+#include "tradebox/broker/alpaca_history_scheduler.h"
 #include "tradebox/broker/alpaca_rest_transport.h"
 #include "tradebox/broker/alpaca_stream_supervision.h"
 #include "tradebox/broker/history_status.h"
@@ -96,7 +97,11 @@ private:
         std::string symbol,
         tradebox::core::BarSeriesKey key,
         tradebox::core::BarRange requested_range,
-        std::vector<tradebox::core::BarRange> reserved_ranges);
+        std::vector<tradebox::core::BarRange> reserved_ranges,
+        tradebox::broker::alpaca::RestPriority priority);
+    void ScheduleBarHistory(
+        tradebox::core::HistoricalBarQuery query,
+        tradebox::broker::alpaca::HistoricalWorkPriority priority);
     void PublishCachedHistory(
         const std::string& symbol,
         const tradebox::core::BarSeriesKey& key,
@@ -166,6 +171,8 @@ private:
     std::size_t background_active_ = 0;
     std::uint64_t background_rejected_ = 0;
     std::atomic<std::uint64_t> tick_requests_coalesced_ = 0;
+    tradebox::broker::alpaca::HistoricalWorkScheduler
+        historical_work_scheduler_;
     std::atomic<bool> persistence_queue_warning_emitted_ = false;
     std::uint64_t reported_persistence_failures_ = 0;
     bool background_stopping_ = false;

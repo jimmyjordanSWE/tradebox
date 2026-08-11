@@ -76,6 +76,23 @@ void DebugWindowRenderer::Draw(
             snapshot.maximum_frame_rate == 0
                 ? "Unlimited"
                 : std::to_string(snapshot.maximum_frame_rate));
+        if (snapshot.rest_health) {
+            const auto& health = *snapshot.rest_health;
+            Row("Historical work", std::to_string(health.historical_work_queued) +
+                                       " queued, " +
+                                       std::to_string(health.historical_work_in_flight) +
+                                       " active");
+            Row("Historical work totals",
+                std::to_string(health.historical_work_completed) +
+                    " completed, " +
+                    std::to_string(health.historical_work_coalesced) +
+                    " coalesced, " +
+                    std::to_string(health.historical_work_rejected) +
+                    " rejected");
+            Row("REST market-data budget",
+                std::to_string(health.market_data.remaining) + " remaining / " +
+                    std::to_string(health.market_data.limit));
+        }
         Row("Window pixels", std::to_string(snapshot.window_width) + " x " +
                                   std::to_string(snapshot.window_height));
         Row("Display mode", std::to_string(snapshot.display_width) + " x " +
