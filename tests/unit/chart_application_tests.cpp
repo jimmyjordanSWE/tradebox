@@ -136,12 +136,6 @@ TEST(ChartApplicationSnapshotTest, ExposesExplicitStatesAndAssetSearch) {
     ASSERT_EQ(snapshot.assets.size(), 1U);
     EXPECT_EQ(snapshot.assets.front().instrument_id, "asset-aapl");
 
-    application.RequestMarketHistory(missing);
-    snapshot = application.SnapshotForUi({.charts = {missing}});
-    EXPECT_EQ(snapshot.charts.front().status,
-              tradebox::application::ChartDataStatus::Failed);
-    EXPECT_TRUE(snapshot.charts.front().retryable);
-
     const tradebox::core::BarRange covered{1'000, 2'000};
     ASSERT_TRUE(database.StoreProviderBars({
         .key = Key(),
@@ -314,6 +308,75 @@ TEST(ChartApplicationSnapshotTest, PublishesOnlyUniqueRequestedMarkets) {
     EXPECT_NE(snapshot.markets.Find("AAPL"), nullptr);
     EXPECT_NE(snapshot.markets.Find("MSFT"), nullptr);
     EXPECT_EQ(snapshot.markets.Find("NVDA"), nullptr);
+}
+
+TEST(ChartApplicationSnapshotTest,
+     WindowDemandDeduplicatesReplacesAndReleasesLiveInterest) {
+    TemporaryDatabase temporary;
+    Database database;
+    std::string error;
+    ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+    tradebox::application::TradingApplication application(database);
+    auto chart = tradebox::application::UiChartQuery{
+        .document_id = "chart.aapl",
+        .key = Key(),
+        .symbol = "AAPL",
+        .range = {1, 2},
+    };
+
+    static_cast<void>(application.SnapshotForUi({.charts = {chart}}));
+    const auto first = application.MarketDataSubscriptions(
+        tradebox::core::MarketDataFeed::Iex);
+    ASSERT_EQ(first.accepted.size(), 1U);
+    EXPECT_EQ(first.accepted.front().symbol, "AAPL");
+
+    static_cast<void>(application.SnapshotForUi({.charts = {chart}}));
+    const auto duplicate = application.MarketDataSubscriptions(
+        tradebox::core::MarketDataFeed::Iex);
+    EXPECT_EQ(duplicate.revision, first.revision);
+
+    chart.symbol = "MSFT";
+    static_cast<void>(application.SnapshotForUi({.charts = {chart}}));
+    const auto replaced = application.MarketDataSubscriptions(
+        tradebox::core::MarketDataFeed::Iex);
+    ASSERT_EQ(replaced.accepted.size(), 1U);
+    EXPECT_EQ(replaced.accepted.front().symbol, "MSFT");
+
+    static_cast<void>(application.SnapshotForUi({}));
+    const auto released = application.MarketDataSubscriptions(
+        tradebox::core::MarketDataFeed::Iex);
+    EXPECT_TRUE(released.accepted.empty());
+}
+
+TEST(ChartApplicationSnapshotTest,
+     TickDemandPublishesReplacesAndReleasesDocumentSnapshot) {
+    TemporaryDatabase temporary;
+    Database database;
+    std::string error;
+    ASSERT_TRUE(database.OpenAt(temporary.path, error)) << error;
+    tradebox::application::TradingApplication application(database);
+    tradebox::application::UiTickQuery tick{
+        .document_id = "time-sales.aapl",
+        .query = {.instrument_id = "asset-aapl",
+                  .symbol = "AAPL",
+                  .start_ns = 10,
+                  .end_ns = 20},
+    };
+
+    auto snapshot = application.SnapshotForUi({.ticks = {tick}});
+    ASSERT_EQ(snapshot.ticks.size(), 1U);
+    EXPECT_EQ(snapshot.ticks.front().document_id, tick.document_id);
+    EXPECT_FALSE(snapshot.ticks.front().loading);
+    EXPECT_EQ(snapshot.ticks.front().series.query.start_ns, 10);
+    EXPECT_FALSE(snapshot.ticks.front().series.error.empty());
+
+    tick.query.end_ns = 30;
+    snapshot = application.SnapshotForUi({.ticks = {tick}});
+    ASSERT_EQ(snapshot.ticks.size(), 1U);
+    EXPECT_EQ(snapshot.ticks.front().series.query.end_ns, 30);
+
+    snapshot = application.SnapshotForUi({});
+    EXPECT_TRUE(snapshot.ticks.empty());
 }
 
 TEST(ChartApplicationSnapshotTest,

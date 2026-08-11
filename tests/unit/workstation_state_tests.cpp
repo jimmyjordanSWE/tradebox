@@ -112,7 +112,7 @@ TEST(PositionsAndOrdersWindows, CreateSeparatePersistentWindows) {
         std::string(kOrdersWindowId)));
 }
 
-TEST(TimeSalesWindow, QueuesOneInitialRecentTradeRequestPerInstrument) {
+TEST(TimeSalesWindow, PublishesRecentTradeDemandPerStableDocument) {
     WorkstationState state = WorkstationState::Defaults();
     ASSERT_TRUE(CreateTimeSalesDocument(state.workspace));
     TimeSalesDocumentState& document = state.workspace.time_sales.front();
@@ -124,18 +124,18 @@ TEST(TimeSalesWindow, QueuesOneInitialRecentTradeRequestPerInstrument) {
     renderer.AppendSnapshotQuery(state.workspace, query);
 
     ASSERT_EQ(query.market_symbols, std::vector<std::string>({"PLTR"}));
-    const auto requests = renderer.ConsumeHistoryRequests();
-    ASSERT_EQ(requests.size(), 1U);
-    EXPECT_EQ(requests.front().document_id, document.id);
-    EXPECT_EQ(requests.front().query.instrument_id, "asset:pltr");
-    EXPECT_EQ(requests.front().query.symbol, "PLTR");
-    EXPECT_EQ(requests.front().query.start_ns, 100'000'000'000LL);
-    EXPECT_EQ(requests.front().query.end_ns, 1'000'000'000'000LL);
-    EXPECT_TRUE(requests.front().query.include_trades);
-    EXPECT_FALSE(requests.front().query.include_quotes);
+    ASSERT_EQ(query.ticks.size(), 1U);
+    EXPECT_EQ(query.ticks.front().document_id, document.id);
+    EXPECT_EQ(query.ticks.front().query.instrument_id, "asset:pltr");
+    EXPECT_EQ(query.ticks.front().query.symbol, "PLTR");
+    EXPECT_EQ(query.ticks.front().query.start_ns, 100'000'000'000LL);
+    EXPECT_EQ(query.ticks.front().query.end_ns, 1'000'000'000'000LL);
+    EXPECT_TRUE(query.ticks.front().query.include_trades);
+    EXPECT_FALSE(query.ticks.front().query.include_quotes);
 
+    query.ticks.clear();
     renderer.AppendSnapshotQuery(state.workspace, query);
-    EXPECT_TRUE(renderer.ConsumeHistoryRequests().empty());
+    EXPECT_EQ(query.ticks.size(), 1U);
 }
 
 TEST(PositionsAndOrdersWindows, ColumnRegistriesContainOnlyUsableDefinitions) {

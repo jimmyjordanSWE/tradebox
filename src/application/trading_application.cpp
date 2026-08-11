@@ -18,6 +18,7 @@
 #include <shared_mutex>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <atomic>
 #include <format>
@@ -148,6 +149,167 @@ private:
 
 }  // namespace
 
+class MarketDataDemandCoordinator final {
+public:
+    void Reconcile(const UiSnapshotQuery& query, const core::CoreSnapshot& core,
+                   core::MarketDataFeed feed, AlpacaService& broker,
+                   MarketDataInterestCoordinator& interests) {
+        PollTicks();
+        std::unordered_map<std::string, std::vector<core::HistoricalBarQuery>> bars;
+        std::unordered_map<std::string, core::TickQuery> ticks;
+        std::unordered_map<std::string, std::vector<std::string>> live;
+        for (const UiChartQuery& chart : query.charts) {
+            if (ValidBar(chart.key, chart.symbol, chart.range)) {
+                bars["ui.chart." + chart.document_id].push_back(
+                    {.key = chart.key, .symbol = chart.symbol, .range = chart.range});
+                live["ui.chart." + chart.document_id].push_back(chart.symbol);
+            }
+        }
+        const core::BarRange daily_range = WatchListDailyRange(query.as_of_ns);
+        for (const UiWatchListQuery& watch : query.watch_lists) {
+            const std::string consumer = "ui.watch-list." + watch.document_id;
+            for (const UiWatchListRowQuery& row : watch.rows) {
+                if (!row.symbol.empty()) live[consumer].push_back(row.symbol);
+                if (watch.needs_change_from_open && query.as_of_ns > 0 &&
+                    !row.instrument_id.empty() && !row.symbol.empty())
+                    bars[consumer].push_back({
+                        .key = {.instrument_id = row.instrument_id,
+                                .feed = feed,
+                                .timeframe = "1Day",
+                                .adjustment = core::BarAdjustment::All},
+                        .symbol = row.symbol,
+                        .range = daily_range,
+                    });
+            }
+        }
+        for (const UiTickQuery& tick : query.ticks) {
+            if (tick.document_id.empty() || tick.query.instrument_id.empty() ||
+                tick.query.symbol.empty() || tick.query.start_ns >= tick.query.end_ns)
+                continue;
+            core::TickQuery resolved = tick.query;
+            resolved.feed = feed;
+            ticks.insert_or_assign("ui.tick." + tick.document_id, resolved);
+            live["ui.tick." + tick.document_id].push_back(resolved.symbol);
+        }
+        std::vector<std::string> shared = query.market_symbols;
+        if (query.include_position_markets)
+            for (const core::PositionState& position : core.positions)
+                if (!position.symbol.empty()) shared.push_back(position.symbol);
+        if (!shared.empty()) live.emplace("ui.snapshot.visible", std::move(shared));
+
+        ReconcileBars(bars, core.authenticated, broker);
+        ReconcileTicks(ticks, core.authenticated, broker);
+        ReconcileLive(live, feed, interests);
+    }
+
+    [[nodiscard]] std::optional<UiTickSnapshot> TickFor(
+        std::string_view document_id) const {
+        const auto found = ticks_.find("ui.tick." + std::string(document_id));
+        if (found == ticks_.end()) return std::nullopt;
+        return UiTickSnapshot{.document_id = std::string(document_id),
+                              .series = found->second.series,
+                              .loading = found->second.request.valid()};
+    }
+
+private:
+    struct TickState {
+        core::TickQuery query;
+        std::future<core::TickSeries> request;
+        core::TickSeries series;
+    };
+
+    static bool Same(const core::HistoricalBarQuery& left,
+                     const core::HistoricalBarQuery& right) {
+        return left.key == right.key && left.symbol == right.symbol &&
+               left.range == right.range;
+    }
+    static bool Same(const core::TickQuery& left, const core::TickQuery& right) {
+        return left.instrument_id == right.instrument_id && left.symbol == right.symbol &&
+               left.start_ns == right.start_ns && left.end_ns == right.end_ns &&
+               left.feed == right.feed && left.include_trades == right.include_trades &&
+               left.include_quotes == right.include_quotes;
+    }
+    static bool Same(const std::vector<core::HistoricalBarQuery>& left,
+                     const std::vector<core::HistoricalBarQuery>& right) {
+        return left.size() == right.size() && std::ranges::equal(
+                   left, right,
+                   [](const core::HistoricalBarQuery& lhs,
+                      const core::HistoricalBarQuery& rhs) {
+                       return Same(lhs, rhs);
+                   });
+    }
+    static bool ValidBar(const core::BarSeriesKey& key, const std::string& symbol,
+                         core::BarRange range) {
+        return !key.instrument_id.empty() && !symbol.empty() &&
+               key.feed != core::MarketDataFeed::Unknown && !key.timeframe.empty() &&
+               range.start_ns >= 0 && range.start_ns < range.end_ns;
+    }
+    void PollTicks() {
+        for (auto& [_, tick] : ticks_) {
+            if (!tick.request.valid() || tick.request.wait_for(std::chrono::seconds(0)) !=
+                                          std::future_status::ready)
+                continue;
+            try { tick.series = tick.request.get(); }
+            catch (const std::exception& error) { tick.series = {.query = tick.query, .error = error.what()}; }
+        }
+    }
+    void ReconcileBars(const std::unordered_map<std::string, std::vector<core::HistoricalBarQuery>>& next,
+                       bool authenticated, AlpacaService& broker) {
+        if (!authenticated) {
+            bars_.clear();
+            return;
+        }
+        for (const auto& [consumer, demands] : next) {
+            const auto current = bars_.find(consumer);
+            if (current != bars_.end() && Same(current->second, demands)) continue;
+            for (const auto& demand : demands) broker.RequestHistory(demand);
+        }
+        bars_ = next;
+    }
+    void ReconcileTicks(const std::unordered_map<std::string, core::TickQuery>& next,
+                        bool authenticated, AlpacaService& broker) {
+        if (!authenticated) {
+            ticks_.clear();
+            for (const auto& [consumer, demand] : next)
+                ticks_.emplace(consumer, TickState{
+                    .query = demand,
+                    .series = {.query = demand,
+                               .error = "Historical ticks are unavailable while disconnected"},
+                });
+            return;
+        }
+        for (const auto& [consumer, demand] : next) {
+            const auto current = ticks_.find(consumer);
+            if (current != ticks_.end() && Same(current->second.query, demand)) continue;
+            ticks_[consumer] = {.query = demand, .request = broker.RequestTicks(demand)};
+        }
+        std::erase_if(ticks_, [&](const auto& entry) { return !next.contains(entry.first); });
+    }
+    void ReconcileLive(const std::unordered_map<std::string, std::vector<std::string>>& next,
+                       core::MarketDataFeed feed, MarketDataInterestCoordinator& interests) {
+        for (const auto& [consumer, symbols] : next) {
+            const auto current = live_.find(consumer);
+            if (current != live_.end() && current->second == symbols) continue;
+            static_cast<void>(interests.Upsert({.consumer_id = consumer, .feed = feed,
+                                                .symbols = symbols,
+                                                .priority = MarketDataInterestPriority::UserVisible}));
+        }
+        for (const std::string& consumer : live_consumers_)
+            if (!next.contains(consumer)) static_cast<void>(interests.Remove(consumer));
+        live_consumers_.clear();
+        live_.clear();
+        for (const auto& [consumer, symbols] : next) {
+            live_consumers_.insert(consumer);
+            live_.emplace(consumer, symbols);
+        }
+    }
+
+    std::unordered_map<std::string, std::vector<core::HistoricalBarQuery>> bars_;
+    std::unordered_map<std::string, TickState> ticks_;
+    std::unordered_set<std::string> live_consumers_;
+    std::unordered_map<std::string, std::vector<std::string>> live_;
+};
+
 class TradingApplication::Impl final {
 public:
     explicit Impl(Database& database)
@@ -232,6 +394,7 @@ public:
     CoreValuationMarketDataSink valuation_market_data;
     core::BarStore bars;
     HistoryRequestTracker history_requests;
+    MarketDataDemandCoordinator market_demands;
     mutable IndicatorProjectionCache indicator_projections;
     MarketDataInterestCoordinator market_interests;
     core::MarketDataFeed active_market_feed =
@@ -260,9 +423,18 @@ core::CoreSnapshot TradingApplication::Snapshot() const {
 }
 
 ApplicationUiSnapshot TradingApplication::SnapshotForUi(
-    const UiSnapshotQuery& query) const {
+    const UiSnapshotQuery& query) {
     ApplicationUiSnapshot result;
     result.core = Snapshot();
+    impl_->market_demands.Reconcile(query, result.core,
+                                    impl_->active_market_feed, impl_->broker,
+                                    impl_->market_interests);
+    const std::vector<std::string> planned = impl_->market_interests.Plan(
+        impl_->active_market_feed).Symbols();
+    if (planned != impl_->active_market_symbols) {
+        impl_->active_market_symbols = planned;
+        impl_->broker.RefreshSymbols(impl_->active_market_symbols);
+    }
     std::vector<std::string> visible_market_identifiers =
         query.market_symbols;
     visible_market_identifiers.reserve(
@@ -409,6 +581,10 @@ ApplicationUiSnapshot TradingApplication::SnapshotForUi(
         }
         result.watch_lists.push_back(std::move(projected));
     }
+    result.ticks.reserve(query.ticks.size());
+    for (const UiTickQuery& tick : query.ticks)
+        if (const auto snapshot = impl_->market_demands.TickFor(tick.document_id))
+            result.ticks.push_back(*snapshot);
     if (query.asset_limit != 0) {
         std::shared_lock catalog_lock(impl_->asset_catalog_mutex);
         const auto search = [&](const std::string& text) {
@@ -859,36 +1035,6 @@ bool TradingApplication::RemoveMarketDataInterest(
 MarketDataSubscriptionPlan TradingApplication::MarketDataSubscriptions(
     core::MarketDataFeed feed) const {
     return impl_->market_interests.Plan(feed);
-}
-
-void TradingApplication::RequestMarketHistory(
-    const std::string& symbol, const std::string& timeframe) {
-    impl_->broker.RequestHistory(symbol, timeframe);
-}
-
-void TradingApplication::RequestMarketHistory(
-    const std::string& symbol, const std::string& timeframe,
-    core::BarRange range) {
-    impl_->broker.RequestHistory(symbol, timeframe, range);
-}
-
-void TradingApplication::RequestMarketHistory(
-    core::HistoricalBarQuery query) {
-    impl_->broker.RequestHistory(std::move(query));
-}
-
-void TradingApplication::RequestMarketHistory(
-    const UiChartQuery& query) {
-    impl_->broker.RequestHistory({
-        .key = query.key,
-        .symbol = query.symbol,
-        .range = query.range,
-    });
-}
-
-std::future<core::TickSeries> TradingApplication::RequestTicks(
-    core::TickQuery query) {
-    return impl_->broker.RequestTicks(std::move(query));
 }
 
 void TradingApplication::RefreshAssetCatalog() {

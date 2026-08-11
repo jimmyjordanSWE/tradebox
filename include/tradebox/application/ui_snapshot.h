@@ -41,11 +41,19 @@ struct UiWatchListQuery {
     bool needs_change_from_open = false;
 };
 
+// A stable UI consumer asks the application to maintain this historical tick
+// projection. The document ID, never a renderer instance, owns its lifecycle.
+struct UiTickQuery {
+    std::string document_id;
+    core::TickQuery query;
+};
+
 struct UiSnapshotQuery {
     std::int64_t as_of_ns = 0;
     std::vector<std::string> market_symbols;
     std::vector<UiChartQuery> charts;
     std::vector<UiWatchListQuery> watch_lists;
+    std::vector<UiTickQuery> ticks;
     // Requests live market snapshots for the symbols currently held in the
     // authoritative position projection.
     bool include_position_markets = false;
@@ -99,6 +107,12 @@ struct UiWatchListSnapshot {
     std::vector<UiWatchListRowSnapshot> rows;
 };
 
+struct UiTickSnapshot {
+    std::string document_id;
+    core::TickSeries series;
+    bool loading = false;
+};
+
 // A complete read model for one render pass. It contains no renderer types and
 // can therefore be assembled and tested independently of the renderer.
 struct ApplicationUiSnapshot {
@@ -106,6 +120,7 @@ struct ApplicationUiSnapshot {
     core::MarketDataFrame markets;
     std::vector<UiChartSnapshot> charts;
     std::vector<UiWatchListSnapshot> watch_lists;
+    std::vector<UiTickSnapshot> ticks;
     std::vector<core::TradableAsset> assets;
     std::vector<UiAssetSearchResult> asset_search_results;
 };

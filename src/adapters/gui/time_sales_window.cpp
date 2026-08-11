@@ -109,13 +109,8 @@ void TimeSalesWindowRenderer::AppendSnapshotQuery(
         if (window == state.windows.end() || !window->second.open) continue;
         if (!document.symbol.empty()) {
             query.market_symbols.push_back(document.symbol);
-            HistoryState& history = history_[document.id];
-            if (history.instrument_id != document.instrument_id) {
-                history = HistoryState{.instrument_id = document.instrument_id};
-            }
-            if (!history.requested && query.as_of_ns > kInitialHistoryLookbackNs) {
-                history.requested = true;
-                history_requests_.push_back({
+            if (query.as_of_ns > kInitialHistoryLookbackNs) {
+                query.ticks.push_back({
                     .document_id = document.id,
                     .query = {.instrument_id = document.instrument_id,
                               .symbol = document.symbol,
@@ -134,7 +129,6 @@ void TimeSalesWindowRenderer::AppendSnapshotQuery(
 void TimeSalesWindowRenderer::Draw(
     ui::Workspace& workspace, workstation::WorkspaceState& state,
     const application::ApplicationUiSnapshot& snapshot) {
-    PollHistoryRequests();
     EnsureColumns(state.time_sales_table);
     for (workstation::TimeSalesDocumentState& document : state.time_sales) {
         const auto found = state.windows.find(document.id);
@@ -206,13 +200,19 @@ void TimeSalesWindowRenderer::Draw(
                 persistent_changed_ = persistent_changed_ ||
                                       old_size != state.time_sales_table.columns.size();
             }
-            const HistoryState& history = history_[document.id];
             const core::MarketDataSnapshot* market = snapshot.markets.Find(document.instrument_id);
-            const auto trades = DisplayTrades(history.trades, market);
-            if (history.request.valid()) ImGui::TextDisabled("Loading recent trades...");
-            else if (ImGui::Button("Refresh recent")) {
-                history_.erase(document.id);
-            }
+            const auto tick = std::ranges::find(
+                snapshot.ticks, document.id,
+                &application::UiTickSnapshot::document_id);
+            const std::vector<core::MarketTrade> empty_history;
+            const auto trades = DisplayTrades(
+                tick == snapshot.ticks.end() ? empty_history : tick->series.trades,
+                market);
+            if (tick != snapshot.ticks.end() && tick->loading)
+                ImGui::TextDisabled("Loading recent trades...");
+            else if (tick != snapshot.ticks.end() && !tick->series.error.empty())
+                ImGui::TextDisabled("Recent history unavailable: %s",
+                                    tick->series.error.c_str());
             if (ImGui::BeginTable("trades", static_cast<int>(columns.size()),
                                   ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY |
@@ -244,30 +244,6 @@ void TimeSalesWindowRenderer::Draw(
             }
         }
         ImGui::PopID(); workspace.EndWindow(window);
-    }
-}
-
-std::vector<TimeSalesHistoryRequest>
-TimeSalesWindowRenderer::ConsumeHistoryRequests() {
-    return std::exchange(history_requests_, {});
-}
-
-void TimeSalesWindowRenderer::SetHistoryRequest(
-    std::string document_id, std::future<core::TickSeries> request) {
-    history_[document_id].request = std::move(request);
-}
-
-void TimeSalesWindowRenderer::PollHistoryRequests() {
-    for (auto& entry : history_) {
-        HistoryState& history = entry.second;
-        if (!history.request.valid() ||
-            history.request.wait_for(std::chrono::seconds(0)) !=
-                std::future_status::ready)
-            continue;
-        try {
-            core::TickSeries series = history.request.get();
-            history.trades = std::move(series.trades);
-        } catch (const std::exception&) {}
     }
 }
 

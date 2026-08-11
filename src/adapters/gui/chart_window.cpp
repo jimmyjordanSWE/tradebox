@@ -78,7 +78,6 @@ ChartWindowRenderer::InteractionState& ChartWindowRenderer::Interaction(
 application::UiSnapshotQuery ChartWindowRenderer::BuildSnapshotQuery(
     workstation::WorkspaceState& state, std::int64_t now_ns) {
     application::UiSnapshotQuery query;
-    queries_.clear();
     persistent_changed_ = false;
     for (ChartDocumentState& chart : state.charts) {
         const auto window = state.windows.find(chart.id);
@@ -113,31 +112,10 @@ application::UiSnapshotQuery ChartWindowRenderer::BuildSnapshotQuery(
         chart_query.indicators.reserve(chart.indicators.size());
         for (const auto& indicator : chart.indicators)
             chart_query.indicators.push_back(indicator.definition);
-        queries_.insert_or_assign(chart.id, chart_query);
         query.charts.push_back(std::move(chart_query));
     }
     query.asset_limit = query.asset_search.empty() ? 0 : 8;
     return query;
-}
-
-void ChartWindowRenderer::RequestMissingHistory(
-    application::TradingApplication& application,
-    const application::ApplicationUiSnapshot& snapshot) {
-    for (const auto& chart : snapshot.charts) {
-        if (chart.status != application::ChartDataStatus::MissingHistory)
-            continue;
-        const auto query = queries_.find(chart.document_id);
-        if (query == queries_.end()) continue;
-        auto& interaction = interactions_[chart.document_id];
-        if (interaction.has_requested_range &&
-            interaction.requested_key == query->second.key &&
-            interaction.requested_range == query->second.range)
-            continue;
-        application.RequestMarketHistory(query->second);
-        interaction.has_requested_range = true;
-        interaction.requested_key = query->second.key;
-        interaction.requested_range = query->second.range;
-    }
 }
 
 const application::UiChartSnapshot* ChartWindowRenderer::SnapshotFor(
@@ -208,7 +186,6 @@ void ChartWindowRenderer::DrawChartWindow(
             if (ImGui::Selectable(option, selected)) {
                 chart.timeframe = option;
                 chart.range_anchor_ns = 0;
-                interaction.has_requested_range = false;
                 changed = true;
             }
             if (selected) ImGui::SetItemDefaultFocus();
@@ -246,7 +223,6 @@ void ChartWindowRenderer::DrawChartWindow(
             interaction.ticker[count] = '\0';
             interaction.ticker.back() = '\0';
             interaction.resolve_requested = false;
-            interaction.has_requested_range = false;
             persistent_changed_ = true;
         }
     } else if (snapshot == nullptr) {
@@ -256,11 +232,6 @@ void ChartWindowRenderer::DrawChartWindow(
         ImGui::Text("%s", StatusLabel(snapshot->status));
         if (!snapshot->message.empty())
             ImGui::TextWrapped("%s", snapshot->message.c_str());
-        if (snapshot->status == application::ChartDataStatus::Failed &&
-            ImGui::Button("Retry history")) {
-            const auto query = queries_.find(chart.id);
-            if (query != queries_.end()) retries_.push_back(query->second);
-        }
         if (snapshot->status == application::ChartDataStatus::Ready ||
             snapshot->status == application::ChartDataStatus::Empty ||
             snapshot->status == application::ChartDataStatus::MissingHistory ||
@@ -445,13 +416,6 @@ void DrawSeries(const application::UiChartSnapshot& snapshot,
                           ImGui::GetColorU32(ImGuiCol_Text), label);
         }
     }
-}
-
-std::vector<application::UiChartQuery>
-ChartWindowRenderer::ConsumeHistoryRetries() {
-    std::vector<application::UiChartQuery> result;
-    result.swap(retries_);
-    return result;
 }
 
 bool ChartWindowRenderer::ConsumePersistentChanges() {

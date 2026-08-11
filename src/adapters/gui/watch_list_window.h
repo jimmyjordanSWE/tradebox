@@ -19,9 +19,6 @@ public:
     void AppendSnapshotQuery(
         workstation::WorkspaceState& state,
         application::UiSnapshotQuery& query);
-    void RequestMissingHistory(
-        application::TradingApplication& application,
-        const application::ApplicationUiSnapshot& snapshot);
     void Draw(ui::Workspace& workspace, workstation::WorkspaceState& state,
               const application::ApplicationUiSnapshot& snapshot,
               const workstation::ApplicationSettings& settings,
@@ -45,9 +42,6 @@ private:
     };
 
     std::unordered_map<std::string, RowInteraction> interactions_;
-    std::unordered_map<std::string, application::UiWatchListQuery>
-        queries_;
-    std::unordered_map<std::string, core::BarRange> requested_history_;
     std::optional<workstation::WatchListDocumentState> draft_;
     std::array<char, 128> name_input_{};
     std::string focus_row_id_;

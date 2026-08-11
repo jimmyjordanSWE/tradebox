@@ -569,26 +569,6 @@ void NormalizeRestoreGeometry(
     effective.maximized = false;
 }
 
-std::vector<std::string> VisibleMarketSymbols(
-    const tradebox::application::UiSnapshotQuery& query,
-    const tradebox::core::CoreSnapshot& core) {
-    std::vector<std::string> result = query.market_symbols;
-    for (const auto& watch_list : query.watch_lists)
-        for (const auto& row : watch_list.rows)
-            if (!row.symbol.empty()) result.push_back(row.symbol);
-    for (const auto& chart : query.charts)
-        if (!chart.symbol.empty()) result.push_back(chart.symbol);
-    if (query.include_position_markets)
-        for (const auto& position : core.positions)
-            result.push_back(position.symbol);
-    std::ranges::sort(result);
-    const auto unique = std::ranges::unique(result);
-    result.erase(unique.begin(), unique.end());
-    std::erase_if(result,
-                  [](const std::string& symbol) { return symbol.empty(); });
-    return result;
-}
-
 std::vector<std::string> ActiveWatchListSymbols(
     const tradebox::workstation::WorkspaceState& workspace) {
     std::vector<std::string> result;
@@ -885,24 +865,6 @@ int RunApplication(const LaunchOptions& options) {
             workstation_state.workspace, snapshot_query);
         time_sales_renderer.AppendSnapshotQuery(
             workstation_state.workspace, snapshot_query);
-        if (application != nullptr) {
-            for (auto request : time_sales_renderer.ConsumeHistoryRequests()) {
-                request.query.feed = application->ActiveMarketDataFeed();
-                time_sales_renderer.SetHistoryRequest(
-                    std::move(request.document_id),
-                    application->RequestTicks(std::move(request.query)));
-            }
-        }
-        if (application != nullptr) {
-            const auto core_snapshot = application->Snapshot();
-            static_cast<void>(application->UpdateMarketDataInterest({
-                .consumer_id = "ui.visible",
-                .feed = application->ActiveMarketDataFeed(),
-                .symbols = VisibleMarketSymbols(snapshot_query, core_snapshot),
-                .priority = tradebox::application::
-                    MarketDataInterestPriority::UserVisible,
-            }));
-        }
         const tradebox::application::ApplicationUiSnapshot snapshot =
             application != nullptr
                 ? application->SnapshotForUi(snapshot_query)
@@ -1155,11 +1117,6 @@ int RunApplication(const LaunchOptions& options) {
                 }
             }
         }
-        if (application != nullptr)
-            chart_renderer.RequestMissingHistory(*application, snapshot);
-        if (application != nullptr)
-            watch_list_renderer.RequestMissingHistory(*application, snapshot);
-
         const ImGuiViewport* viewport = ImGui::GetMainViewport();
         workspace.SetUiScale(workstation_state.application.ui_scale);
         workspace.SetSnapPixels(
@@ -1218,12 +1175,6 @@ int RunApplication(const LaunchOptions& options) {
         debug_renderer.Draw(
               workspace, workstation_state.workspace, debug_snapshot);
         event_renderer.Draw(workspace, workstation_state.workspace);
-        if (application != nullptr) {
-            for (const auto& retry : chart_renderer.ConsumeHistoryRetries())
-                application->RequestMarketHistory(retry);
-        } else {
-            static_cast<void>(chart_renderer.ConsumeHistoryRetries());
-        }
         workspace.EndFrame();
 
         DrawStartupOverlay(startup_status);

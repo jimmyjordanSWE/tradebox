@@ -49,7 +49,7 @@ public:
 
     [[nodiscard]] core::CoreSnapshot Snapshot() const;
     [[nodiscard]] ApplicationUiSnapshot SnapshotForUi(
-        const UiSnapshotQuery& query) const;
+        const UiSnapshotQuery& query);
     [[nodiscard]] std::optional<core::CoreSnapshot> SnapshotAfter(
         std::uint64_t revision) const;
     [[nodiscard]] core::MarketDataSnapshot MarketData(
@@ -116,15 +116,6 @@ public:
         std::string_view consumer_id);
     [[nodiscard]] MarketDataSubscriptionPlan MarketDataSubscriptions(
         core::MarketDataFeed feed) const;
-    void RequestMarketHistory(const std::string& symbol,
-                              const std::string& timeframe = "1Day");
-    void RequestMarketHistory(const std::string& symbol,
-                              const std::string& timeframe,
-                              core::BarRange range);
-    void RequestMarketHistory(core::HistoricalBarQuery query);
-    void RequestMarketHistory(const UiChartQuery& query);
-    [[nodiscard]] std::future<core::TickSeries> RequestTicks(
-        core::TickQuery query);
     void RefreshAssetCatalog();
     [[nodiscard]] std::vector<UiEvent> DrainUiEvents();
 

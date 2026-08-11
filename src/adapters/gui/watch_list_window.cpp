@@ -295,7 +295,6 @@ void WatchListWindowRenderer::CommitName(workstation::WorkspaceState& state) {
 
 void WatchListWindowRenderer::AppendSnapshotQuery(
     workstation::WorkspaceState& state, application::UiSnapshotQuery& query) {
-    queries_.clear();
     workstation::WatchListDocumentState* document = ActiveDocument(state);
     if (document == nullptr) return;
     const auto window = state.windows.find(
@@ -335,34 +334,7 @@ void WatchListWindowRenderer::AppendSnapshotQuery(
     if (!query.asset_searches.empty())
         query.asset_limit = std::max<std::size_t>(query.asset_limit, 8U);
     query.watch_lists.push_back(watch_query);
-    queries_.emplace(document->id, std::move(watch_query));
     query.asset_preferred_instrument_ids = state.asset_selection_history;
-}
-
-void WatchListWindowRenderer::RequestMissingHistory(
-    application::TradingApplication& application,
-    const application::ApplicationUiSnapshot& snapshot) {
-    for (const application::UiWatchListSnapshot& watch_list :
-         snapshot.watch_lists) {
-        if (watch_list.daily_range.start_ns >= watch_list.daily_range.end_ns)
-            continue;
-        const auto query = queries_.find(watch_list.document_id);
-        if (query == queries_.end()) continue;
-        for (const auto& row : watch_list.rows) {
-            if (!row.history_missing) continue;
-            const auto row_query = std::ranges::find(
-                query->second.rows, row.row_id,
-                &application::UiWatchListRowQuery::row_id);
-            if (row_query == query->second.rows.end()) continue;
-            const auto requested = requested_history_.find(row.row_id);
-            if (requested != requested_history_.end() &&
-                requested->second == watch_list.daily_range)
-                continue;
-            application.RequestMarketHistory(
-                row_query->symbol, "1Day", watch_list.daily_range);
-            requested_history_[row.row_id] = watch_list.daily_range;
-        }
-    }
 }
 
 void WatchListWindowRenderer::Draw(
