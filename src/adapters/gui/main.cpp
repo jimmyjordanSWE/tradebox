@@ -720,7 +720,8 @@ int RunApplication(const LaunchOptions& options) {
     workspace.SetPersistentState(&workstation_state.workspace);
     tradebox::ui::UiScaleController ui_scale_controller;
     ui_scale_controller.CaptureBaseline();
-    tradebox::gui::ChartWindowRenderer chart_renderer;
+    tradebox::workstation::ChartEditHistory chart_edit_history;
+    tradebox::gui::ChartWindowRenderer chart_renderer(chart_edit_history);
       DebugWindowRenderer debug_renderer;
       EventWindowRenderer event_renderer;
     tradebox::gui::WatchListWindowRenderer watch_list_renderer;

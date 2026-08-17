@@ -54,6 +54,33 @@ TEST(ChartRangePolicyTest, ResolvesDeterministicBoundedRange) {
     EXPECT_EQ(result->end_ns, 1'001 * minute_ns);
 }
 
+TEST(ChartRangePolicyTest, StabilizesMovingAnchorWithinCurrentBar) {
+    constexpr std::int64_t minute_ns = 60LL * 1'000'000'000;
+    auto intent = tradebox::application::ChartViewportIntent{
+        .document_id = "chart-1",
+        .key = Key(),
+        .symbol = "AAPL",
+        .anchor_ns = 1'000 * minute_ns + 1,
+        .visible_bars = 100,
+    };
+
+    const auto first =
+        tradebox::application::ResolveChartRange(intent);
+    ASSERT_TRUE(first.has_value()) << first.error();
+    intent.anchor_ns = 1'001 * minute_ns - 1;
+    const auto same_bar =
+        tradebox::application::ResolveChartRange(intent);
+    ASSERT_TRUE(same_bar.has_value()) << same_bar.error();
+    EXPECT_EQ(*same_bar, *first);
+
+    intent.anchor_ns = 1'001 * minute_ns;
+    const auto next_bar =
+        tradebox::application::ResolveChartRange(intent);
+    ASSERT_TRUE(next_bar.has_value()) << next_bar.error();
+    EXPECT_EQ(next_bar->start_ns, first->start_ns + minute_ns);
+    EXPECT_EQ(next_bar->end_ns, first->end_ns + minute_ns);
+}
+
 TEST(ChartRangePolicyTest, RejectsUnresolvedIdentityAndTimeframe) {
     auto intent = tradebox::application::ChartViewportIntent{
         .document_id = "chart-1",

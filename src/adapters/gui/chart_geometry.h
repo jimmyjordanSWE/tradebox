@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace tradebox::gui::chart {
 
@@ -28,6 +29,22 @@ struct VisibleIndices {
 
     [[nodiscard]] bool Empty() const { return first >= last; }
 };
+
+struct ViewportState {
+    int visible_bars = 120;
+    std::int64_t anchor_ns = 0;
+};
+
+[[nodiscard]] std::optional<ViewportState> ZoomViewport(
+    ViewportState current, core::BarRange rendered_range,
+    float pointer_x, Rect plot, float wheel_delta,
+    int minimum_visible_bars = 30,
+    int maximum_visible_bars = 2'000);
+[[nodiscard]] std::optional<std::int64_t> PanViewportAnchor(
+    std::int64_t anchor_ns, core::BarRange rendered_range,
+    float horizontal_drag_pixels, Rect plot);
+[[nodiscard]] core::BarRange ShiftRange(core::BarRange range,
+                                        std::int64_t delta_ns);
 
 [[nodiscard]] VisibleIndices SelectVisibleIndices(
     std::span<const core::MarketBar> bars, core::BarRange range);
@@ -79,5 +96,11 @@ struct CandleGeometry {
     VisibleIndices visible,
     std::int64_t time_ns,
     core::BarRange range);
+
+[[nodiscard]] std::vector<core::MarketBar> AggregateBarsByScreenColumn(
+    std::span<const core::MarketBar> bars,
+    VisibleIndices visible,
+    core::BarRange range,
+    Rect plot);
 
 }  // namespace tradebox::gui::chart

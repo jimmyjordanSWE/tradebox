@@ -22,6 +22,12 @@ ValidateHistoricalPage(
                 return std::unexpected(
                     "historical page returned provider error: " +
                     message->get<std::string>());
+            if (items != value.end())
+                return std::unexpected(
+                    "historical page field '" +
+                    std::string(array_field) + "' has type " +
+                    std::string(items->type_name()) +
+                    ", expected array");
             return std::unexpected(
                 "historical page is missing array field '" +
                 std::string(array_field) + "'");

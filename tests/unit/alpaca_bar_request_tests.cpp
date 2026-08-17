@@ -22,9 +22,12 @@ TEST(AlpacaHistoricalPage,
     EXPECT_FALSE(ValidateHistoricalPage("[]", "bars"));
     EXPECT_FALSE(ValidateHistoricalPage(
         R"({"next_page_token":null})", "bars"));
-    EXPECT_FALSE(ValidateHistoricalPage(
+    const auto wrong_type = ValidateHistoricalPage(
         R"({"bars":{},"next_page_token":null})",
-        "bars"));
+        "bars");
+    ASSERT_FALSE(wrong_type);
+    EXPECT_NE(wrong_type.error().find("has type object"),
+              std::string::npos);
     EXPECT_FALSE(ValidateHistoricalPage(
         R"({"bars":[],"next_page_token":42})",
         "bars"));

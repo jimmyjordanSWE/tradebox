@@ -19,7 +19,75 @@ void IncludePrice(double value, double& minimum, double& maximum) {
     maximum = std::max(maximum, value);
 }
 
+std::int64_t ClampTimestamp(long double value) {
+    if (value <= 0.0L) return 0;
+    const long double maximum = static_cast<long double>(
+        std::numeric_limits<std::int64_t>::max());
+    if (value >= maximum)
+        return std::numeric_limits<std::int64_t>::max();
+    return static_cast<std::int64_t>(value);
+}
+
 }  // namespace
+
+std::optional<ViewportState> ZoomViewport(
+    ViewportState current, core::BarRange rendered_range,
+    float pointer_x, Rect plot, float wheel_delta,
+    int minimum_visible_bars, int maximum_visible_bars) {
+    if (!plot.IsUsable() || rendered_range.end_ns <= rendered_range.start_ns ||
+        current.visible_bars <= 0 || current.anchor_ns <= 0 ||
+        !Finite(pointer_x) || !Finite(wheel_delta) || wheel_delta == 0.0F ||
+        minimum_visible_bars <= 0 ||
+        maximum_visible_bars < minimum_visible_bars)
+        return std::nullopt;
+    const double factor = std::pow(0.82, static_cast<double>(wheel_delta));
+    if (!Finite(factor) || factor <= 0.0) return std::nullopt;
+    const double scaled =
+        static_cast<double>(current.visible_bars) * factor;
+    const int next_visible =
+        scaled <= static_cast<double>(minimum_visible_bars)
+            ? minimum_visible_bars
+            : scaled >= static_cast<double>(maximum_visible_bars)
+                  ? maximum_visible_bars
+                  : static_cast<int>(std::lround(scaled));
+    if (next_visible == current.visible_bars) return std::nullopt;
+
+    const std::int64_t pointer_time =
+        XToTime(pointer_x, rendered_range, plot);
+    const long double ratio =
+        static_cast<long double>(next_visible) /
+        static_cast<long double>(current.visible_bars);
+    const long double next_anchor =
+        static_cast<long double>(pointer_time) +
+        (static_cast<long double>(current.anchor_ns) -
+         static_cast<long double>(pointer_time)) * ratio;
+    return ViewportState{.visible_bars = next_visible,
+                         .anchor_ns = ClampTimestamp(next_anchor)};
+}
+
+std::optional<std::int64_t> PanViewportAnchor(
+    std::int64_t anchor_ns, core::BarRange rendered_range,
+    float horizontal_drag_pixels, Rect plot) {
+    if (!plot.IsUsable() || rendered_range.end_ns <= rendered_range.start_ns ||
+        anchor_ns <= 0 || !Finite(horizontal_drag_pixels))
+        return std::nullopt;
+    const long double duration =
+        static_cast<long double>(rendered_range.end_ns) -
+        static_cast<long double>(rendered_range.start_ns);
+    const long double delta =
+        static_cast<long double>(horizontal_drag_pixels) /
+        static_cast<long double>(plot.Width()) * duration;
+    return ClampTimestamp(static_cast<long double>(anchor_ns) - delta);
+}
+
+core::BarRange ShiftRange(core::BarRange range, std::int64_t delta_ns) {
+    return {
+        .start_ns = ClampTimestamp(static_cast<long double>(range.start_ns) +
+                                   static_cast<long double>(delta_ns)),
+        .end_ns = ClampTimestamp(static_cast<long double>(range.end_ns) +
+                                 static_cast<long double>(delta_ns)),
+    };
+}
 
 VisibleIndices SelectVisibleIndices(
     std::span<const core::MarketBar> bars, core::BarRange range) {
@@ -153,6 +221,43 @@ std::optional<std::size_t> HitTestBar(
     }
     static_cast<void>(range);
     return nearest;
+}
+
+std::vector<core::MarketBar> AggregateBarsByScreenColumn(
+    std::span<const core::MarketBar> bars, VisibleIndices visible,
+    core::BarRange range, Rect plot) {
+    std::vector<core::MarketBar> result;
+    if (!plot.IsUsable() || range.end_ns <= range.start_ns || visible.Empty())
+        return result;
+    const std::size_t last = std::min(visible.last, bars.size());
+    const std::size_t first = std::min(visible.first, last);
+    result.reserve(std::min(last - first,
+                            static_cast<std::size_t>(
+                                std::ceil(plot.Width())) + 1U));
+    int previous_column = std::numeric_limits<int>::min();
+    for (std::size_t index = first; index < last; ++index) {
+        const core::MarketBar& bar = bars[index];
+        const int column = static_cast<int>(std::floor(
+            TimeToX(bar.start_ns, range, plot) - plot.left));
+        if (result.empty() || column != previous_column) {
+            result.push_back(bar);
+            previous_column = column;
+            continue;
+        }
+        core::MarketBar& aggregate = result.back();
+        aggregate.high = std::max(aggregate.high, bar.high);
+        aggregate.low = std::min(aggregate.low, bar.low);
+        aggregate.close = bar.close;
+        aggregate.volume += bar.volume;
+        const std::uint64_t remaining =
+            std::numeric_limits<std::uint64_t>::max() - aggregate.trade_count;
+        aggregate.trade_count += std::min(remaining, bar.trade_count);
+        aggregate.within_bar_vwap.reset();
+        aggregate.source = bar.source;
+        aggregate.state = bar.state;
+        aggregate.revision = std::max(aggregate.revision, bar.revision);
+    }
+    return result;
 }
 
 }  // namespace tradebox::gui::chart

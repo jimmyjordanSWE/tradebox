@@ -34,4 +34,31 @@ if(NOT SNAPSHOT_MATCH)
   )
 endif()
 
+set(CHART_GUI_FILES
+  "${SOURCE_ROOT}/src/adapters/gui/chart_window.cpp"
+  "${SOURCE_ROOT}/src/adapters/gui/chart_window.h"
+  "${SOURCE_ROOT}/src/adapters/gui/chart_geometry.cpp"
+  "${SOURCE_ROOT}/src/adapters/gui/chart_geometry.h"
+)
+foreach(CHART_GUI_FILE IN LISTS CHART_GUI_FILES)
+  file(READ "${CHART_GUI_FILE}" CHART_GUI_CONTENTS)
+  set(CHART_BANNED_PATTERNS
+    "tradebox/broker/"
+    "tradebox/persistence/"
+    "AlpacaService"
+    "BarStore"
+    "MarketDataStore"
+    "Database"
+  )
+  foreach(CHART_BANNED_PATTERN IN LISTS CHART_BANNED_PATTERNS)
+    string(REGEX MATCH "${CHART_BANNED_PATTERN}" CHART_BANNED_MATCH
+           "${CHART_GUI_CONTENTS}")
+    if(CHART_BANNED_MATCH)
+      message(FATAL_ERROR
+        "Chart GUI bypasses the application boundary in ${CHART_GUI_FILE}: ${CHART_BANNED_MATCH}"
+      )
+    endif()
+  endforeach()
+endforeach()
+
 message(STATUS "GUI uses the application-service boundary")

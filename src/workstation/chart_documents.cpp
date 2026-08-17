@@ -1,5 +1,6 @@
 #include "tradebox/workstation/chart_documents.h"
 
+#include "tradebox/workstation/chart_commands.h"
 #include "tradebox/workstation/stable_id.h"
 
 #include <algorithm>
@@ -230,55 +231,26 @@ std::expected<std::string, ChartDocumentError> AddChartIndicator(
     if (chart == nullptr)
         return std::unexpected(
             ChartDocumentError{"chart document does not exist"});
-    const core::IndicatorInput& input = std::visit(
-        [](const auto& calculation) -> const core::IndicatorInput& {
-            return calculation.input;
-        },
-        indicator.definition.calculation);
-    if (const auto* reference =
-            std::get_if<core::IndicatorOutputInput>(&input);
-        reference != nullptr &&
-        std::ranges::none_of(
-            chart->indicators,
-            [&](const ChartIndicatorState& existing) {
-                return existing.definition.id == reference->indicator_id;
-            }))
-        return std::unexpected(
-            ChartDocumentError{"indicator input does not exist in chart"});
     indicator.definition.id = NewStableId("indicator");
     const std::string id = indicator.definition.id;
-    chart->indicators.push_back(std::move(indicator));
+    const auto applied = ApplyChartEdit(
+        workspace, AddChartIndicatorCommand{
+                       .document_id = std::string(document_id),
+                       .indicator = std::move(indicator)});
+    if (!applied)
+        return std::unexpected(ChartDocumentError{applied.error().message});
     return id;
 }
 
 bool RemoveChartIndicator(WorkspaceState& workspace,
                           std::string_view document_id,
                           std::string_view indicator_id) {
-    ChartDocumentState* chart = FindChartDocument(workspace, document_id);
-    if (chart == nullptr) return false;
-    if (std::ranges::any_of(
-            chart->indicators,
-            [&](const ChartIndicatorState& indicator) {
-                const auto* reference =
-                    std::visit(
-                        [](const auto& calculation) {
-                            return std::get_if<
-                                core::IndicatorOutputInput>(
-                                &calculation.input);
-                        },
-                        indicator.definition.calculation);
-                return reference != nullptr &&
-                       reference->indicator_id == indicator_id;
-            }))
-        return false;
-    const auto found = std::ranges::find(
-        chart->indicators, indicator_id,
-        [](const ChartIndicatorState& indicator) {
-            return indicator.definition.id;
-        });
-    if (found == chart->indicators.end()) return false;
-    chart->indicators.erase(found);
-    return true;
+    return ApplyChartEdit(
+               workspace,
+               RemoveChartIndicatorCommand{
+                   .document_id = std::string(document_id),
+                   .indicator_id = std::string(indicator_id)})
+        .has_value();
 }
 
 std::expected<std::string, ChartDocumentError> CreateChartDrawing(
@@ -298,26 +270,25 @@ std::expected<void, ChartDocumentError> UpsertChartDrawing(
     if (drawing.id.empty() || drawing.instrument_id.empty())
         return std::unexpected(ChartDocumentError{
             "drawing requires stable drawing and instrument identities"});
-    const auto found = std::ranges::find(
-        workspace.chart_drawings, drawing.id, &ChartDrawingState::id);
-    if (found != workspace.chart_drawings.end()) {
-        if (found->instrument_id != drawing.instrument_id)
-            return std::unexpected(ChartDocumentError{
-                "drawing identity cannot move between instruments"});
-        *found = std::move(drawing);
-    } else {
-        workspace.chart_drawings.push_back(std::move(drawing));
-    }
+    const bool exists = std::ranges::any_of(
+        workspace.chart_drawings, [&](const ChartDrawingState& value) {
+            return value.id == drawing.id;
+        });
+    const ChartEditCommand command =
+        exists ? ChartEditCommand{UpdateChartDrawingCommand{drawing}}
+               : ChartEditCommand{AddChartDrawingCommand{drawing}};
+    const auto applied = ApplyChartEdit(workspace, command);
+    if (!applied)
+        return std::unexpected(ChartDocumentError{applied.error().message});
     return {};
 }
 
 bool DeleteChartDrawing(WorkspaceState& workspace,
                         std::string_view drawing_id) {
-    const auto found = std::ranges::find(
-        workspace.chart_drawings, drawing_id, &ChartDrawingState::id);
-    if (found == workspace.chart_drawings.end()) return false;
-    workspace.chart_drawings.erase(found);
-    return true;
+    return ApplyChartEdit(
+               workspace,
+               RemoveChartDrawingCommand{std::string(drawing_id)})
+        .has_value();
 }
 
 std::vector<std::reference_wrapper<const ChartDrawingState>>

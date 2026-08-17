@@ -144,6 +144,7 @@ tradebox_enable_windows_api(tradebox_platform)
 tradebox_enable_strict_warnings(tradebox_platform)
 
 add_library(tradebox_workstation STATIC
+  src/workstation/chart_commands.cpp
   src/workstation/chart_documents.cpp
   src/workstation/asset_preferences.cpp
   src/workstation/defaults.cpp
@@ -326,6 +327,7 @@ if(BUILD_TESTING)
   gtest_discover_tests(tradebox_order_pipeline_tests)
 
   add_executable(tradebox_workstation_tests
+    tests/unit/chart_command_tests.cpp
     tests/unit/chart_geometry_tests.cpp
     tests/unit/native_chrome_layout_tests.cpp
     tests/unit/table_controls_tests.cpp

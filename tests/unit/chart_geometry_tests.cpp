@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 namespace tradebox::gui::chart {
 namespace {
 
@@ -70,6 +72,70 @@ TEST(ChartGeometry, BuildsCandleAndVolumeGeometrySafely) {
         std::span<const core::MarketBar>(&bar, 1), {0, 1}, 490, {0, 1'000});
     ASSERT_TRUE(hit);
     EXPECT_EQ(*hit, 0U);
+}
+
+TEST(ChartGeometry, ZoomKeepsPointerTimeStable) {
+    const Rect plot{0.0F, 0.0F, 1'000.0F, 500.0F};
+    const core::BarRange range{1'000, 11'000};
+    const auto zoomed = ZoomViewport(
+        {.visible_bars = 100, .anchor_ns = 10'000}, range,
+        250.0F, plot, 1.0F);
+    ASSERT_TRUE(zoomed);
+    EXPECT_LT(zoomed->visible_bars, 100);
+
+    const std::int64_t pointed = XToTime(250.0F, range, plot);
+    const long double ratio =
+        static_cast<long double>(zoomed->visible_bars) / 100.0L;
+    const auto expected = static_cast<std::int64_t>(
+        static_cast<long double>(pointed) +
+        (10'000.0L - static_cast<long double>(pointed)) * ratio);
+    EXPECT_NEAR(static_cast<double>(zoomed->anchor_ns),
+                static_cast<double>(expected), 1.0);
+}
+
+TEST(ChartGeometry, ZoomAndPanRejectInvalidGeometryAndClampLimits) {
+    const Rect plot{0.0F, 0.0F, 1'000.0F, 500.0F};
+    const core::BarRange range{1'000, 11'000};
+    const auto maximum = ZoomViewport(
+        {.visible_bars = 1'999, .anchor_ns = 10'000}, range,
+        500.0F, plot, -100.0F);
+    ASSERT_TRUE(maximum);
+    EXPECT_EQ(maximum->visible_bars, 2'000);
+    EXPECT_FALSE(ZoomViewport(
+        {.visible_bars = 100, .anchor_ns = 10'000}, range,
+        500.0F, {}, 1.0F));
+
+    const auto panned = PanViewportAnchor(
+        10'000, range, 100.0F, plot);
+    ASSERT_TRUE(panned);
+    EXPECT_EQ(*panned, 9'000);
+    EXPECT_FALSE(PanViewportAnchor(10'000, range, 100.0F, {}));
+}
+
+TEST(ChartGeometry, ShiftRangeSaturatesAtTimestampBounds) {
+    EXPECT_EQ(ShiftRange({10, 20}, -15), (core::BarRange{0, 5}));
+    const auto shifted = ShiftRange(
+        {std::numeric_limits<std::int64_t>::max() - 5,
+         std::numeric_limits<std::int64_t>::max()},
+        10);
+    EXPECT_EQ(shifted.start_ns, std::numeric_limits<std::int64_t>::max());
+    EXPECT_EQ(shifted.end_ns, std::numeric_limits<std::int64_t>::max());
+}
+
+TEST(ChartGeometry, ScreenAggregationPreservesOhlcvMeaning) {
+    const std::vector<core::MarketBar> bars{
+        Bar(1, "10", "12", "9", "11", "100"),
+        Bar(2, "11", "15", "8", "14", "200"),
+        Bar(50, "14", "16", "13", "15", "300")};
+    const auto aggregated = AggregateBarsByScreenColumn(
+        bars, {.first = 0, .last = bars.size()}, {0, 100},
+        {0.0F, 0.0F, 2.0F, 100.0F});
+    ASSERT_EQ(aggregated.size(), 2U);
+    EXPECT_EQ(aggregated.front().open, D("10"));
+    EXPECT_EQ(aggregated.front().high, D("15"));
+    EXPECT_EQ(aggregated.front().low, D("8"));
+    EXPECT_EQ(aggregated.front().close, D("14"));
+    EXPECT_EQ(aggregated.front().volume, D("300"));
 }
 
 }  // namespace

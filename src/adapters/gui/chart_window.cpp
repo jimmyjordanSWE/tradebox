@@ -5,13 +5,18 @@
 #include "chart_geometry.h"
 #include "tradebox/application/chart_query.h"
 #include "tradebox/workstation/chart_documents.h"
+#include "tradebox/workstation/stable_id.h"
 
 #include "imgui.h"
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
+#include <iterator>
 #include <limits>
+#include <type_traits>
+#include <utility>
 
 namespace tradebox::gui {
 namespace {
@@ -58,9 +63,6 @@ bool SameSymbol(std::string_view left, std::string_view right) {
 
 }  // namespace
 
-void DrawSeries(const application::UiChartSnapshot& snapshot,
-                const workstation::ChartDocumentState& chart_state);
-
 ChartWindowRenderer::InteractionState& ChartWindowRenderer::Interaction(
     const ChartDocumentState& chart) {
     auto& interaction = interactions_[chart.id];
@@ -90,15 +92,14 @@ application::UiSnapshotQuery ChartWindowRenderer::BuildSnapshotQuery(
         if (query.asset_search.empty() && !chart.ticker_input.empty())
             query.asset_search = chart.ticker_input;
         if (chart.instrument_id.empty() || chart.symbol.empty()) continue;
-        if (chart.range_anchor_ns == 0 && now_ns > 0) {
-            chart.range_anchor_ns = now_ns;
-            persistent_changed_ = true;
-        }
+        InteractionState& mutable_interaction = Interaction(chart);
+        mutable_interaction.effective_anchor_ns =
+            chart.range_anchor_ns == 0 ? now_ns : chart.range_anchor_ns;
         application::ChartViewportIntent intent{
             .document_id = chart.id,
             .key = SeriesKey(chart),
             .symbol = chart.symbol,
-            .anchor_ns = chart.range_anchor_ns,
+            .anchor_ns = mutable_interaction.effective_anchor_ns,
             .visible_bars = static_cast<std::size_t>(chart.visible_bars),
         };
         const auto range = application::ResolveChartRange(intent);
@@ -196,6 +197,142 @@ void ChartWindowRenderer::DrawChartWindow(
     MarkChanged(changed, ImGui::Checkbox("Volume", &chart.show_volume));
     ImGui::SameLine();
     MarkChanged(changed, ImGui::Checkbox("Crosshair", &chart.show_crosshair));
+    ImGui::SameLine();
+    if (ImGui::Button("Latest") && chart.range_anchor_ns != 0) {
+        const auto applied = edit_history_.Execute(
+            state, workstation::SetChartViewportCommand{
+                       .document_id = chart.id,
+                       .visible_bars = chart.visible_bars,
+                       .range_anchor_ns = 0});
+        if (applied) changed = true;
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!edit_history_.CanUndo());
+    if (ImGui::Button("Undo")) {
+        if (edit_history_.Undo(state)) changed = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!edit_history_.CanRedo());
+    if (ImGui::Button("Redo")) {
+        if (edit_history_.Redo(state)) changed = true;
+    }
+    ImGui::EndDisabled();
+
+    if (ImGui::Button("Add SMA")) {
+        workstation::ChartIndicatorState indicator{
+            .definition = {
+                .id = workstation::NewStableId("indicator"),
+                .calculation = core::SimpleMovingAverageCalculation{
+                    .period = 20}},
+            .label = "SMA 20",
+        };
+        const auto applied = edit_history_.Execute(
+            state, workstation::AddChartIndicatorCommand{
+                       .document_id = chart.id,
+                       .indicator = std::move(indicator)});
+        if (applied) changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Add EMA")) {
+        workstation::ChartIndicatorState indicator{
+            .definition = {
+                .id = workstation::NewStableId("indicator"),
+                .calculation = core::ExponentialMovingAverageCalculation{
+                    .period = 20}},
+            .label = "EMA 20",
+            .color_rgba = 0xe0a84affU,
+        };
+        const auto applied = edit_history_.Execute(
+            state, workstation::AddChartIndicatorCommand{
+                       .document_id = chart.id,
+                       .indicator = std::move(indicator)});
+        if (applied) changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("H Line")) {
+        interaction.drawing_tool =
+            workstation::ChartDrawingKind::HorizontalLine;
+        interaction.drawing_first.reset();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("V Line")) {
+        interaction.drawing_tool = workstation::ChartDrawingKind::VerticalLine;
+        interaction.drawing_first.reset();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Trend")) {
+        interaction.drawing_tool = workstation::ChartDrawingKind::TrendLine;
+        interaction.drawing_first.reset();
+    }
+    if (interaction.drawing_tool) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Drawing: click chart (Esc cancels)");
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            interaction.drawing_tool.reset();
+            interaction.drawing_first.reset();
+        }
+    }
+    for (std::size_t index = 0; index < chart.indicators.size(); ++index) {
+        const workstation::ChartIndicatorState original =
+            chart.indicators[index];
+        workstation::ChartIndicatorState edited = original;
+        ImGui::PushID(original.definition.id.c_str());
+        bool indicator_changed =
+            ImGui::Checkbox("##visible", &edited.visible);
+        ImGui::SameLine();
+        ImGui::TextUnformatted(edited.label.empty()
+                                   ? edited.definition.id.c_str()
+                                   : edited.label.c_str());
+        ImGui::SameLine();
+        int period = std::visit(
+            [](const auto& calculation) {
+                return static_cast<int>(calculation.period);
+            },
+            edited.definition.calculation);
+        ImGui::SetNextItemWidth(90.0F);
+        if (ImGui::DragInt("Period", &period, 1.0F, 1, 10'000)) {
+            std::visit(
+                [period](auto& calculation) {
+                    calculation.period = static_cast<std::uint32_t>(period);
+                },
+                edited.definition.calculation);
+            edited.label = std::visit(
+                [period](const auto& calculation) {
+                    using T = std::decay_t<decltype(calculation)>;
+                    const char* name =
+                        std::is_same_v<T, core::SimpleMovingAverageCalculation>
+                            ? "SMA "
+                            : "EMA ";
+                    return std::string(name) + std::to_string(period);
+                },
+                edited.definition.calculation);
+            indicator_changed = true;
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90.0F);
+        indicator_changed =
+            ImGui::SliderFloat("Width", &edited.line_width, 0.5F, 10.0F) ||
+            indicator_changed;
+        ImGui::SameLine();
+        const bool remove = ImGui::SmallButton("Remove");
+        ImGui::PopID();
+        if (remove) {
+            if (edit_history_.Execute(
+                    state, workstation::RemoveChartIndicatorCommand{
+                               .document_id = chart.id,
+                               .indicator_id = original.definition.id}))
+                changed = true;
+            break;
+        }
+        if (indicator_changed) {
+            if (edit_history_.Execute(
+                    state, workstation::UpdateChartIndicatorCommand{
+                               .document_id = chart.id,
+                               .indicator = std::move(edited)}))
+                changed = true;
+        }
+    }
     if (changed) persistent_changed_ = true;
 
     if (chart.instrument_id.empty()) {
@@ -236,14 +373,16 @@ void ChartWindowRenderer::DrawChartWindow(
             snapshot->status == application::ChartDataStatus::Empty ||
             snapshot->status == application::ChartDataStatus::MissingHistory ||
             snapshot->status == application::ChartDataStatus::Loading)
-            DrawSeries(*snapshot, chart);
+            DrawSeries(*snapshot, state, chart, interaction);
     }
     ImGui::PopID();
     workspace.EndWindow(window);
 }
 
-void DrawSeries(const application::UiChartSnapshot& snapshot,
-                const ChartDocumentState& chart_state) {
+void ChartWindowRenderer::DrawSeries(
+    const application::UiChartSnapshot& snapshot,
+    workstation::WorkspaceState& state, ChartDocumentState& chart_state,
+    InteractionState& interaction) {
     const ImVec2 available = ImGui::GetContentRegionAvail();
     const float width = std::max(1.0f, available.x);
     const float height = std::max(1.0f, available.y);
@@ -257,6 +396,55 @@ void DrawSeries(const application::UiChartSnapshot& snapshot,
         maximum.x - 58.0f, maximum.y - volume_height - 24.0f};
     const chart::Rect volume_plot{
         plot.left, plot.bottom + 12.0f, plot.right, maximum.y - 20.0f};
+    const auto& series = snapshot.series;
+    if (ImGui::IsItemHovered()) {
+        const float wheel = ImGui::GetIO().MouseWheel;
+        if (const auto zoomed = chart::ZoomViewport(
+                {.visible_bars = chart_state.visible_bars,
+                 .anchor_ns = interaction.effective_anchor_ns},
+                series.requested_range, ImGui::GetIO().MousePos.x, plot,
+                wheel)) {
+            const auto applied = edit_history_.Execute(
+                state, workstation::SetChartViewportCommand{
+                           .document_id = chart_state.id,
+                           .visible_bars = zoomed->visible_bars,
+                           .range_anchor_ns = zoomed->anchor_ns});
+            if (applied) persistent_changed_ = true;
+        }
+    }
+    if (ImGui::IsItemActivated() && !interaction.drawing_tool) {
+        interaction.panning = true;
+        interaction.pan_origin_x = ImGui::GetIO().MousePos.x;
+        interaction.pan_origin_anchor_ns = interaction.effective_anchor_ns;
+        interaction.preview_anchor_ns = interaction.effective_anchor_ns;
+    }
+    if (interaction.panning && ImGui::IsItemActive() &&
+        ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        if (const auto anchor = chart::PanViewportAnchor(
+                interaction.pan_origin_anchor_ns, series.requested_range,
+                ImGui::GetIO().MousePos.x - interaction.pan_origin_x, plot))
+            interaction.preview_anchor_ns = *anchor;
+    }
+    if (interaction.panning && ImGui::IsItemDeactivated()) {
+        if (interaction.preview_anchor_ns !=
+            interaction.pan_origin_anchor_ns) {
+            const auto applied = edit_history_.Execute(
+                state, workstation::SetChartViewportCommand{
+                           .document_id = chart_state.id,
+                           .visible_bars = chart_state.visible_bars,
+                           .range_anchor_ns =
+                               interaction.preview_anchor_ns});
+            if (applied) persistent_changed_ = true;
+        }
+        interaction.panning = false;
+    }
+    core::BarRange rendered_range = series.requested_range;
+    if (interaction.panning) {
+        rendered_range = chart::ShiftRange(
+            rendered_range,
+            interaction.preview_anchor_ns -
+                interaction.pan_origin_anchor_ns);
+    }
     ImDrawList* draw = ImGui::GetWindowDrawList();
     draw->AddRectFilled({plot.left, plot.top}, {plot.right, plot.bottom},
                         ImGui::GetColorU32(ImVec4{0.035f, 0.045f, 0.065f, 1.0f}));
@@ -264,18 +452,73 @@ void DrawSeries(const application::UiChartSnapshot& snapshot,
         draw->AddRectFilled({volume_plot.left, volume_plot.top},
                             {volume_plot.right, volume_plot.bottom},
                             ImGui::GetColorU32(ImVec4{0.025f, 0.035f, 0.050f, 1.0f}));
-    const auto& series = snapshot.series;
     const auto visible = chart::SelectVisibleIndices(series.bars,
-                                                       series.requested_range);
+                                                       rendered_range);
+    std::vector<core::MarketBar> aggregated_bars;
+    std::span<const core::MarketBar> render_bars = series.bars;
+    chart::VisibleIndices render_visible = visible;
+    if (!visible.Empty() &&
+        visible.last - visible.first >
+            static_cast<std::size_t>(std::max(1.0F, plot.Width()))) {
+        aggregated_bars = chart::AggregateBarsByScreenColumn(
+            series.bars, visible, rendered_range, plot);
+        render_bars = aggregated_bars;
+        render_visible = {.first = 0, .last = aggregated_bars.size()};
+    }
     const core::MarketBar* current =
         series.current_bar ? &*series.current_bar : nullptr;
+    const core::MarketBar* visible_current =
+        current != nullptr && current->start_ns >= rendered_range.start_ns &&
+                current->start_ns < rendered_range.end_ns
+            ? current
+            : nullptr;
     const auto scale = chart::AutoscalePrices(
-        series.bars, visible, current);
+        series.bars, visible, visible_current);
     if (!scale) {
         draw->AddText({plot.left + 12.0f, plot.top + 12.0f},
                       ImGui::GetColorU32(ImGuiCol_TextDisabled),
                       "No bars in this range");
         return;
+    }
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const auto mouse_anchor = [&]() {
+        const auto price = core::Decimal::Parse(
+            std::to_string(scale->FromY(mouse.y, plot)));
+        return workstation::ChartDrawingAnchorState{
+            .time_ns = chart::XToTime(mouse.x, rendered_range, plot),
+            .price = price ? *price : core::Decimal::Zero()};
+    };
+    if (interaction.drawing_tool && ImGui::IsItemClicked() &&
+        !chart_state.instrument_id.empty() && mouse.x >= plot.left &&
+        mouse.x <= plot.right && mouse.y >= plot.top &&
+        mouse.y <= plot.bottom) {
+        const workstation::ChartDrawingAnchorState anchor = mouse_anchor();
+        const bool needs_second =
+            *interaction.drawing_tool ==
+            workstation::ChartDrawingKind::TrendLine;
+        if (needs_second && !interaction.drawing_first) {
+            interaction.drawing_first = anchor;
+        } else {
+            workstation::ChartDrawingState drawing{
+                .id = workstation::NewStableId("drawing"),
+                .instrument_id = chart_state.instrument_id,
+                .kind = *interaction.drawing_tool,
+                .first = interaction.drawing_first.value_or(anchor),
+                .second = needs_second
+                              ? std::optional<
+                                    workstation::ChartDrawingAnchorState>(anchor)
+                              : std::nullopt,
+            };
+            const std::string drawing_id = drawing.id;
+            if (edit_history_.Execute(
+                    state, workstation::AddChartDrawingCommand{
+                               .drawing = std::move(drawing)})) {
+                interaction.selected_drawing_id = drawing_id;
+                persistent_changed_ = true;
+            }
+            interaction.drawing_tool.reset();
+            interaction.drawing_first.reset();
+        }
     }
     for (int line = 0; line <= 4; ++line) {
         const float y = plot.top + plot.Height() *
@@ -289,16 +532,18 @@ void DrawSeries(const application::UiChartSnapshot& snapshot,
                       ImGui::GetColorU32(ImGuiCol_TextDisabled), label);
     }
     draw->PushClipRect({plot.left, plot.top}, {plot.right, plot.bottom}, true);
-    const std::size_t visible_count = visible.last - visible.first;
+    const std::size_t visible_count =
+        render_visible.last - render_visible.first;
     const float body_half_width = visible_count == 0
                                       ? 2.0f
                                       : std::clamp(plot.Width() /
                                                        static_cast<float>(visible_count) *
                                                        0.32f,
                                                    1.0f, 8.0f);
-    for (std::size_t index = visible.first; index < visible.last; ++index) {
+    for (std::size_t index = render_visible.first;
+         index < render_visible.last; ++index) {
         const auto candle = chart::MakeCandleGeometry(
-            series.bars[index], *scale, series.requested_range, plot,
+            render_bars[index], *scale, rendered_range, plot,
             body_half_width);
         const ImVec4 color = candle.unchanged
                                  ? kFlatColor
@@ -312,15 +557,14 @@ void DrawSeries(const application::UiChartSnapshot& snapshot,
              std::max(candle.open_y, candle.close_y)},
             ImGui::GetColorU32(color));
     }
-    if (current != nullptr) {
+    if (visible_current != nullptr) {
         const bool duplicate = std::ranges::any_of(
-            series.bars, [current](const core::MarketBar& bar) {
-                return bar.start_ns == current->start_ns;
+            series.bars, [visible_current](const core::MarketBar& bar) {
+                return bar.start_ns == visible_current->start_ns;
             });
-        if (!duplicate && current->start_ns >= series.requested_range.start_ns &&
-            current->start_ns < series.requested_range.end_ns) {
+        if (!duplicate) {
             const auto candle = chart::MakeCandleGeometry(
-                *current, *scale, series.requested_range, plot,
+                *visible_current, *scale, rendered_range, plot,
                 body_half_width);
             const ImVec4 color = candle.unchanged
                                      ? kFlatColor
@@ -335,14 +579,128 @@ void DrawSeries(const application::UiChartSnapshot& snapshot,
                 ImGui::GetColorU32(color));
         }
     }
-    if (current != nullptr) {
+    if (snapshot.indicator_projection) {
+        for (const core::IndicatorSeries& indicator_series :
+             snapshot.indicator_projection->series) {
+            const auto configured = std::ranges::find(
+                chart_state.indicators, indicator_series.indicator_id,
+                [](const workstation::ChartIndicatorState& value) {
+                    return value.definition.id;
+                });
+            if (configured == chart_state.indicators.end() ||
+                !configured->visible)
+                continue;
+            const std::uint32_t rgba = configured->color_rgba;
+            const ImVec4 color{
+                static_cast<float>((rgba >> 24U) & 0xffU) / 255.0F,
+                static_cast<float>((rgba >> 16U) & 0xffU) / 255.0F,
+                static_cast<float>((rgba >> 8U) & 0xffU) / 255.0F,
+                static_cast<float>(rgba & 0xffU) / 255.0F};
+            const auto first = std::ranges::lower_bound(
+                indicator_series.points, rendered_range.start_ns, {},
+                &core::IndicatorPoint::start_ns);
+            const auto last = std::ranges::lower_bound(
+                indicator_series.points, rendered_range.end_ns, {},
+                &core::IndicatorPoint::start_ns);
+            if (first == last) continue;
+            auto previous = first;
+            for (auto point = std::next(first); point != last;
+                 ++point, ++previous) {
+                draw->AddLine(
+                    {chart::TimeToX(previous->start_ns, rendered_range, plot),
+                     scale->ToY(previous->value.ToDisplayDouble(), plot)},
+                    {chart::TimeToX(point->start_ns, rendered_range, plot),
+                     scale->ToY(point->value.ToDisplayDouble(), plot)},
+                    ImGui::GetColorU32(color), configured->line_width);
+            }
+        }
+    }
+    const auto drawing_color = [](std::uint32_t rgba) {
+        return ImVec4{
+            static_cast<float>((rgba >> 24U) & 0xffU) / 255.0F,
+            static_cast<float>((rgba >> 16U) & 0xffU) / 255.0F,
+            static_cast<float>((rgba >> 8U) & 0xffU) / 255.0F,
+            static_cast<float>(rgba & 0xffU) / 255.0F};
+    };
+    const auto draw_drawing = [&](const workstation::ChartDrawingState& value,
+                                  bool selected) {
+        const float first_x = chart::TimeToX(
+            value.first.time_ns, rendered_range, plot);
+        const float first_y = scale->ToY(
+            value.first.price.ToDisplayDouble(), plot);
+        const ImU32 color = ImGui::GetColorU32(
+            selected ? ImVec4{1.0F, 0.82F, 0.25F, 1.0F}
+                     : drawing_color(value.color_rgba));
+        switch (value.kind) {
+            case workstation::ChartDrawingKind::HorizontalLine:
+                draw->AddLine({plot.left, first_y}, {plot.right, first_y},
+                              color, value.line_width);
+                break;
+            case workstation::ChartDrawingKind::VerticalLine:
+                draw->AddLine({first_x, plot.top}, {first_x, plot.bottom},
+                              color, value.line_width);
+                break;
+            case workstation::ChartDrawingKind::TrendLine:
+            case workstation::ChartDrawingKind::Ray:
+                if (value.second) {
+                    draw->AddLine(
+                        {first_x, first_y},
+                        {chart::TimeToX(value.second->time_ns, rendered_range,
+                                        plot),
+                         scale->ToY(value.second->price.ToDisplayDouble(),
+                                    plot)},
+                        color, value.line_width);
+                }
+                break;
+            case workstation::ChartDrawingKind::Rectangle:
+                if (value.second) {
+                    draw->AddRect(
+                        {first_x, first_y},
+                        {chart::TimeToX(value.second->time_ns, rendered_range,
+                                        plot),
+                         scale->ToY(value.second->price.ToDisplayDouble(),
+                                    plot)},
+                        color, 0.0F, 0, value.line_width);
+                }
+                break;
+        }
+    };
+    for (const workstation::ChartDrawingState& drawing : state.chart_drawings) {
+        if (drawing.instrument_id != chart_state.instrument_id ||
+            !drawing.visible)
+            continue;
+        draw_drawing(drawing,
+                     drawing.id == interaction.selected_drawing_id);
+    }
+    if (!interaction.selected_drawing_id.empty() &&
+        ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+        if (edit_history_.Execute(
+                state, workstation::RemoveChartDrawingCommand{
+                           interaction.selected_drawing_id})) {
+            interaction.selected_drawing_id.clear();
+            persistent_changed_ = true;
+        }
+    }
+    if (interaction.drawing_tool && interaction.drawing_first &&
+        mouse.x >= plot.left && mouse.x <= plot.right &&
+        mouse.y >= plot.top && mouse.y <= plot.bottom) {
+        workstation::ChartDrawingState preview{
+            .instrument_id = chart_state.instrument_id,
+            .kind = *interaction.drawing_tool,
+            .first = *interaction.drawing_first,
+            .second = mouse_anchor(),
+            .color_rgba = 0xffffff99U,
+        };
+        draw_drawing(preview, true);
+    }
+    if (visible_current != nullptr) {
         const float current_y = scale->ToY(
-            current->close.ToDisplayDouble(), plot);
+            visible_current->close.ToDisplayDouble(), plot);
         draw->AddLine({plot.left, current_y}, {plot.right, current_y},
                       ImGui::GetColorU32(kFlatColor));
         char current_label[48]{};
         std::snprintf(current_label, sizeof(current_label), "last %.2f",
-                      current->close.ToDisplayDouble());
+                      visible_current->close.ToDisplayDouble());
         draw->AddText({plot.left + 8.0f, current_y - 18.0f},
                       ImGui::GetColorU32(kFlatColor), current_label);
     }
@@ -350,36 +708,36 @@ void DrawSeries(const application::UiChartSnapshot& snapshot,
 
     if (chart_state.show_volume) {
         const auto maximum_volume = chart::MaximumVolume(
-            series.bars, visible, current);
+            render_bars, render_visible, visible_current);
         if (maximum_volume) {
             draw->PushClipRect({volume_plot.left, volume_plot.top},
                                {volume_plot.right, volume_plot.bottom}, true);
-            for (std::size_t index = visible.first; index < visible.last;
+            for (std::size_t index = render_visible.first;
+                 index < render_visible.last;
                  ++index) {
                 const auto candle = chart::MakeCandleGeometry(
-                    series.bars[index], *scale, series.requested_range, plot,
+                    render_bars[index], *scale, rendered_range, plot,
                     body_half_width);
                 const float volume_y = chart::VolumeToY(
-                    series.bars[index].volume.ToDisplayDouble(),
+                    render_bars[index].volume.ToDisplayDouble(),
                     *maximum_volume, volume_plot);
                 draw->AddRectFilled(
                     {candle.x - candle.body_half_width, volume_y},
                     {candle.x + candle.body_half_width, volume_plot.bottom},
                     ImGui::GetColorU32(kVolumeColor));
             }
-            if (current != nullptr) {
+            if (visible_current != nullptr) {
                 const bool duplicate = std::ranges::any_of(
-                    series.bars, [current](const core::MarketBar& bar) {
-                        return bar.start_ns == current->start_ns;
+                    series.bars, [visible_current](const core::MarketBar& bar) {
+                        return bar.start_ns == visible_current->start_ns;
                     });
-                if (!duplicate && current->start_ns >=
-                                       series.requested_range.start_ns &&
-                    current->start_ns < series.requested_range.end_ns) {
+                if (!duplicate) {
                     const auto candle = chart::MakeCandleGeometry(
-                        *current, *scale, series.requested_range, plot,
+                        *visible_current, *scale, rendered_range, plot,
                         body_half_width);
                     const float volume_y = chart::VolumeToY(
-                        current->volume.ToDisplayDouble(), *maximum_volume,
+                        visible_current->volume.ToDisplayDouble(),
+                        *maximum_volume,
                         volume_plot);
                     draw->AddRectFilled(
                         {candle.x - candle.body_half_width, volume_y},
@@ -391,17 +749,21 @@ void DrawSeries(const application::UiChartSnapshot& snapshot,
         }
     }
     if (chart_state.show_crosshair && ImGui::IsItemHovered()) {
-        const ImVec2 mouse = ImGui::GetIO().MousePos;
-        if (mouse.x >= plot.left && mouse.x <= plot.right &&
-            mouse.y >= plot.top && mouse.y <= plot.bottom) {
-            draw->AddLine({mouse.x, plot.top}, {mouse.x, plot.bottom},
+        const ImVec2 crosshair_mouse = ImGui::GetIO().MousePos;
+        if (crosshair_mouse.x >= plot.left &&
+            crosshair_mouse.x <= plot.right &&
+            crosshair_mouse.y >= plot.top &&
+            crosshair_mouse.y <= plot.bottom) {
+            draw->AddLine({crosshair_mouse.x, plot.top},
+                          {crosshair_mouse.x, plot.bottom},
                           ImGui::GetColorU32(ImGuiCol_TextDisabled));
-            draw->AddLine({plot.left, mouse.y}, {plot.right, mouse.y},
+            draw->AddLine({plot.left, crosshair_mouse.y},
+                          {plot.right, crosshair_mouse.y},
                           ImGui::GetColorU32(ImGuiCol_TextDisabled));
             const std::int64_t time = chart::XToTime(
-                mouse.x, series.requested_range, plot);
+                crosshair_mouse.x, rendered_range, plot);
             const auto hit = chart::HitTestBar(
-                series.bars, visible, time, series.requested_range);
+                series.bars, visible, time, rendered_range);
             char label[96]{};
             if (hit) {
                 std::snprintf(label, sizeof(label), "t=%lld  close=%.2f",
