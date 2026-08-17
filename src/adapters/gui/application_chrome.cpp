@@ -1,5 +1,6 @@
 #include "application_chrome.h"
 
+#include "buying_power_display.h"
 #include "gui_controls.h"
 
 #include <SDL3/SDL.h>
@@ -24,32 +25,9 @@ struct CreationActions {
     std::optional<std::string> open_watch_list_id;
 };
 
-void DrawBuyingPowerMeter(const core::AccountState& account) {
-    const auto multiplier = core::Decimal::Parse(account.multiplier);
-    const core::Decimal buying_power_capacity =
-        multiplier && *multiplier > core::Decimal::Zero()
-            ? account.equity * *multiplier
-            : account.equity;
-    std::optional<core::Decimal> available_ratio;
-    if (buying_power_capacity > core::Decimal::Zero()) {
-        const auto divided = account.buying_power.Divide(buying_power_capacity, 6);
-        if (divided) available_ratio = *divided;
-    }
-    const float available_percent = available_ratio
-                                        ? std::max(
-                                              static_cast<float>(
-                                                  available_ratio->ToDisplayDouble()),
-                                              0.0f)
-                                        : 0.0f;
-    const std::string summary = std::format(
-        "BP ${:.0f} left  |  {:.0f}% available",
-        account.buying_power.ToDisplayDouble(), available_percent * 100.0f);
-    ImGui::TextDisabled("%s", summary.c_str());
-    const std::string tooltip = std::format(
-        "Buying power left: ${:.2f}\nBuying-power capacity: ${:.2f}\nAvailable: {:.1f}%",
-        account.buying_power.ToDisplayDouble(),
-        buying_power_capacity.ToDisplayDouble(), available_percent * 100.0f);
-    ImGui::SetItemTooltip("%s", tooltip.c_str());
+void DrawBuyingPowerMeter(const BuyingPowerDisplay& display) {
+    ImGui::TextDisabled("%s", display.summary.c_str());
+    ImGui::SetItemTooltip("%s", display.tooltip.c_str());
 }
 
 CreationActions DrawCreationMenu(
@@ -237,15 +215,15 @@ ChromeActions DrawApplicationChrome(
             static_cast<int>(ImGui::GetCursorPosX());
 
         if (snapshot.account) {
-            const std::string summary = std::format(
-                "BP ${:.0f} left  |  100% available",
-                snapshot.account->buying_power.ToDisplayDouble());
-            const float summary_width = ImGui::CalcTextSize(summary.c_str()).x;
+            const BuyingPowerDisplay buying_power =
+                BuildBuyingPowerDisplay(*snapshot.account);
+            const float summary_width =
+                ImGui::CalcTextSize(buying_power.summary.c_str()).x;
             const float meter_x = std::max(
                 static_cast<float>(metrics.interactive_left_width + 12),
                 window_size.x - caption_controls_width - summary_width - 12.0f);
             ImGui::SetCursorPosX(meter_x);
-            DrawBuyingPowerMeter(*snapshot.account);
+            DrawBuyingPowerMeter(buying_power);
         }
 
         ImGui::SetCursorPosX(window_size.x - caption_controls_width);

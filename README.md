@@ -29,7 +29,7 @@ TradeBox currently supports 64-bit Windows. Open the
 and download this file—not GitHub's automatically generated source archives:
 
 ```text
-TradeBox-v0.1.0-alpha-windows-x64.zip
+TradeBox-v0.1.1-alpha-windows-x64.zip
 ```
 
 Then:
@@ -47,23 +47,43 @@ Manager rather than in the workstation profile or SQLite databases.
 The SHA-256 checksum file beside the ZIP can be used to confirm that the
 download was not altered.
 
-## What currently works
+## What to expect
 
-The stock-trading and order-management foundation is functional. Current work
-includes:
+The underlying trading core is considerably further along than the interface.
+It owns broker-independent order validation, price and quantity rules, order
+state, account and market-data projections, recovery, and reconciliation. The
+application layer exposes that state to the UI as read-only snapshots and
+accepts typed trading commands. Alpaca-specific HTTP and streaming details,
+SQLite storage, workstation profiles, and the GUI are kept outside the core.
 
-- Alpaca Paper and Live account connections;
-- account, position, and order views;
-- stock order entry, cancellation, replacement, and bracket-order support;
-- live account activity and market-data streams;
-- historical and live stock bars;
-- persistent watch lists and workstation layouts;
-- operational recovery and broker reconciliation; and
-- local operational and market-data databases.
+The current Windows interface is usable as a paper-trading workstation, but it
+is still rough. Today you can:
 
-The underlying trading core, application boundaries, persistence,
-reconciliation, and automated tests are considerably further along than the
-interface.
+- connect to an Alpaca Paper or Live account and view account, position, and
+  order state;
+- enter, cancel, and replace stock orders, including bracket orders;
+- receive live account activity and market data and load historical stock
+  bars;
+- create and rename watch lists, add, remove, and reorder tickers, and choose
+  and sort quote columns;
+- click a populated watch-list row to make that ticker the active symbol in
+  the **Trade Hotkey** window;
+- keep separate Trade Hotkey drafts for each ticker: stop-loss percentage,
+  profit-target percentage, and GTC/day choice are restored when you switch
+  tickers or reopen the workstation profile; and
+- save window layout, open documents, tables, watch lists, chart state, and
+  application risk limits in a `.tbw` workstation profile.
+
+The Trade Hotkey workflow currently creates a **bracket order**: an entry order
+with a take-profit exit and a stop-loss exit. The core and Alpaca adapter also
+understand standalone OCO orders, but there is not yet a finished general OCO
+order-entry window in the UI. In other words, selecting a watch-list ticker
+changes the symbol used by the bracket-order Trade Hotkey window; it does not
+silently place an order.
+
+Operational order history and recovery data and local market history are kept
+in separate SQLite databases. API credentials are never written to a `.tbw`
+profile or those databases.
 
 ## What is unfinished
 

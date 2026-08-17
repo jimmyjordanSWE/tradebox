@@ -2,15 +2,53 @@
 
 #include "tradebox/workstation/instrument_links.h"
 #include "tradebox/workstation/validation.h"
+#include "tradebox/workstation/watch_list_documents.h"
 
 #include <toml++/toml.hpp>
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
 #include <iomanip>
 #include <stdexcept>
 #include <sstream>
 
 namespace tradebox::workstation {
 namespace {
+
+constexpr std::array<std::string_view, 4> kSchemaSevenSeededWatchList{
+    "AMD", "AAPL", "NVDA", "SPY"};
+
+bool MatchesSchemaSevenSeed(
+    const std::vector<WatchListRowState>& rows) {
+    if (rows.size() < kSchemaSevenSeededWatchList.size()) return false;
+    for (std::size_t index = 0;
+         index < kSchemaSevenSeededWatchList.size(); ++index) {
+        const WatchListRowState& row = rows[index];
+        if (!row.instrument_id.empty() || !row.symbol.empty() ||
+            row.ticker_input != kSchemaSevenSeededWatchList[index])
+            return false;
+    }
+    return true;
+}
+
+void RemoveSchemaSevenWatchListSeed(WorkspaceState& workspace) {
+    if (workspace.watchlist.size() == kSchemaSevenSeededWatchList.size() &&
+        std::equal(workspace.watchlist.begin(), workspace.watchlist.end(),
+                   kSchemaSevenSeededWatchList.begin()))
+        workspace.watchlist.clear();
+
+    const auto document = std::ranges::find(
+        workspace.watch_lists, kWatchListDefaultId,
+        &WatchListDocumentState::id);
+    if (document == workspace.watch_lists.end() ||
+        !MatchesSchemaSevenSeed(document->rows))
+        return;
+    document->rows.erase(
+        document->rows.begin(),
+        document->rows.begin() +
+            static_cast<std::ptrdiff_t>(kSchemaSevenSeededWatchList.size()));
+}
 
 std::string Quote(std::string_view value) {
     std::string output{"\""};
@@ -500,6 +538,7 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
         if (source_schema_version != 1 && source_schema_version != 2 &&
             source_schema_version != 3 && source_schema_version != 4 &&
             source_schema_version != 5 && source_schema_version != 6 &&
+            source_schema_version != 7 &&
             source_schema_version != kCurrentSchemaVersion)
             return std::unexpected(
                 "Unsupported workstation profile schema version");
@@ -781,6 +820,8 @@ std::expected<WorkstationState, std::string> DecodeProfile(std::string_view sour
                 state.workspace.chart_drawings.push_back(std::move(value));
             }
         }
+        if (source_schema_version == 7)
+            RemoveSchemaSevenWatchListSeed(state.workspace);
         std::string validation_error;
         if (!ValidateAndNormalize(state, validation_error))
             return std::unexpected(validation_error);

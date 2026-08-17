@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(TradeBoxNative VERSION 0.1.0 LANGUAGES C CXX)
+project(TradeBoxNative VERSION 0.1.1 LANGUAGES C CXX)
 
 set(TRADEBOX_RELEASE_LABEL "${PROJECT_VERSION}-alpha")
 
@@ -223,6 +223,7 @@ tradebox_enable_strict_warnings(tradebox_application)
 add_executable(tradebox_gui WIN32
   src/adapters/gui/account_popup.cpp
   src/adapters/gui/application_chrome.cpp
+  src/adapters/gui/buying_power_display.cpp
   src/adapters/gui/chart_geometry.cpp
   src/adapters/gui/chart_window.cpp
   src/adapters/gui/debug_window.cpp
@@ -364,6 +365,7 @@ if(BUILD_TESTING)
   gtest_discover_tests(tradebox_order_pipeline_tests)
 
   add_executable(tradebox_workstation_tests
+    tests/unit/buying_power_display_tests.cpp
     tests/unit/chart_command_tests.cpp
     tests/unit/chart_geometry_tests.cpp
     tests/unit/native_chrome_layout_tests.cpp
@@ -379,6 +381,7 @@ if(BUILD_TESTING)
     src/adapters/gui
   )
   target_sources(tradebox_workstation_tests PRIVATE
+    src/adapters/gui/buying_power_display.cpp
     src/adapters/gui/chart_geometry.cpp
     src/adapters/gui/time_sales_window.cpp
   )

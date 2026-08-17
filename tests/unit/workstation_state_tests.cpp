@@ -390,6 +390,25 @@ TEST(WatchListDocuments, DeletesRowsThroughWorkstationOwner) {
         state.workspace, *document_id, first_id));
 }
 
+TEST(WatchListDocuments, DeletingLastRowLeavesWatchListEmpty) {
+    WorkstationState state = WorkstationState::Defaults();
+    const auto document_id = EnsureDefaultWatchList(state.workspace);
+    ASSERT_TRUE(document_id) << document_id.error().message;
+    auto* document = FindWatchListDocument(state.workspace, *document_id);
+    ASSERT_NE(document, nullptr);
+    ASSERT_TRUE(document->rows.empty());
+
+    const auto row_id = AddWatchListRow(state.workspace, *document_id);
+    ASSERT_TRUE(row_id) << row_id.error().message;
+    ASSERT_TRUE(AssignWatchListRowAsset(
+        state.workspace, *document_id, *row_id, "asset-aapl", "AAPL"));
+    ASSERT_TRUE(DeleteWatchListRow(state.workspace, *document_id, *row_id));
+    EXPECT_TRUE(document->rows.empty());
+
+    ASSERT_TRUE(EnsureDefaultWatchList(state.workspace));
+    EXPECT_TRUE(document->rows.empty());
+}
+
 TEST(WatchListDocuments, RejectsDuplicateTickerAssignments) {
     WatchListDocumentState document{
         .id = "watch-list.test",
@@ -580,11 +599,7 @@ TEST(WatchListDocuments, ReusesOnePersistentDefaultWatchList) {
     EXPECT_EQ(*second, kWatchListDefaultId);
     ASSERT_EQ(state.workspace.watch_lists.size(), 1U);
     EXPECT_EQ(state.workspace.watch_lists.front().name, "Default");
-    ASSERT_EQ(state.workspace.watch_lists.front().rows.size(), 4U);
-    EXPECT_EQ(state.workspace.watch_lists.front().rows[0].ticker_input, "AMD");
-    EXPECT_EQ(state.workspace.watch_lists.front().rows[1].ticker_input, "AAPL");
-    EXPECT_EQ(state.workspace.watch_lists.front().rows[2].ticker_input, "NVDA");
-    EXPECT_EQ(state.workspace.watch_lists.front().rows[3].ticker_input, "SPY");
+    EXPECT_TRUE(state.workspace.watch_lists.front().rows.empty());
     EXPECT_TRUE(state.workspace.watchlist.empty());
     EXPECT_EQ(state.workspace.active_watch_list_id, kWatchListDefaultId);
     EXPECT_TRUE(state.workspace.windows.empty());
@@ -894,6 +909,63 @@ TEST(WorkstationState, RemovesDormantOrderTicketDataFromLegacyProfiles) {
     ASSERT_TRUE(decoded) << decoded.error();
     EXPECT_FALSE(decoded->workspace.windows.contains("order-ticket.window"));
     EXPECT_EQ(EncodeProfile(*decoded).find("order_tickets"), std::string::npos);
+}
+
+TEST(WorkstationState, RemovesSchemaSevenSeededWatchListRows) {
+    WorkstationState state = WorkstationState::Defaults();
+    state.workspace.watchlist = {"AMD", "AAPL", "NVDA", "SPY"};
+    state.workspace.watch_lists.push_back({
+        .id = std::string(kWatchListDefaultId),
+        .name = "Default",
+        .rows = {
+            {.id = "seed-amd", .ticker_input = "AMD"},
+            {.id = "seed-aapl", .ticker_input = "AAPL"},
+            {.id = "seed-nvda", .ticker_input = "NVDA"},
+            {.id = "seed-spy", .ticker_input = "SPY"},
+            {.id = "user-tsla",
+             .instrument_id = "asset-tsla",
+             .symbol = "TSLA",
+             .ticker_input = "TSLA"},
+        },
+    });
+    std::string encoded = EncodeProfile(state);
+    const std::string current =
+        "schema_version = " + std::to_string(kCurrentSchemaVersion);
+    const std::size_t version = encoded.find(current);
+    ASSERT_NE(version, std::string::npos);
+    encoded.replace(version, current.size(), "schema_version = 7");
+
+    const auto decoded = DecodeProfile(encoded);
+    ASSERT_TRUE(decoded) << decoded.error();
+    EXPECT_TRUE(decoded->workspace.watchlist.empty());
+    const auto* document = FindWatchListDocument(
+        decoded->workspace, kWatchListDefaultId);
+    ASSERT_NE(document, nullptr);
+    ASSERT_EQ(document->rows.size(), 1U);
+    EXPECT_EQ(document->rows.front().symbol, "TSLA");
+}
+
+TEST(WorkstationState, PreservesSchemaSevenUserWatchListDrafts) {
+    WorkstationState state = WorkstationState::Defaults();
+    state.workspace.watch_lists.push_back({
+        .id = std::string(kWatchListDefaultId),
+        .name = "Default",
+        .rows = {{.id = "user-draft", .ticker_input = "AAPL"}},
+    });
+    std::string encoded = EncodeProfile(state);
+    const std::string current =
+        "schema_version = " + std::to_string(kCurrentSchemaVersion);
+    const std::size_t version = encoded.find(current);
+    ASSERT_NE(version, std::string::npos);
+    encoded.replace(version, current.size(), "schema_version = 7");
+
+    const auto decoded = DecodeProfile(encoded);
+    ASSERT_TRUE(decoded) << decoded.error();
+    const auto* document = FindWatchListDocument(
+        decoded->workspace, kWatchListDefaultId);
+    ASSERT_NE(document, nullptr);
+    ASSERT_EQ(document->rows.size(), 1U);
+    EXPECT_EQ(document->rows.front().ticker_input, "AAPL");
 }
 
 TEST(InstrumentLinks, CommandsPreserveLocalWindowStateAndPublishOneContext) {

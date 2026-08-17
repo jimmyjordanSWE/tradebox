@@ -375,7 +375,7 @@ void WatchListWindowRenderer::Draw(
         ImGui::PushID(document.id.c_str());
         ImGui::TextUnformatted("Watch List");
         ImGui::SameLine();
-        ImGui::TextDisabled("Double-click a ticker to open Order Ticket");
+        ImGui::TextDisabled("Select a ticker to update Trade Hotkey");
         ImGui::SameLine();
         if (ImGui::Button("Add Ticker##watch_list_add_ticker")) {
             const auto added =

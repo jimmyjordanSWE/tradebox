@@ -189,10 +189,10 @@ if /i "!BUILD_ACTION!"=="package" (
     echo [build] ERROR: cpack not found for the release package.
     exit /b 11
   )
-  echo [build] Packaging v0.1.0-alpha ...
+  echo [build] Packaging v0.1.1-alpha ...
   "!CPACK_EXE!" --config build\CPackConfig.cmake -C !BUILD_CONFIG!
   if errorlevel 1 exit /b 12
-  "!CMAKE_EXE!" "-DTRADEBOX_ARCHIVE=%CD%\build\release\TradeBox-v0.1.0-alpha-windows-x64.zip" "-DTRADEBOX_VERIFY_DIR=%CD%\build\release-verification" -P tools\verify_release_package.cmake
+  "!CMAKE_EXE!" "-DTRADEBOX_ARCHIVE=%CD%\build\release\TradeBox-v0.1.1-alpha-windows-x64.zip" "-DTRADEBOX_VERIFY_DIR=%CD%\build\release-verification" -P tools\verify_release_package.cmake
   if errorlevel 1 exit /b 13
 )
 

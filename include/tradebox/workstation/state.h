@@ -11,7 +11,7 @@
 
 namespace tradebox::workstation {
 
-inline constexpr int kCurrentSchemaVersion = 7;
+inline constexpr int kCurrentSchemaVersion = 8;
 inline constexpr std::size_t kInstrumentLinkGroupCount = 32;
 
 enum class InstrumentLinkColor : std::uint8_t {
@@ -226,7 +226,9 @@ struct BracketDraftState {
 
 struct WorkspaceState {
     std::string selected_symbol = "AMD";
-    std::vector<std::string> watchlist{"AMD", "AAPL", "NVDA", "SPY"};
+    // Legacy pre-document watch-list symbols. Kept only as a typed profile
+    // migration input; new workspaces start with an empty watch list.
+    std::vector<std::string> watchlist;
     // Empty means the active watch-list session is an unsaved draft.
     std::string active_watch_list_id;
     // Most-recently selected stable asset identities, used to make repeated
