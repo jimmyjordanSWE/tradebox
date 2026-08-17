@@ -13,6 +13,8 @@ rem    build.bat              build the TradeBoxNative app (Release)
 rem    build.bat Debug        build the app with the Debug configuration
 rem    build.bat Release test build the app, then build and run the test suite
 rem                           (requires Python 3 on PATH)
+rem    build.bat Release package
+rem                           build and verify the release ZIP
 rem
 rem  The script reconfigures from scratch (cmake --fresh) only when the
 rem  detected toolchain differs from the one recorded in build/CMakeCache.txt,
@@ -23,7 +25,16 @@ cd /d "%~dp0"
 
 set "BUILD_CONFIG=%~1"
 if not defined BUILD_CONFIG set "BUILD_CONFIG=Release"
-set "RUN_TESTS=%~2"
+set "BUILD_ACTION=%~2"
+
+if defined BUILD_ACTION if /i not "!BUILD_ACTION!"=="test" if /i not "!BUILD_ACTION!"=="package" (
+  echo [build] ERROR: unknown action "!BUILD_ACTION!". Use test or package.
+  exit /b 1
+)
+if /i "!BUILD_ACTION!"=="package" if /i not "!BUILD_CONFIG!"=="Release" (
+  echo [build] ERROR: release packages must use the Release configuration.
+  exit /b 1
+)
 
 rem ---- locate a Visual Studio installation with the C++ workload ---------------
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -134,11 +145,11 @@ if "!STALE!"=="1" (
 )
 
 set "TEST_FLAG=-DBUILD_TESTING=OFF"
-if /i "!RUN_TESTS!"=="test" set "TEST_FLAG=-DBUILD_TESTING=ON"
+if /i "!BUILD_ACTION!"=="test" set "TEST_FLAG=-DBUILD_TESTING=ON"
 
 rem ---- configure and build ------------------------------------------------------
 set "RUNNING_APP="
-for /f "tokens=1" %%P in ('tasklist /FI "IMAGENAME eq TradeBoxNative.exe" /FO CSV /NH 2^>nul ^| find /I "TradeBoxNative.exe"') do if not defined RUNNING_APP set "RUNNING_APP=%%~P"
+for /f "tokens=2 delims=," %%P in ('tasklist /FI "IMAGENAME eq TradeBoxNative.exe" /FO CSV /NH 2^>nul ^| find /I "TradeBoxNative.exe"') do if not defined RUNNING_APP set "RUNNING_APP=%%~P"
 if defined RUNNING_APP (
   echo [build] Stopping running TradeBoxNative.exe, PID !RUNNING_APP! ...
   taskkill /PID !RUNNING_APP! /T /F >nul 2>&1
@@ -157,7 +168,7 @@ echo [build] Building !BUILD_CONFIG! ...
 "%CMAKE_EXE%" --build build --config !BUILD_CONFIG!
 if errorlevel 1 exit /b 8
 
-if /i "!RUN_TESTS!"=="test" (
+if /i "!BUILD_ACTION!"=="test" (
   set "CTEST_EXE="
   for /f "delims=" %%T in ('where ctest 2^>nul') do if not defined CTEST_EXE set "CTEST_EXE=%%T"
   if not defined CTEST_EXE for %%F in ("!CMAKE_EXE!") do if exist "%%~dpFctest.exe" set "CTEST_EXE=%%~dpFctest.exe"
@@ -168,6 +179,21 @@ if /i "!RUN_TESTS!"=="test" (
   echo [build] Running tests ...
   "!CTEST_EXE!" --test-dir build -C !BUILD_CONFIG! --output-on-failure
   if errorlevel 1 exit /b 10
+)
+
+if /i "!BUILD_ACTION!"=="package" (
+  set "CPACK_EXE="
+  for /f "delims=" %%P in ('where cpack 2^>nul') do if not defined CPACK_EXE set "CPACK_EXE=%%P"
+  if not defined CPACK_EXE for %%F in ("!CMAKE_EXE!") do if exist "%%~dpFcpack.exe" set "CPACK_EXE=%%~dpFcpack.exe"
+  if not defined CPACK_EXE (
+    echo [build] ERROR: cpack not found for the release package.
+    exit /b 11
+  )
+  echo [build] Packaging v0.1.0-alpha ...
+  "!CPACK_EXE!" --config build\CPackConfig.cmake -C !BUILD_CONFIG!
+  if errorlevel 1 exit /b 12
+  "!CMAKE_EXE!" "-DTRADEBOX_ARCHIVE=%CD%\build\release\TradeBox-v0.1.0-alpha-windows-x64.zip" "-DTRADEBOX_VERIFY_DIR=%CD%\build\release-verification" -P tools\verify_release_package.cmake
+  if errorlevel 1 exit /b 13
 )
 
 echo [build] Done.

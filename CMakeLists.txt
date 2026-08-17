@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
-project(TradeBoxNative LANGUAGES C CXX)
+project(TradeBoxNative VERSION 0.1.0 LANGUAGES C CXX)
+
+set(TRADEBOX_RELEASE_LABEL "${PROJECT_VERSION}-alpha")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -257,6 +259,41 @@ add_custom_command(TARGET tradebox_gui POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
     ${CMAKE_SOURCE_DIR}/assets ${CMAKE_CURRENT_BINARY_DIR}/assets
 )
+
+# The executable loads fonts relative to its own location, so the release
+# authority is an installed bundle rather than a standalone executable.
+install(TARGETS tradebox_gui RUNTIME DESTINATION .)
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/assets/fonts DESTINATION assets)
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/assets/licenses/ DESTINATION licenses)
+install(FILES
+  ${CMAKE_SOURCE_DIR}/README.md
+  ${CMAKE_SOURCE_DIR}/THIRD_PARTY_NOTICES.txt
+  DESTINATION .
+)
+install(FILES ${dear_imgui_SOURCE_DIR}/LICENSE.txt
+  DESTINATION licenses RENAME Dear-ImGui-MIT.txt)
+install(FILES ${SDL3_SOURCE_DIR}/LICENSE.txt
+  DESTINATION licenses RENAME SDL3-Zlib.txt)
+install(FILES ${nlohmann_json_SOURCE_DIR}/LICENSE.MIT
+  DESTINATION licenses RENAME nlohmann-json-MIT.txt)
+install(FILES ${tomlplusplus_SOURCE_DIR}/LICENSE
+  DESTINATION licenses RENAME tomlplusplus-MIT.txt)
+install(FILES ${rapidjson_SOURCE_DIR}/license.txt
+  DESTINATION licenses RENAME RapidJSON-License.txt)
+
+set(CPACK_GENERATOR ZIP)
+set(CPACK_PACKAGE_NAME TradeBox)
+set(CPACK_PACKAGE_VENDOR "Jimmy Jordan")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+  "Experimental native Windows trading workstation for Alpaca")
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_PACKAGE_FILE_NAME
+  "TradeBox-v${TRADEBOX_RELEASE_LABEL}-windows-x64")
+set(CPACK_PACKAGE_DIRECTORY "${CMAKE_BINARY_DIR}/release")
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY OFF)
+set(CPACK_PACKAGE_CHECKSUM SHA256)
+set(CPACK_VERBATIM_VARIABLES YES)
+include(CPack)
 
 include(CTest)
 option(

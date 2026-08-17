@@ -1,0 +1,27 @@
+TradeBox third-party notices
+============================
+
+The TradeBox release bundle includes or incorporates the following third-party
+software. The complete applicable license texts are distributed in the
+licenses directory beside this file.
+
+- Dear ImGui — MIT License
+  https://github.com/ocornut/imgui
+- SDL — zlib License
+  https://github.com/libsdl-org/SDL
+- JSON for Modern C++ — MIT License
+  https://github.com/nlohmann/json
+- toml++ — MIT License
+  https://github.com/marzer/tomlplusplus
+- RapidJSON — MIT License, with its upstream third-party notices
+  https://github.com/Tencent/rapidjson
+- SQLite — dedicated to the public domain by its authors
+  https://www.sqlite.org/copyright.html
+- B612 and B612 Mono fonts — SIL Open Font License 1.1
+  https://github.com/polarsys/b612
+- Google Material Icons and Material Symbols — Apache License 2.0
+  https://fonts.google.com/icons
+
+TradeBox itself does not currently grant a public reuse license. Publication
+of its source code and release binaries does not grant rights beyond those
+required to download and run an unmodified release for personal evaluation.
