@@ -25,7 +25,7 @@ and try unfinished features.
 ## Download and run
 
 TradeBox currently supports 64-bit Windows. Open the
-[latest GitHub release](https://github.com/jimmyjordanSWE/tradebox/releases/latest)
+[current alpha release](https://github.com/jimmyjordanSWE/tradebox/releases/tag/v0.1.1-alpha)
 and download this file—not GitHub's automatically generated source archives:
 
 ```text
