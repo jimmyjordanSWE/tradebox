@@ -3,24 +3,14 @@
 TradeBox is an experimental native Windows trading workstation and an
 unofficial front end for the Alpaca Trading API.
 
-I originally built it for myself because I wanted a controlled way to practice
-trading with an Alpaca Paper Trading account. I did not want order entry to be
-a mysterious automated black box: I wanted to see my account, positions,
-orders, and market data in one place, deliberately construct an order, and
-understand exactly what would be sent to Alpaca.
-
 The longer-term idea is a practical order-management workstation that makes it
-easy to enter, monitor, replace, and cancel orders while keeping the final
-decision with the person using it. It can connect to either Alpaca Paper or
-Live Trading, but Paper Trading is the intended place to learn the application
-and try unfinished features.
+easy to enter, monitor, replace, and cancel orders. It can connect to either Alpaca Paper or
+Live Trading.
 
 > [!WARNING]
 > TradeBox is under heavy development and can submit real orders when connected
-> to a live Alpaca account. It may contain bugs, incomplete behavior, or rough
-> safety edges. Start with Alpaca Paper Trading, inspect every order, and use it
-> entirely at your own risk. This is personal software, not financial advice,
-> and there is no promise that it is suitable for production trading.
+> to a live Alpaca account. It WILL contain bugs, incomplete behavior, or rough
+> safety edges.
 
 ## Download and run
 
@@ -29,7 +19,7 @@ TradeBox currently supports 64-bit Windows. Open the
 and download this file—not GitHub's automatically generated source archives:
 
 ```text
-TradeBox-v0.1.1-alpha-windows-x64.zip
+TradeBox-*-windows-x64.zip
 ```
 
 Then:
